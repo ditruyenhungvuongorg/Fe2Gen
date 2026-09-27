@@ -8,6 +8,7 @@ from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, Rank
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
 from model1_v38_package.model1_runner import Model1V38Runner
 from model1_v6.runner import Model1V6Runner
+from model2_reranker import POOL, Reranker, candidate_features, load_validity
 
 STATUS = {'CÓ': PhenotypeStatus.PRESENT, 'NGHI NGỜ': PhenotypeStatus.SUSPECTED, 'KHÔNG': PhenotypeStatus.ABSENT}
 # Left-to-right order of the result columns, following the usual prenatal test
@@ -16,6 +17,8 @@ GROUPS = (('NST', 10), ('CNV', 10), ('DON_GEN', 10), ('CHUA_RO', 5))
 # A locally rebuilt table in data/ takes precedence over the copy shipped in the repo.
 XREF_FILES = (BASE_DIR / 'data/disease_xref_mondo.tsv', BASE_DIR / 'resources/disease_xref_mondo.tsv')
 CATEGORY_FILES = (BASE_DIR / 'data/disease_category.tsv', BASE_DIR / 'resources/disease_category.tsv')
+RERANKER_FILES = (BASE_DIR / 'data/model2_reranker.json', BASE_DIR / 'resources/model2_reranker.json')
+TOP_OVERALL = 5
 
 
 def load_categories(path):
@@ -76,6 +79,10 @@ class WebSystem(Fe2genSystem):
         xref = next((p for p in XREF_FILES if p.is_file()), None)
         self.resolver = load_disease_xref(xref) if xref else None
         print(f'[Model 2] Gộp mã OMIM/ORPHA cùng bệnh: {xref.name if xref else "không có bảng, không gộp"}.')
+        reranker = next((p for p in RERANKER_FILES if p.is_file()), None)
+        self.reranker = Reranker.load(reranker) if reranker and self.categories else None
+        self.gene_validity, self.disease_validity = load_validity(BASE_DIR / 'resources/gencc_validity.tsv')
+        print(f'[Model 2] Xếp hạng lại: {reranker.name if self.reranker else "không dùng (thứ tự ic_coverage)"}.')
         self.runner = Model1V6Runner(bundle) if bundle else Model1V38Runner(os.getenv('MODEL1_ADAPTER'), os.getenv('MODEL1_WORKER_DIR'))
 
     def term(self, hid):
@@ -164,6 +171,27 @@ class WebSystem(Fe2genSystem):
                 kept.append(candidate)
         return kept, {k: sorted(v) for k, v in others.items() if v}
 
+    def rerank(self, ranked, equivalents):
+        """Reorder the top POOL of each mechanism column with the learned model; the rest keeps its order."""
+        taken, pool, rest = defaultdict(int), [], []
+        info = self.matcher.information_content
+        for c in ranked:
+            group = self.categories.get(c.disease_id, ('CHUA_RO', False))[0]
+            if c.ic_weighted_coverage > 0 and taken[group] < POOL:
+                taken[group] += 1
+                same = [c.disease_id, *equivalents.get(c.disease_id, [])]
+                genes = sorted({g for d in same for g in self.disease_to_genes.get(d, [])})
+                evidence = [(1.0 if e.status == 'PRESENT' else 0.5, info(e.observed_hpo_id), e.ic_similarity, e.disease_frequency)
+                            for e in c.evidence if e.status in ('PRESENT', 'SUSPECTED')]
+                x = candidate_features(c.ic_weighted_coverage, c.exact_coverage, c.score,
+                                       len(self.profiles_by_id[c.disease_id].positive_frequencies), evidence, group,
+                                       genes, same, taken[group], self.gene_validity, self.disease_validity)
+                pool.append((self.reranker.score(x), c))
+            else:
+                rest.append(c)
+        pool.sort(key=lambda item: -item[0])
+        return [c for _, c in pool] + rest
+
     def match(self, payload):
         hpos = payload.get('hpos')
         if not isinstance(hpos, list) or not 1 <= len(hpos) <= 100:
@@ -187,6 +215,8 @@ class WebSystem(Fe2genSystem):
             ranked, equivalents = self.merge_equivalents(ranked)
         else:
             equivalents = {}
+        if self.reranker:
+            ranked = self.rerank(ranked, equivalents)
         report = self.decider.analyze_case(case_id='WEB', observations=positive, disease_candidates=ranked[:20], top_k=5)
         if self.categories:
             chosen, taken = [], {name: 0 for name, _ in GROUPS}
@@ -232,6 +262,8 @@ class WebSystem(Fe2genSystem):
                 'model3_rationale': ('Hồ sơ gợi ý khớp mã bệnh ' + c.disease_id) if exact_profile else '',
                 'model3_recommended_tests': (exact_profile.recommended_first_tier + '. ' + exact_profile.recommended_second_tier) if exact_profile else '',
                 'negative_conflict': c.negative_conflict})
-        return {'candidates': output, 'grouped': bool(self.categories), 'category_version': self.category_version,
+        top_overall = [c.disease_id for c in ranked[:TOP_OVERALL] if c.ic_weighted_coverage > 0] if self.categories else []
+        return {'candidates': output, 'grouped': bool(self.categories), 'top_overall': top_overall,
+                'reranked': bool(self.reranker), 'category_version': self.category_version,
                 'clinical_pattern': report.clinical_pattern,
                 'score_semantics': 'IC-weighted phenotype similarity; not disease probability', 'observations': hpos}

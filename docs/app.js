@@ -200,6 +200,13 @@ function renderResults(){
   $('results').replaceChildren();
   if(!list.length){$('results').innerHTML='<p class="no-results">Không có kết quả phù hợp bộ lọc.</p>';return;}
   if(!result.grouped){for(const c of list)$('results').append(diseaseCard(c));return;}
+  const top=(result.top_overall||[]).map(id=>list.find(c=>c.disease_id===id)).filter(Boolean);
+  if(top.length){
+    const box=document.createElement('section');box.className='top-overall';
+    box.innerHTML='<header class="group-head"><h3>'+top.length+' gợi ý hàng đầu</h3><span>Trộn cả ba nhóm, ưu tiên theo thứ tự xét nghiệm · cần bác sĩ duyệt</span></header><ol>'+
+      top.map(c=>'<li><b>'+escape(c.disease_name)+'</b> <span class="pill '+({NST:'purple',CNV:'orange',DON_GEN:'green'}[c.group]||'gray')+'">'+escape(groupTitle(c.group))+'</span> <span class="hint">'+escape(c.disease_id)+' · '+c.match_percentage+'% tương đồng</span></li>').join('')+'</ol>';
+    $('results').append(box);
+  }
   const columns=document.createElement('div');columns.className='group-columns';
   for(const g of GROUPS){
     const items=list.filter(c=>c.group===g.id);

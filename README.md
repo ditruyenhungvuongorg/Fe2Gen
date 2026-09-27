@@ -38,6 +38,16 @@ OMIM and ORPHA IDs of the same disease (one-to-one pairs sharing a MONDO ID, `ba
 2,036 pairs) are shown as one card, keeping the better-ranked ID and listing the other; genes and inheritance
 modes of both IDs are combined. Requests are served one at a time and wait up to 90 s in a queue.
 
+A learned re-ranker (`backend/model2_reranker.py`, model in `backend/resources/model2_reranker.json`, numpy only)
+reorders the top 100 of each column and gives the "top 5" list that mixes the groups. It is gradient-boosted trees
+(XGBoost pairwise ranking) over 20 features of each candidate (coverage, likelihood, frequency-weighted coverage,
+profile size, matches, column rank, group, GenCC validity from `backend/resources/gencc_validity.tsv`, CC0).
+Training cases: 48 published prenatal cases and 87 hospital cases whose label is the doctor's first suggestion
+(so it learns the NST > CNV > single-gene priority doctors use). Chosen by cross-validation before the test.
+Fu2022 test (205 prenatal single-gene cases, scored once, not used in training): correct disease in the top 5 of
+its column 23 -> 34, shown on the web 35 -> 48, overall top 10 30 -> 35. Scores are ranking scores, not probabilities.
+Without the model file the web falls back to the ic_coverage order.
+
 The mechanism classifier in `training/` is not used by the web service. Its first run used labels derived
 from doctors' first-listed suggestions, not karyotype/CMA/exome results, so its scores measure agreement
 with those suggestions, not diagnostic accuracy.

@@ -77,6 +77,25 @@ class WebTests(unittest.TestCase):
         expected = reference.rank(obs, top_k=100, ranking_strategy=RankingStrategy.IC_COVERAGE)
         self.assertEqual([c.disease_id for c in merged_here[:100]], [c.disease_id for c in expected])
 
+    def test_reranker_keeps_columns_and_top_overall(self):
+        hpos = [{'id': h, 'status': 'CÓ'} for h in ('HP:0001674', 'HP:0001274', 'HP:0001539', 'HP:0001511')]
+        result = self.system.match({'hpos': hpos})
+        self.assertTrue(result['reranked'])
+        ids = [c['disease_id'] for c in result['candidates']]
+        self.assertTrue(1 <= len(result['top_overall']) <= 5)
+        self.assertTrue(set(result['top_overall']) <= set(ids))
+        order = ['NST', 'CNV', 'DON_GEN', 'CHUA_RO']
+        groups = [c['group'] for c in result['candidates']]
+        self.assertEqual(groups, sorted(groups, key=order.index))
+        self.assertEqual(result['top_overall'][0], 'ORPHA:3380')  # trisomy 18 pattern
+
+    def test_reranker_json_matches_feature_list(self):
+        from model2_reranker import FEATURES, Reranker
+        from web_service import RERANKER_FILES
+        model = Reranker.load(RERANKER_FILES[-1])
+        self.assertEqual(tuple(model.spec['features']), FEATURES)
+        self.assertIsInstance(model.score([0.5] * len(FEATURES)), float)
+
     def test_requests_queue_instead_of_failing(self):
         import serve_web
         self.assertGreaterEqual(serve_web.QUEUE_SECONDS, 30)
