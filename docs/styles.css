@@ -53,3 +53,5 @@ footer{color:var(--muted)}
 dialog{border-radius:18px}dialog::backdrop{background:#0e261799}
 @media print{body{font-family:Inter,'Be Vietnam Pro','Segoe UI',sans-serif;background:#fff;color:#000}}
 @media(max-width:760px){.intro{padding:24px 20px;border-radius:16px}.steps b{white-space:nowrap}}
+/* Page background: template sage green (27/09/2026). */
+:root{--paper:#cad8cf}body{background:var(--paper)}.steps{color:#2d4436}footer{color:#2d4436}
