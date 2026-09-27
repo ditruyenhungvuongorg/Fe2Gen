@@ -4,8 +4,8 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>Fe2gen · From Fetal to Gene</title>
-<link rel="stylesheet" href="styles.css?v=20260927b">
-<script defer src="config.js"></script><script defer src="case-state.js?v=20260927b"></script><script defer src="app.js?v=20260927b"></script>
+<link rel="stylesheet" href="styles.css?v=20260927c">
+<script defer src="config.js"></script><script defer src="case-state.js?v=20260927c"></script><script defer src="app.js?v=20260927c"></script>
 </head>
 <body>
 <header class="topbar"><a class="brand" href="./"><span class="brand-icon">F</span><span>Fe2gen<span class="brand-sub">FROM FETAL TO GENE</span></span></a><div class="top-actions"><span id="connection" role="status">Đang kết nối…</span><button id="settings-open" class="quiet">Kết nối</button><button id="new-case" class="quiet">Ca mới</button></div></header>
@@ -21,7 +21,7 @@
 <div id="manual" role="tabpanel" aria-labelledby="tab-search"><label for="query">Tên dấu hiệu hoặc mã HPO</label><input id="query" type="search" autocomplete="off" placeholder="đầu nhỏ, Microcephaly, HP:0000252"><p class="hint">Tìm tiếng Việt có/không dấu, tiếng Anh hoặc mã HPO.</p><p id="search-status" class="hint" role="status">Nhập tên dấu hiệu để bắt đầu tìm.</p><div id="search-results" class="search-results"></div></div>
 <div id="paragraph" role="tabpanel" aria-labelledby="tab-text" hidden><label for="clinical-text">Mô tả siêu âm</label><textarea id="clinical-text" rows="6" maxlength="6000" placeholder="Dán đoạn mô tả siêu âm để nhận diện các cụm dấu hiệu…"></textarea><p class="hint">Model trích cụm nguyên văn; bác sĩ chọn HPO tương ứng trước khi đối chiếu.</p><button id="extract" class="full">Tách dấu hiệu từ văn bản</button><p id="extract-status" class="hint" role="status"></p><div id="mentions"></div></div>
 </section>
-<section class="panel"><div class="section-heading"><h2>HPO của ca <span id="hpo-count" class="count">0</span></h2><button id="clear-hpos" class="text-button">Xóa danh sách</button></div><p class="hint">Xác nhận trạng thái cho từng dấu hiệu. Chưa nhắc đến không có nghĩa là không có.</p><p id="conflict-summary" class="notice" role="status" hidden></p><div id="selected"></div><label class="check"><input type="checkbox" id="reviewed"> Tôi đã duyệt mã HPO và trạng thái của ca này.</label><button id="match" class="full" disabled>Đối chiếu bệnh <span>→</span></button></section>
+<section class="panel"><div class="section-heading"><h2>HPO của ca <span id="hpo-count" class="count">0</span></h2><button id="clear-hpos" class="text-button">Xóa danh sách</button></div><p class="hint">Xác nhận trạng thái cho từng dấu hiệu. Chưa nhắc đến không có nghĩa là không có.</p><p id="conflict-summary" class="notice" role="status" hidden></p><div id="selected"></div><label for="wes-genes">Gene ứng viên từ WES <span class="subtle">(tuỳ chọn)</span></label><textarea id="wes-genes" rows="2" maxlength="20000" placeholder="Ví dụ: FGFR3, TSC2, PTPN11 — dán danh sách gene còn lại sau khi lọc biến thể"></textarea><p class="hint">Có danh sách gene thì Model 2 xếp hạng các gene/bệnh này theo kiểu hình của ca.</p><label class="check"><input type="checkbox" id="reviewed"> Tôi đã duyệt mã HPO và trạng thái của ca này.</label><button id="match" class="full" disabled>Đối chiếu bệnh <span>→</span></button></section>
 
 <section class="panel results-area" aria-label="Kết quả đối chiếu">
 <div class="results-heading"><div><p class="eyebrow">ĐỐI CHIẾU KIỂU HÌNH</p><h2 id="results-title">Kết quả bệnh tiềm năng</h2></div><select id="inheritance-filter" aria-label="Lọc kiểu di truyền"><option value="">Tất cả kiểu di truyền</option></select></div>

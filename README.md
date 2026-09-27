@@ -48,6 +48,12 @@ Fu2022 test (205 prenatal single-gene cases, scored once, not used in training):
 its column 23 -> 34, shown on the web 35 -> 48, overall top 10 30 -> 35. Scores are ranking scores, not probabilities.
 Without the model file the web falls back to the ic_coverage order.
 
+WES mode: a candidate-gene list from an exome report (optional field) restricts a separate panel to diseases
+of those genes, in the same phenotype order, and ranks the genes. Spike-in evaluation (causal gene + N random
+disease genes, 10 draws, re-ranker frozen, nothing tuned): Fu2022 test, correct gene in the top 5 at
+N = 20/50/100: 91.7% / 82.4% / 70.1% (random order 23.8% / 9.8% / 5.0%). This assumes the exome found the
+causal variant; the lists are simulated, not real VCFs.
+
 The mechanism classifier in `training/` is not used by the web service. Its first run used labels derived
 from doctors' first-listed suggestions, not karyotype/CMA/exome results, so its scores measure agreement
 with those suggestions, not diagnostic accuracy.

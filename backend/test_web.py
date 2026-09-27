@@ -96,6 +96,27 @@ class WebTests(unittest.TestCase):
         self.assertEqual(tuple(model.spec['features']), FEATURES)
         self.assertIsInstance(model.score([0.5] * len(FEATURES)), float)
 
+    def test_wes_genes_rank_listed_genes_by_phenotype(self):
+        # Cardiac rhabdomyoma with a WES list holding TSC2 among unrelated genes.
+        result = self.system.match({'hpos': [{'id': 'HP:0009729', 'status': 'CÓ'}],
+                                    'genes': 'BRCA2, TSC2, MYH7 , ttn; FGFR3 NOTAGENE1'})
+        wes = result['wes']
+        self.assertEqual(wes['genes_ranked'][0], 'TSC2')
+        self.assertIn('NOTAGENE1', wes['unknown_genes'])
+        by_id = {c['disease_id']: c for c in result['candidates']}
+        first = by_id[wes['diseases'][0]]
+        self.assertEqual(first['wes_rank'], 1)
+        self.assertIn('TSC2', first['wes_genes'])
+        columns = [c for c in result['candidates'] if c['in_column']]
+        self.assertTrue(all(c['rank'] is not None for c in columns))
+        with self.assertRaises(ValueError):
+            self.system.match({'hpos': [{'id': 'HP:0009729', 'status': 'CÓ'}], 'genes': 'TSC2 <script>'})
+
+    def test_no_genes_means_no_wes_block(self):
+        result = self.system.match({'hpos': [{'id': 'HP:0009729', 'status': 'CÓ'}]})
+        self.assertIsNone(result['wes'])
+        self.assertTrue(all(c['in_column'] for c in result['candidates']))
+
     def test_requests_queue_instead_of_failing(self):
         import serve_web
         self.assertGreaterEqual(serve_web.QUEUE_SECONDS, 30)

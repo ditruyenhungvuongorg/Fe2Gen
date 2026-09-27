@@ -164,13 +164,14 @@ $('extract').onclick = async () => {
 };
 $('clear-hpos').onclick = () => { selection.clear(); invalidate(); renderSelected(); renderSearch(); renderMentions(); notice('Đã xóa danh sách HPO. Đoạn văn và gợi ý vẫn được giữ.'); };
 $('reviewed').onchange = updateActions;
+$('wes-genes').oninput = () => { if (result) invalidate(); };
 $('match').onclick = async () => {
   if (busy || selection.conflicts || !$('reviewed').checked) return;
   const seq = revision;
-  const snapshot = {hpos:structuredClone([...chosen.values()]), text:$('clinical-text').value};
+  const snapshot = {hpos:structuredClone([...chosen.values()]), text:$('clinical-text').value, wesText:$('wes-genes').value.trim()};
   busy = 'match'; updateActions(); notice('Đang đối chiếu hồ sơ bệnh hiếm…');
   try {
-    const data = await api('/api/match_diseases', {hpos:snapshot.hpos.map(h => ({id:h.id,status:h.status}))});
+    const data = await api('/api/match_diseases', {hpos:snapshot.hpos.map(h => ({id:h.id,status:h.status})), genes:snapshot.wesText});
     if (seq !== revision) return;
     result = {...data, ...snapshot};
     labIds.clear();
@@ -200,6 +201,15 @@ function renderResults(){
   $('results').replaceChildren();
   if(!list.length){$('results').innerHTML='<p class="no-results">Không có kết quả phù hợp bộ lọc.</p>';return;}
   if(!result.grouped){for(const c of list)$('results').append(diseaseCard(c));return;}
+  if(result.wes){
+    const w=result.wes, wl=w.diseases.map(id=>list.find(c=>c.disease_id===id)).filter(Boolean);
+    const box=document.createElement('section');box.className='top-overall wes';
+    box.innerHTML='<header class="group-head"><h3>Xếp hạng theo gene WES</h3><span>'+w.genes.length+' gene ứng viên · thứ tự theo kiểu hình của ca · cần bác sĩ và phòng xét nghiệm duyệt</span></header>'+
+      (w.genes_ranked.length?'<p><b>Gene ưu tiên:</b> '+w.genes_ranked.slice(0,10).map((g,i)=>'<span class="pill '+(i<5?'purple':'gray')+'">'+(i+1)+'. '+escape(g)+'</span>').join(' ')+'</p>':'<p class="hint">Không gene nào trong danh sách có bệnh khớp kiểu hình.</p>')+
+      (wl.length?'<ol>'+wl.map(c=>'<li><b>'+escape(c.disease_name)+'</b> <span class="hint">'+escape(c.disease_id)+' · gene '+c.wes_genes.map(escape).join(', ')+' · '+c.match_percentage+'% tương đồng</span></li>').join('')+'</ol>':'')+
+      (w.unknown_genes.length?'<p class="hint">Chưa có liên kết bệnh trong dữ liệu: '+w.unknown_genes.slice(0,30).map(escape).join(', ')+(w.unknown_genes.length>30?'…':'')+'</p>':'');
+    $('results').append(box);
+  }
   const top=(result.top_overall||[]).map(id=>list.find(c=>c.disease_id===id)).filter(Boolean);
   if(top.length){
     const box=document.createElement('section');box.className='top-overall';
@@ -209,7 +219,7 @@ function renderResults(){
   }
   const columns=document.createElement('div');columns.className='group-columns';
   for(const g of GROUPS){
-    const items=list.filter(c=>c.group===g.id);
+    const items=list.filter(c=>c.group===g.id&&c.in_column!==false);
     if(g.id==='CHUA_RO'&&!items.length)continue;
     const col=document.createElement('section');col.className='group-column'+(g.id==='CHUA_RO'?' group-other':'');
     col.innerHTML='<header class="group-head"><h3>'+escape(g.title)+'</h3><span>'+escape(g.test)+'</span></header>';
@@ -246,7 +256,7 @@ $('export').onclick=()=>{
   const rows=result.candidates.filter(c=>labIds.has(c.disease_id));
   const table=(heads,body)=>'<table><thead><tr>'+heads.map(h=>'<th>'+escape(h)+'</th>').join('')+'</tr></thead><tbody>'+body.map(r=>'<tr>'+r.map(v=>'<td>'+escape(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
   $('sheet').innerHTML='<p style="text-align:center">HỘI CHẨN DI TRUYỀN TIỀN SẢN</p><h1>PHIẾU GỬI LAB DI TRUYỀN</h1><p>Mã ca: '+escape($('case-id').value||'……………………')+' · Tuổi thai: '+escape($('gestation').value||'……………………')+'\nBác sĩ: '+escape($('doctor').value||'……………………')+'\nNgày lập: '+escape(new Date().toLocaleString('vi-VN'))+'</p>'+
-  '<h2>1. Mô tả siêu âm</h2><p>'+escape(result.text||'Nhập dấu hiệu bằng tra cứu HPO.')+'</p><h2>2. Kiểu hình đã duyệt</h2>'+
+  (result.wesText?'<h2>Gene ứng viên từ WES</h2><p>'+escape(result.wesText)+'</p>':'')+'<h2>1. Mô tả siêu âm</h2><p>'+escape(result.text||'Nhập dấu hiệu bằng tra cứu HPO.')+'</p><h2>2. Kiểu hình đã duyệt</h2>'+
   table(['Mã HPO','Tiếng Việt','Tiếng Anh','Trạng thái'],result.hpos.map(h=>[h.id,h.vi,h.en,h.status]))+
   '<h2>3. Bệnh được bác sĩ chọn để hội chẩn</h2>'+table(['Hạng','Bệnh / mã','Tương đồng','Kiểu di truyền','Gen'],rows.map(c=>[(c.group?groupTitle(c.group)+' #':'')+c.rank,c.disease_name+' · '+c.disease_id,c.match_percentage+'%',c.inheritance_modes.join(', '),c.causative_genes.join(', ')]))+
   '<p>Phần trăm là độ tương đồng kiểu hình, không phải xác suất mắc bệnh.</p><h2>4. Gợi ý xét nghiệm để bác sĩ xem xét</h2>'+
@@ -257,7 +267,7 @@ $('export').onclick=()=>{
 $('print').onclick=()=>window.print();$('close-lab').onclick=()=>$('lab').close();
 $('new-case').onclick=()=>{
   if((chosen.size||$('clinical-text').value)&&!confirm('Bắt đầu ca mới và xóa nội dung ca hiện tại trong phiên này?'))return;
-  extractVersion++;searchVersion++;connectionVersion++;clearTimeout(timer);for(const c of requests)c.abort('new-case');selection.clear();extraction=null;searchTerms=[];for(const id of ['case-id','gestation','doctor','clinical-text','query'])$(id).value='';
+  extractVersion++;searchVersion++;connectionVersion++;clearTimeout(timer);for(const c of requests)c.abort('new-case');selection.clear();extraction=null;searchTerms=[];for(const id of ['case-id','gestation','doctor','clinical-text','query','wes-genes'])$(id).value='';
   renderMentions();renderSearch();invalidate();renderSelected();notice('');localStatus('extract-status','');localStatus('search-status','Nhập tên dấu hiệu để bắt đầu tìm.');
 };
 $('settings-open').onclick=()=>{$('api-url').value=base;$('settings').showModal();};

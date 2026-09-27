@@ -19,6 +19,8 @@ XREF_FILES = (BASE_DIR / 'data/disease_xref_mondo.tsv', BASE_DIR / 'resources/di
 CATEGORY_FILES = (BASE_DIR / 'data/disease_category.tsv', BASE_DIR / 'resources/disease_category.tsv')
 RERANKER_FILES = (BASE_DIR / 'data/model2_reranker.json', BASE_DIR / 'resources/model2_reranker.json')
 TOP_OVERALL = 5
+WES_TOP = 10
+GENE_SYMBOL = re.compile(r'^[A-Z0-9][A-Z0-9.-]{0,19}$')
 
 
 def load_categories(path):
@@ -192,7 +194,26 @@ class WebSystem(Fe2genSystem):
         pool.sort(key=lambda item: -item[0])
         return [c for _, c in pool] + rest
 
+    def parse_genes(self, raw):
+        """Candidate genes from a WES report: a list or a comma/space separated string of HGNC symbols."""
+        if raw in (None, '', []):
+            return []
+        items = re.split(r'[\s,;]+', raw) if isinstance(raw, str) else raw
+        if not isinstance(items, list) or len(items) > 1000:
+            raise ValueError('Danh sách gene WES không hợp lệ (tối đa 1.000 gene).')
+        genes = []
+        for item in items:
+            symbol = str(item).strip().upper()
+            if not symbol:
+                continue
+            if not GENE_SYMBOL.match(symbol):
+                raise ValueError(f'Ký hiệu gene không hợp lệ: {symbol[:20]}')
+            if symbol not in genes:
+                genes.append(symbol)
+        return genes
+
     def match(self, payload):
+        wes_genes = self.parse_genes(payload.get('genes'))
         hpos = payload.get('hpos')
         if not isinstance(hpos, list) or not 1 <= len(hpos) <= 100:
             raise ValueError('Chọn từ 1 đến 100 HPO đã duyệt.')
@@ -231,6 +252,23 @@ class WebSystem(Fe2genSystem):
             chosen.sort(key=lambda item: (position[item[2]], item[1]))
         else:
             chosen = [(overall, overall, None, c) for overall, c in enumerate(ranked[:20], 1)]
+        # WES mode: only diseases with a listed gene, in the same phenotype order.
+        wes, wes_rank = None, {}
+        if wes_genes:
+            listed, genes_ranked, known = set(wes_genes), [], set()
+            for genes in self.disease_to_genes.values():
+                known.update(genes)
+            for overall, c in enumerate(ranked, 1):
+                same = [c.disease_id, *equivalents.get(c.disease_id, [])]
+                hits = sorted({g for d in same for g in self.disease_to_genes.get(d, [])} & listed)
+                if hits and len(wes_rank) < WES_TOP:
+                    wes_rank[c.disease_id] = (len(wes_rank) + 1, hits)
+                    genes_ranked += [g for g in hits if g not in genes_ranked]
+                    if c.disease_id not in {item[3].disease_id for item in chosen}:
+                        group = self.categories.get(c.disease_id, ('CHUA_RO', False))[0] if self.categories else None
+                        chosen.append((overall, None, group, c))
+            wes = {'genes': wes_genes, 'diseases': list(wes_rank), 'genes_ranked': genes_ranked,
+                   'unknown_genes': [g for g in wes_genes if g not in known]}
         output = []
         for overall, rank, group, c in chosen:
             profile = self.profiles_by_id[c.disease_id]
@@ -252,6 +290,8 @@ class WebSystem(Fe2genSystem):
             genes = list(dict.fromkeys(g for d in same for g in self.disease_to_genes.get(d, [])))
             modes = sorted({h for d in same for h in self.inheritance[d]})
             output.append({'rank': rank, 'overall_rank': overall, 'group': group, 'equivalent_ids': same[1:],
+                'in_column': rank is not None, 'wes_rank': wes_rank.get(c.disease_id, (None,))[0],
+                'wes_genes': wes_rank.get(c.disease_id, (None, []))[1],
                 'mixed_mechanism': self.categories.get(c.disease_id, (None, False))[1],
                 'disease_id': c.disease_id, 'disease_name': c.disease_name,
                 'match_percentage': round(max(0, min(1, c.ic_weighted_coverage)) * 100, 1),
@@ -263,7 +303,7 @@ class WebSystem(Fe2genSystem):
                 'model3_recommended_tests': (exact_profile.recommended_first_tier + '. ' + exact_profile.recommended_second_tier) if exact_profile else '',
                 'negative_conflict': c.negative_conflict})
         top_overall = [c.disease_id for c in ranked[:TOP_OVERALL] if c.ic_weighted_coverage > 0] if self.categories else []
-        return {'candidates': output, 'grouped': bool(self.categories), 'top_overall': top_overall,
+        return {'candidates': output, 'grouped': bool(self.categories), 'top_overall': top_overall, 'wes': wes,
                 'reranked': bool(self.reranker), 'category_version': self.category_version,
                 'clinical_pattern': report.clinical_pattern,
                 'score_semantics': 'IC-weighted phenotype similarity; not disease probability', 'observations': hpos}
