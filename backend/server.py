@@ -80,7 +80,9 @@ class Fe2genSystem:
         hpoa_path = data_dir / "phenotype.hpoa"
         obo_path = data_dir / "hp.obo"
         genes_path = data_dir / "genes_to_disease.txt"
-        catalog_path = data_dir / "hpo_catalog_vi.json"
+        # A local data/ copy takes precedence over the public dictionary shipped in resources/.
+        catalog_path = next((p for p in (data_dir / "hpo_catalog_vi.json", BASE_DIR / "resources" / "hpo_catalog_vi.json") if p.is_file()),
+                            data_dir / "hpo_catalog_vi.json")
         sample_cases_path = data_dir / "sample_cases.json"
 
         # 1. Load HPO Matcher (Model 2)

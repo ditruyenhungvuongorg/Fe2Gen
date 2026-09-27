@@ -7,6 +7,7 @@ from server import Fe2genSystem, normalize_text, BASE_DIR
 from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
 from model1_v38_package.model1_runner import Model1V38Runner
+from model1_v6.runner import Model1V6Runner
 
 STATUS = {'CÓ': PhenotypeStatus.PRESENT, 'NGHI NGỜ': PhenotypeStatus.SUSPECTED, 'KHÔNG': PhenotypeStatus.ABSENT}
 # Left-to-right order of the result columns, following the usual prenatal test
@@ -69,7 +70,9 @@ class WebSystem(Fe2genSystem):
             print(f'[Model 2] Nạp nhóm cơ chế cho {len(self.categories):,} bệnh từ {path.relative_to(BASE_DIR)}.')
         else:
             print('[Model 2] Chưa có disease_category.tsv: kết quả hiển thị một danh sách chung.')
-        self.runner = Model1V38Runner(os.getenv('MODEL1_ADAPTER'), os.getenv('MODEL1_WORKER_DIR'))
+        # Model 1 v6 (ensemble extractor + HPO retriever/reranker) when its private bundle is configured; else v3.8.
+        bundle = os.getenv('MODEL1_V6_BUNDLE')
+        self.runner = Model1V6Runner(bundle) if bundle else Model1V38Runner(os.getenv('MODEL1_ADAPTER'), os.getenv('MODEL1_WORKER_DIR'))
 
     def term(self, hid):
         t = self.canonical.get(hid, {})
@@ -109,6 +112,8 @@ class WebSystem(Fe2genSystem):
     def extract(self, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 6000:
             raise ValueError('Nhập đoạn mô tả từ 1 đến 6.000 ký tự.')
+        if isinstance(self.runner, Model1V6Runner):
+            return self.extract_v6(text)
         mentions = []
         for span in self.runner.extract_spans(text):
             phrase = span['mention_text']
@@ -121,6 +126,25 @@ class WebSystem(Fe2genSystem):
                              'context_review': caution, 'candidates': choices,
                              'mapping': 'exact_dictionary' if exact else 'search_suggestion', 'approved': False})
         return {'mentions': mentions, 'engine': 'model1_v3.8_lora', 'review_required': True}
+
+    def extract_v6(self, text):
+        """Findings + assertion from the v6 ensemble; HPO candidates in reranked order (ranking scores, not probabilities)."""
+        result = self.runner.extract(text)
+        labels = {'present': 'CÓ', 'suspected': 'NGHI NGỜ'}
+        mentions = []
+        for f in result['findings']:
+            context = re.split(r'[.;,\n]', text[:f['span_start']])[-1]
+            caution = bool(re.search(r'\b(không|chưa|mẹ|cha|gia đình|tiền sử)\b', context, re.I)) or f.get('alignment') == 'ambiguous_first_occurrence'
+            choices = [dict(self.term(h['id']), retriever_cosine=h['retriever_cosine'], reranker_logprob=h['reranker_logprob'])
+                       for h in f['hpo_ranked'] if h['id'] in self.canonical]
+            mentions.append({'mention_text': f['mention_text'], 'span_start': f['span_start'], 'span_end': f['span_end'],
+                             'status': labels[f['assertion']],
+                             'explanation': 'Model 1 v6 gợi ý trạng thái ' + labels[f['assertion']] + '; bác sĩ xác nhận.',
+                             'context_review': caution, 'alignment': f.get('alignment', 'unique'),
+                             'candidates': choices or self.search_hpo(f['mention_text'], 5),
+                             'mapping': 'model1_v6_retriever_reranker' if choices else 'search_suggestion', 'approved': False})
+        return {'mentions': mentions, 'engine': 'model1_v6_ensemble', 'review_required': True,
+                'warnings': result.get('errors', []), 'seconds': result.get('seconds')}
 
     def match(self, payload):
         hpos = payload.get('hpos')

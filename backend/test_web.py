@@ -86,5 +86,41 @@ class WebTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             align('tim bình thường', '{"phrases":["đầu nhỏ"]}')
 
+    def test_v6_extraction_keeps_review_gate_and_ranked_candidates(self):
+        from model1_v6.runner import Model1V6Runner
+        s = self.system
+        original = s.runner
+        text = 'Thai 22 tuần, TD hẹp eo ĐMC, không thấy dạ dày'
+        a, b = text.index('hẹp eo ĐMC'), text.index('dạ dày')
+        s.runner = Mock(spec=Model1V6Runner)
+        s.runner.extract.return_value = {'findings': [
+            {'mention_text': 'hẹp eo ĐMC', 'span_start': a, 'span_end': a + 10, 'assertion': 'suspected',
+             'hpo_ranked': [{'id': 'HP:0001680', 'retriever_cosine': 0.99, 'reranker_logprob': -0.01},
+                            {'id': 'HP:9999999', 'retriever_cosine': 0.5, 'reranker_logprob': -9.0}]},
+            {'mention_text': 'dạ dày', 'span_start': b, 'span_end': b + 6, 'assertion': 'present', 'alignment': 'unique',
+             'hpo_ranked': [{'id': 'HP:9999999', 'retriever_cosine': 0.4, 'reranker_logprob': -1.0}]}],
+            'errors': [], 'seconds': 1.0}
+        try:
+            out = s.extract(text)
+            self.assertTrue(out['review_required'])
+            self.assertEqual(out['engine'], 'model1_v6_ensemble')
+            first, second = out['mentions']
+            self.assertEqual((first['status'], first['approved']), ('NGHI NGỜ', False))
+            self.assertEqual([c['id'] for c in first['candidates']], ['HP:0001680'])  # unknown IDs are dropped
+            self.assertEqual(text[first['span_start']:first['span_end']], first['mention_text'])
+            self.assertTrue(second['context_review'])  # "không" before the finding: doctor must choose the status
+            self.assertEqual(second['mapping'], 'search_suggestion')  # no catalogue ID left -> dictionary search
+        finally:
+            s.runner = original
+
+    def test_v6_contract_alignment_and_chunks(self):
+        from model1_v6 import contract as C
+        with self.assertRaises(ValueError):
+            C.align('đầu nhỏ, đầu nhỏ', '{"findings":[{"text":"đầu nhỏ","assertion":"present"}]}')
+        got = C.lenient_align('đầu nhỏ, đầu nhỏ', '{"findings":[{"text":"đầu nhỏ","assertion":"present"}]}')
+        self.assertEqual((got[0]['span_start'], got[0]['alignment']), (0, 'ambiguous_first_occurrence'))
+        text = 'Thai 30 tuần. ' + 'Tim: hẹp eo ĐMC, thông liên thất. ' * 60
+        self.assertTrue(all(text[o:o + len(c)] == c for o, c in C.chunks(text, 1200)))
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
