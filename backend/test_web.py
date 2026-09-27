@@ -54,6 +54,33 @@ class WebTests(unittest.TestCase):
         nst = [c['disease_id'] for c in result['candidates'] if c['group'] == 'NST']
         self.assertIn('ORPHA:3380', nst)
 
+    def test_equivalent_ids_are_listed_once(self):
+        # 4 HPO of the trisomy 18 pattern; the MONDO table merges OMIM/ORPHA pairs.
+        hpos = [{'id': h, 'status': 'CÓ'} for h in ('HP:0001674', 'HP:0001274', 'HP:0001539', 'HP:0001511')]
+        result = self.system.match({'hpos': hpos})
+        resolve = self.system.resolver.resolve
+        concepts = [resolve(c['disease_id']) for c in result['candidates']]
+        self.assertEqual(len(concepts), len(set(concepts)))
+        merged = [c for c in result['candidates'] if c['equivalent_ids']]
+        self.assertTrue(merged)
+        for c in merged:
+            self.assertTrue(all(resolve(e) == resolve(c['disease_id']) for e in c['equivalent_ids']))
+
+    def test_merge_matches_matcher_resolver(self):
+        # Same result as HPOAgent2Matcher.rank with the resolver loaded, on the top-100.
+        from hpo_agents.agent2_matcher import HPOAgent2Matcher
+        from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy
+        obs = [PhenotypeObservation(h, PhenotypeStatus.PRESENT) for h in ('HP:0001636', 'HP:0012020')]
+        s = self.system
+        merged_here, _ = s.merge_equivalents(s.matcher.rank(obs, top_k=None, ranking_strategy=RankingStrategy.IC_COVERAGE))
+        reference = HPOAgent2Matcher(s.matcher.profiles, s.matcher.ontology, disease_resolver=s.resolver)
+        expected = reference.rank(obs, top_k=100, ranking_strategy=RankingStrategy.IC_COVERAGE)
+        self.assertEqual([c.disease_id for c in merged_here[:100]], [c.disease_id for c in expected])
+
+    def test_requests_queue_instead_of_failing(self):
+        import serve_web
+        self.assertGreaterEqual(serve_web.QUEUE_SECONDS, 30)
+
     def test_shipped_category_table(self):
         from web_service import CATEGORY_FILES, load_categories
         table, version = load_categories(CATEGORY_FILES[-1])

@@ -1,3 +1,5 @@
+> Cập nhật 27/09/2026: repo đổi tên thành Fe2Gen; địa chỉ web hiện là https://ditruyenhungvuongorg.github.io/Fe2Gen/ và repo https://github.com/ditruyenhungvuongorg/Fe2Gen. Nội dung bên dưới là báo cáo gốc ngày 19/09.
+
 # Báo cáo triển khai và kiểm thử — 19/09/2026
 
 ## Địa chỉ

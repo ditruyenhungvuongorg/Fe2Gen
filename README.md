@@ -21,7 +21,7 @@ This is a research/clinical-review tool, not a validated diagnostic device.
 - `docs/`: dependency-free HTML/CSS/JavaScript published by GitHub Pages.
 - `backend/`: Python HTTP boundary, existing matching engine, assertion rules and strict Model 1 runner.
 - `backend/resources/disease_category.tsv`: mechanism group of each HPOA disease (IDs and groups only).
-- `backend/tools/`: `build_disease_category.py` rebuilds that table; `build_mechanism_dataset.py` builds the case table for the mechanism classifier.
+- `backend/tools/`: `build_disease_category.py` rebuilds that table; `build_mechanism_dataset.py` builds the case table for the mechanism classifier; `evaluate_model2.py` measures Model 2 as the web shows it.
 - `training/`: Naive Bayes / SVM / Random Forest / XGBoost comparison for the mechanism classifier (numpy, scikit-learn, xgboost only).
 - Clinical cases, HPO data files, model weights, credentials and training runs are not published here.
 
@@ -34,6 +34,9 @@ genes from Orphanet/OMIM (-> DON_GEN); `co_che_hon_hop=1` marks chromosomal/CNV 
 Mendelian gene. Sources are MONDO and Orphanet product6 releases of 2021-12 (versions and SHA-256 in the file header).
 Diseases absent from HPOA, such as Klinefelter syndrome, cannot be suggested.
 A table rebuilt into `backend/data/disease_category.tsv` takes precedence over the shipped copy.
+OMIM and ORPHA IDs of the same disease (one-to-one pairs sharing a MONDO ID, `backend/resources/disease_xref_mondo.tsv`,
+2,036 pairs) are shown as one card, keeping the better-ranked ID and listing the other; genes and inheritance
+modes of both IDs are combined. Requests are served one at a time and wait up to 90 s in a queue.
 
 The mechanism classifier in `training/` is not used by the web service. Its first run used labels derived
 from doctors' first-listed suggestions, not karyotype/CMA/exome results, so its scores measure agreement

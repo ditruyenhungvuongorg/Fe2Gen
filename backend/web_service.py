@@ -4,7 +4,7 @@ import os
 import re
 from collections import defaultdict
 from server import Fe2genSystem, normalize_text, BASE_DIR
-from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy
+from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy, load_disease_xref
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
 from model1_v38_package.model1_runner import Model1V38Runner
 from model1_v6.runner import Model1V6Runner
@@ -14,6 +14,7 @@ STATUS = {'CÓ': PhenotypeStatus.PRESENT, 'NGHI NGỜ': PhenotypeStatus.SUSPECTE
 # sequence QF-PCR/karyotype -> CMA -> exome; CHUA_RO is listed after them.
 GROUPS = (('NST', 10), ('CNV', 10), ('DON_GEN', 10), ('CHUA_RO', 5))
 # A locally rebuilt table in data/ takes precedence over the copy shipped in the repo.
+XREF_FILES = (BASE_DIR / 'data/disease_xref_mondo.tsv', BASE_DIR / 'resources/disease_xref_mondo.tsv')
 CATEGORY_FILES = (BASE_DIR / 'data/disease_category.tsv', BASE_DIR / 'resources/disease_category.tsv')
 
 
@@ -72,6 +73,9 @@ class WebSystem(Fe2genSystem):
             print('[Model 2] Chưa có disease_category.tsv: kết quả hiển thị một danh sách chung.')
         # Model 1 v6 (ensemble extractor + HPO retriever/reranker) when its private bundle is configured; else v3.8.
         bundle = os.getenv('MODEL1_V6_BUNDLE')
+        xref = next((p for p in XREF_FILES if p.is_file()), None)
+        self.resolver = load_disease_xref(xref) if xref else None
+        print(f'[Model 2] Gộp mã OMIM/ORPHA cùng bệnh: {xref.name if xref else "không có bảng, không gộp"}.')
         self.runner = Model1V6Runner(bundle) if bundle else Model1V38Runner(os.getenv('MODEL1_ADAPTER'), os.getenv('MODEL1_WORKER_DIR'))
 
     def term(self, hid):
@@ -146,6 +150,20 @@ class WebSystem(Fe2genSystem):
         return {'mentions': mentions, 'engine': 'model1_v6_ensemble', 'review_required': True,
                 'warnings': result.get('errors', []), 'seconds': result.get('seconds')}
 
+    def merge_equivalents(self, ranked):
+        """Keep the best-ranked ID of each MONDO disease; the same choice as rank() with a resolver,
+        without rescoring every profile."""
+        kept, first, others = [], {}, {}
+        for candidate in ranked:
+            concept = self.resolver.resolve(candidate.disease_id)
+            if concept in first:
+                others[first[concept]].append(candidate.disease_id)
+            else:
+                first[concept] = candidate.disease_id
+                others[candidate.disease_id] = []
+                kept.append(candidate)
+        return kept, {k: sorted(v) for k, v in others.items() if v}
+
     def match(self, payload):
         hpos = payload.get('hpos')
         if not isinstance(hpos, list) or not 1 <= len(hpos) <= 100:
@@ -165,6 +183,10 @@ class WebSystem(Fe2genSystem):
         # Scoring every profile costs the same as a top-k heap, so rank them all
         # once; overall_rank then shows where a grouped disease stands overall.
         ranked = self.matcher.rank(observations, top_k=None, ranking_strategy=RankingStrategy.IC_COVERAGE)
+        if self.resolver:
+            ranked, equivalents = self.merge_equivalents(ranked)
+        else:
+            equivalents = {}
         report = self.decider.analyze_case(case_id='WEB', observations=positive, disease_candidates=ranked[:20], top_k=5)
         if self.categories:
             chosen, taken = [], {name: 0 for name, _ in GROUPS}
@@ -195,13 +217,17 @@ class WebSystem(Fe2genSystem):
             # "syndrome". Only exact catalog IDs may supply disease-specific text.
             exact_profile = next((p for p in PRENATAL_SYNDROME_CATALOG.values()
                                   if p.canonical_id == c.disease_id), None)
-            output.append({'rank': rank, 'overall_rank': overall, 'group': group,
+            # With the MONDO merge a card stands for its equivalent IDs too.
+            same = [c.disease_id, *equivalents.get(c.disease_id, [])]
+            genes = list(dict.fromkeys(g for d in same for g in self.disease_to_genes.get(d, [])))
+            modes = sorted({h for d in same for h in self.inheritance[d]})
+            output.append({'rank': rank, 'overall_rank': overall, 'group': group, 'equivalent_ids': same[1:],
                 'mixed_mechanism': self.categories.get(c.disease_id, (None, False))[1],
                 'disease_id': c.disease_id, 'disease_name': c.disease_name,
                 'match_percentage': round(max(0, min(1, c.ic_weighted_coverage)) * 100, 1),
                 'matched_phenotypes': matched,
-                'inheritance_modes': [self.labels.get(h, h) for h in sorted(self.inheritance[c.disease_id])],
-                'causative_genes': self.disease_to_genes.get(c.disease_id, []),
+                'inheritance_modes': [self.labels.get(h, h) for h in modes],
+                'causative_genes': genes,
                 'clinical_features_to_check': remaining,
                 'model3_rationale': ('Hồ sơ gợi ý khớp mã bệnh ' + c.disease_id) if exact_profile else '',
                 'model3_recommended_tests': (exact_profile.recommended_first_tier + '. ' + exact_profile.recommended_second_tier) if exact_profile else '',

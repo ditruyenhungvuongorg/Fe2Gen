@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT.parent / 'docs'
 SYSTEM = WebSystem()
 WORK = BoundedSemaphore(1)
+QUEUE_SECONDS = 90
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -98,7 +99,8 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if path not in ('/api/extract_hpo', '/api/match_diseases'):
             return self.send_json({'error': 'Không có endpoint này.'}, 404)
-        if not WORK.acquire(blocking=False):
+        # One request at a time on the GPU; later requests queue instead of failing at once.
+        if not WORK.acquire(timeout=QUEUE_SECONDS):
             return self.send_json({'error': 'Hệ thống đang xử lý ca khác. Vui lòng thử lại.'}, 503)
         try:
             data = SYSTEM.extract(payload.get('text')) if path.endswith('extract_hpo') else SYSTEM.match(payload)
