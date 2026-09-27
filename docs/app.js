@@ -173,7 +173,10 @@ $('match').onclick = async () => {
     const data = await api('/api/match_diseases', {hpos:snapshot.hpos.map(h => ({id:h.id,status:h.status}))});
     if (seq !== revision) return;
     result = {...data, ...snapshot};
-    labIds.clear(); for (const c of data.candidates.slice(0,5)) labIds.add(c.disease_id);
+    labIds.clear();
+    // Grouped results preselect the best match of each mechanism column.
+    const first = data.grouped ? GROUPS.slice(0,3).map(g => data.candidates.find(c => c.group === g.id)).filter(Boolean) : data.candidates.slice(0,5);
+    for (const c of first) labIds.add(c.disease_id);
     const modes = [...new Set(data.candidates.flatMap(c => c.inheritance_modes))].sort();
     $('inheritance-filter').innerHTML = '<option value="">Tất cả kiểu di truyền</option>' + modes.map(m => '<option>' + escape(m) + '</option>').join('');
     renderResults(); notice('');
@@ -181,6 +184,12 @@ $('match').onclick = async () => {
   finally { busy = false; updateActions(); }
 };
 
+const GROUPS=[
+  {id:'NST',title:'Bất thường nhiễm sắc thể',test:'QF-PCR / Karyotype'},
+  {id:'CNV',title:'Vi mất đoạn / CNV',test:'CMA (microarray)'},
+  {id:'DON_GEN',title:'Bất thường đơn gen',test:'WES / Panel gen'},
+  {id:'CHUA_RO',title:'Chưa rõ cơ chế di truyền',test:'Không xếp được vào 3 nhóm trên'}];
+const groupTitle=id=>(GROUPS.find(g=>g.id===id)||{title:''}).title;
 function pills(values,cls){return values.length?values.map(v=>'<span class="pill '+cls+'">'+escape(v)+'</span>').join(''):'<span class="hint">Chưa có thông tin</span>';}
 function renderResults(){
   if(!result)return;
@@ -189,12 +198,25 @@ function renderResults(){
   $('results-title').textContent=list.length+' bệnh tiềm năng';
   $('pattern').textContent=result.clinical_pattern;$('pattern').hidden=!result.clinical_pattern;
   $('results').replaceChildren();
-  if(!list.length)$('results').innerHTML='<p class="no-results">Không có kết quả phù hợp bộ lọc.</p>';
-  for(const c of list){
+  if(!list.length){$('results').innerHTML='<p class="no-results">Không có kết quả phù hợp bộ lọc.</p>';return;}
+  if(!result.grouped){for(const c of list)$('results').append(diseaseCard(c));return;}
+  const columns=document.createElement('div');columns.className='group-columns';
+  for(const g of GROUPS){
+    const items=list.filter(c=>c.group===g.id);
+    if(g.id==='CHUA_RO'&&!items.length)continue;
+    const col=document.createElement('section');col.className='group-column'+(g.id==='CHUA_RO'?' group-other':'');
+    col.innerHTML='<header class="group-head"><h3>'+escape(g.title)+'</h3><span>'+escape(g.test)+'</span></header>';
+    if(!items.length)col.insertAdjacentHTML('beforeend','<p class="no-results">Không có bệnh nào trong nhóm này chia sẻ HPO đã duyệt.</p>');
+    for(const c of items)col.append(diseaseCard(c));
+    columns.append(col);
+  }
+  $('results').append(columns);
+}
+function diseaseCard(c){
     const card=document.createElement('article');card.className='disease';
     const match=c.disease_id.match(/^(OMIM|ORPHA|ORPHANET):(\d+)$/);
     const link=match?(match[1]==='OMIM'?'https://omim.org/entry/':'https://www.orpha.net/en/disease/detail/')+match[2]:'';
-    card.innerHTML='<div class="disease-top"><div class="rank">'+c.rank+'</div><div class="disease-title"><h3>'+escape(c.disease_name)+'</h3>'+(link?'<a target="_blank" rel="noopener noreferrer" href="'+link+'">'+escape(c.disease_id)+' ↗</a>':escape(c.disease_id))+'</div><div class="score">'+c.match_percentage+'%<small>TƯƠNG ĐỒNG</small></div></div>'+
+    card.innerHTML='<div class="disease-top"><div class="rank">'+c.rank+'</div><div class="disease-title"><h3>'+escape(c.disease_name)+'</h3>'+(link?'<a target="_blank" rel="noopener noreferrer" href="'+link+'">'+escape(c.disease_id)+' ↗</a>':escape(c.disease_id))+(c.overall_rank&&c.overall_rank!==c.rank?'<span class="overall">Hạng chung '+c.overall_rank+'</span>':'')+(c.mixed_mechanism?'<span class="pill amber mixed" title="Bệnh có thể do CNV hoặc do biến thể một gen">Cơ chế hỗn hợp</span>':'')+'</div><div class="score">'+c.match_percentage+'%<small>TƯƠNG ĐỒNG</small></div></div>'+
       '<div class="evidence-row"><span class="evidence-label">HPO khớp</span><div>'+pills(c.matched_phenotypes.map(p=>(p.vi||p.en)+' · '+p.id+(p.relation==='exact'?'':' (ngữ nghĩa)')),'blue')+'</div></div>'+
       '<div class="evidence-row"><span class="evidence-label">Kiểu di truyền</span><div>'+pills(c.inheritance_modes,'green')+'</div></div>'+
       '<div class="evidence-row"><span class="evidence-label">Gen liên quan</span><div>'+pills(c.causative_genes,'gray')+'</div></div>'+
@@ -209,8 +231,7 @@ function renderResults(){
       featureList.append(b);
     }
     card.querySelector('input').onchange=e=>{if(e.target.checked)labIds.add(c.disease_id);else labIds.delete(c.disease_id);updateActions();};
-    $('results').append(card);
-  }
+    return card;
 }
 $('inheritance-filter').onchange=renderResults;
 $('export').onclick=()=>{
@@ -220,7 +241,7 @@ $('export').onclick=()=>{
   $('sheet').innerHTML='<p style="text-align:center">HỘI CHẨN DI TRUYỀN TIỀN SẢN</p><h1>PHIẾU GỬI LAB DI TRUYỀN</h1><p>Mã ca: '+escape($('case-id').value||'……………………')+' · Tuổi thai: '+escape($('gestation').value||'……………………')+'\nBác sĩ: '+escape($('doctor').value||'……………………')+'\nNgày lập: '+escape(new Date().toLocaleString('vi-VN'))+'</p>'+
   '<h2>1. Mô tả siêu âm</h2><p>'+escape(result.text||'Nhập dấu hiệu bằng tra cứu HPO.')+'</p><h2>2. Kiểu hình đã duyệt</h2>'+
   table(['Mã HPO','Tiếng Việt','Tiếng Anh','Trạng thái'],result.hpos.map(h=>[h.id,h.vi,h.en,h.status]))+
-  '<h2>3. Bệnh được bác sĩ chọn để hội chẩn</h2>'+table(['Hạng','Bệnh / mã','Tương đồng','Kiểu di truyền','Gen'],rows.map(c=>[c.rank,c.disease_name+' · '+c.disease_id,c.match_percentage+'%',c.inheritance_modes.join(', '),c.causative_genes.join(', ')]))+
+  '<h2>3. Bệnh được bác sĩ chọn để hội chẩn</h2>'+table(['Hạng','Bệnh / mã','Tương đồng','Kiểu di truyền','Gen'],rows.map(c=>[(c.group?groupTitle(c.group)+' #':'')+c.rank,c.disease_name+' · '+c.disease_id,c.match_percentage+'%',c.inheritance_modes.join(', '),c.causative_genes.join(', ')]))+
   '<p>Phần trăm là độ tương đồng kiểu hình, không phải xác suất mắc bệnh.</p><h2>4. Gợi ý xét nghiệm để bác sĩ xem xét</h2>'+
   rows.filter(c=>c.model3_recommended_tests).map(c=>'<p><strong>'+escape(c.disease_name)+'</strong>\n'+escape(c.model3_recommended_tests)+'</p>').join('')+
   '<p>Chỉ định / ghi chú bác sĩ: ........................................................................\n...........................................................................................................</p><div class="signature"><div>Bác sĩ chỉ định<br>(Ký, ghi rõ họ tên)</div><div>Phòng Lab tiếp nhận<br>(Ký, ghi rõ họ tên)</div></div>';

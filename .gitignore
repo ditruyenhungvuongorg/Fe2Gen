@@ -7,3 +7,8 @@ backend/data/
 *.bin
 *.zip
 .deployment/
+
+# Du lieu rieng, khong dua len GitHub
+nghien_cuu/
+model1_v38_worker/
+CHUYEN_MAY.md

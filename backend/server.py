@@ -1,6 +1,6 @@
-"""Prenatal PubCaseFinder Standalone Web Server.
+"""Fe2gen (From Fetal to Gene) standalone web server.
 
-Integrates Model 1 (NER HPO Extraction), Model 2 (PubCaseFinder Phenotype Matcher),
+Integrates Model 1 (NER HPO Extraction), Model 2 (IC-weighted phenotype matcher),
 and Model 3 (ACMG/ACOG Prenatal Decision & Genetic Test Recommender).
 Modeled directly after the PubCaseFinder UI and Dr. Hung Vuong clinical protocols.
 """
@@ -59,7 +59,7 @@ def normalize_text(text: str) -> str:
 # ============================================================================
 # GLOBAL SYSTEM STATE & CACHE
 # ============================================================================
-class PubCaseFinderSystem:
+class Fe2genSystem:
     def __init__(self):
         self.matcher: Optional[HPOAgent2Matcher] = None
         self.decider: Optional[PrenatalDecisionAgent] = None
@@ -72,7 +72,7 @@ class PubCaseFinderSystem:
 
     def initialize(self):
         print("=" * 75)
-        print("   KHỞI ĐỘNG PRENATAL PUBCASEFINDER BACKEND (3-AGENT PIPELINE)   ")
+        print("   KHỞI ĐỘNG FE2GEN BACKEND — FROM FETAL TO GENE   ")
         print("=" * 75)
         t0 = time.time()
 
@@ -219,13 +219,13 @@ class PubCaseFinderSystem:
         return found_mentions
 
 
-GLOBAL_SYSTEM = PubCaseFinderSystem()
+GLOBAL_SYSTEM = Fe2genSystem()
 
 
 # ============================================================================
 # HTTP REQUEST HANDLER
 # ============================================================================
-class PubCaseFinderHandler(SimpleHTTPRequestHandler):
+class Fe2genHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(BASE_DIR / "static"), **kwargs)
 
@@ -280,7 +280,7 @@ class PubCaseFinderHandler(SimpleHTTPRequestHandler):
         self.send_error(404, "Endpoint not found")
 
     def _handle_match_diseases(self, payload: Dict[str, Any]):
-        """PubCaseFinder Matching Engine."""
+        """Phenotype matching endpoint."""
         hpos_input = payload.get("hpos", [])
         clinical_text = payload.get("clinical_text", "")
 
@@ -430,7 +430,7 @@ class PubCaseFinderHandler(SimpleHTTPRequestHandler):
 def run_server(port: int = 8000):
     GLOBAL_SYSTEM.initialize()
     server_address = ("127.0.0.1", port)
-    httpd = HTTPServer(server_address, PubCaseFinderHandler)
+    httpd = HTTPServer(server_address, Fe2genHandler)
     print("=" * 75)
     print(f"   SERVER ĐANG CHẠY TẠI: http://localhost:{port}/ hoặc http://127.0.0.1:{port}/")
     print("   Nhấn Ctrl+C để dừng server.")
