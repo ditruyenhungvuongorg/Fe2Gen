@@ -16,6 +16,8 @@ WORK = BoundedSemaphore(1)
 QUEUE_SECONDS = 90
 
 class Handler(SimpleHTTPRequestHandler):
+    extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.woff2': 'font/woff2'}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_ROOT), **kwargs)
 
@@ -80,7 +82,7 @@ class Handler(SimpleHTTPRequestHandler):
             if path.path == '/api/hpo_search':
                 return self.send_json(SYSTEM.search_hpo(parse_qs(path.query).get('q', [''])[0][:200]))
             return self.send_json({'error': 'Không có endpoint này.'}, 404)
-        if path.path not in ('/', '/index.html', '/styles.css', '/app.js', '/config.js', '/case-state.js', '/fonts/BeVietnamPro-Regular.ttf', '/fonts/BeVietnamPro-SemiBold.ttf', '/fonts/OFL.txt'):
+        if path.path not in ('/', '/index.html', '/styles.css', '/app.js', '/config.js', '/case-state.js', '/fonts/BeVietnamPro-Regular.ttf', '/fonts/BeVietnamPro-SemiBold.ttf', '/fonts/OFL.txt', '/fonts/Inter-vietnamese.woff2', '/fonts/Inter-latin-ext.woff2', '/fonts/Inter-latin.woff2', '/fonts/OFL-Inter.txt'):
             return self.send_error(404)
         super().do_GET()
 
