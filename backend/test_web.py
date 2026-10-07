@@ -139,8 +139,8 @@ class WebTests(unittest.TestCase):
         self.assertIn('RuntimeError', log.getvalue())
 
     def test_v6_runner_without_gpu_raises_runtime_error(self):
-        # unsloth's device check raises NotImplementedError at import when CUDA is unusable; the runner
-        # reports RuntimeError so /api/extract_hpo answers 503 instead of 500.
+        # unsloth's device check raises NotImplementedError at import when CUDA is unusable; its message
+        # blames the AMD iGPU and advises reinstalling PyTorch for ROCm, which would break the NVIDIA setup.
         from model1_v6.runner import Model1V6Runner
 
         class NoGpuUnsloth(types.ModuleType):
