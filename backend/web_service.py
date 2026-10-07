@@ -23,6 +23,10 @@ RERANKER_FILES = (BASE_DIR / 'data/model2_reranker.json', BASE_DIR / 'resources/
 TOP_OVERALL = 5
 WES_TOP = 10
 GENE_SYMBOL = re.compile(r'^[A-Z0-9][A-Z0-9.-]{0,19}$')
+# A reviewed phrase whose HPO means absence but whose words do not ("thận (P)" -> renal agenesis) was cut from a
+# sentence such as "không thấy thận (P)"; its meaning depends on that sentence.
+ABSENCE_TERM = re.compile(r'\b(absent|absence|agenesis|aplasia)\b', re.I)
+ABSENCE_WORD = re.compile(r'\b(không|vắng|mất|bất sản|thiếu|thiểu)\b', re.I)
 
 
 def load_categories(path):
@@ -77,15 +81,19 @@ class WebSystem(Fe2genSystem):
                     if key and term['id'] not in self.lexicon[key]:
                         self.lexicon[key].append(term['id'])
         # Doctor-reviewed phrase -> HPO from the 234 gold cases. Model 1 v6/v7 ranks HPO on its own and misses
-        # some of them (e.g. "thai to" -> HP:0001520 is outside its top 10), so extraction lists these first.
-        self.doctor_phrases = {}
+        # some of them (e.g. "thai to" -> HP:0001520 is outside its top 10), so extraction lists these first,
+        # except context-dependent fragments (7 of 248 on 07/10/2026), which are only appended and flagged.
+        self.doctor_phrases, self.context_phrases = {}, set()
         phrases_path = BASE_DIR / 'data/doctor_clinical_phrases.json'
         if phrases_path.is_file():
             for item in json.loads(phrases_path.read_text(encoding='utf-8')):
                 if item['id'] in self.canonical:
-                    ids = self.doctor_phrases.setdefault(phrase_key(item['vi']), [])
+                    key = phrase_key(item['vi'])
+                    ids = self.doctor_phrases.setdefault(key, [])
                     if item['id'] not in ids:
                         ids.append(item['id'])
+                    if ABSENCE_TERM.search(self.labels.get(item['id'], '')) and not ABSENCE_WORD.search(key):
+                        self.context_phrases.add(key)
         path = next((p for p in CATEGORY_FILES if p.is_file()), CATEGORY_FILES[-1])
         self.categories, self.category_version = load_categories(path)
         if self.categories:
@@ -168,8 +176,12 @@ class WebSystem(Fe2genSystem):
             caution = bool(re.search(r'\b(không|chưa|mẹ|cha|gia đình|tiền sử)\b', context, re.I)) or f.get('alignment') == 'ambiguous_first_occurrence'
             choices = [dict(self.term(h['id']), retriever_cosine=h['retriever_cosine'], reranker_logprob=h['reranker_logprob'])
                        for h in f['hpo_ranked'] if h['id'] in self.canonical]
-            reviewed = self.doctor_phrases.get(phrase_key(f['mention_text']), [])
-            if reviewed:  # the doctor's earlier choice first; the model's candidates stay below it
+            key = phrase_key(f['mention_text'])
+            reviewed = self.doctor_phrases.get(key, [])
+            if key in self.context_phrases:  # meaning lies in the sentence: keep the model order, flag for review
+                choices += [self.term(h) for h in reviewed if h not in {c['id'] for c in choices}]
+                caution, reviewed = True, []
+            elif reviewed:  # the doctor's earlier choice first; the model's candidates stay below it
                 choices = [self.term(h) for h in reviewed] + [c for c in choices if c['id'] not in reviewed]
             mentions.append({'mention_text': f['mention_text'], 'span_start': f['span_start'], 'span_end': f['span_end'],
                              'status': labels[f['assertion']],

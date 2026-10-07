@@ -212,23 +212,35 @@ class WebTests(unittest.TestCase):
         s = self.system
         if (BASE_DIR / 'data/doctor_clinical_phrases.json').is_file():
             self.assertEqual(s.doctor_phrases.get('thai to'), ['HP:0001520'])
+            # Organ-only fragments of "không thấy ..." sentences mean absence only in their sentence.
+            self.assertLessEqual({'thận (p)', 'thận (t)', 'túi mật', 'xương mũi'}, s.context_phrases)
+            self.assertNotIn('thai to', s.context_phrases)
         original = s.runner
-        text = 'Thai 36 tuần, Thai to, đa ối.'
-        a, b = text.index('Thai to'), text.index('đa ối')
+        text = 'Thai 36 tuần, Thai to. Túi mật bình thường, đa ối.'
+        a, g, b = text.index('Thai to'), text.index('Túi mật'), text.index('đa ối')
         s.runner = Mock(spec=Model1V6Runner)
         s.runner.extract.return_value = {'findings': [
             {'mention_text': 'Thai to', 'span_start': a, 'span_end': a + 7, 'assertion': 'present',
              'hpo_ranked': [{'id': 'HP:0001518', 'retriever_cosine': 0.5, 'reranker_logprob': -0.02},
                             {'id': 'HP:0001640', 'retriever_cosine': 0.68, 'reranker_logprob': -5.8}]},
+            {'mention_text': 'Túi mật', 'span_start': g, 'span_end': g + 7, 'assertion': 'present',
+             'hpo_ranked': [{'id': 'HP:0002240', 'retriever_cosine': 0.6, 'reranker_logprob': -0.5},
+                            {'id': 'HP:0001640', 'retriever_cosine': 0.5, 'reranker_logprob': -3.0}]},
             {'mention_text': 'đa ối', 'span_start': b, 'span_end': b + 5, 'assertion': 'present',
              'hpo_ranked': [{'id': 'HP:0001561', 'retriever_cosine': 1.0, 'reranker_logprob': 0.0}]}],
             'errors': [], 'seconds': 1.0}
         try:
-            with patch.object(s, 'doctor_phrases', {'thai to': ['HP:0001520']}):
-                big, poly = s.extract(text)['mentions']
+            with patch.object(s, 'doctor_phrases', {'thai to': ['HP:0001520'], 'túi mật': ['HP:0011467']}), \
+                 patch.object(s, 'context_phrases', {'túi mật'}):
+                big, gall, poly = s.extract(text)['mentions']
             self.assertEqual([c['id'] for c in big['candidates']], ['HP:0001520', 'HP:0001518', 'HP:0001640'])
             self.assertEqual(big['mapping'], 'doctor_reviewed_phrase')
             self.assertIn('bác sĩ đã duyệt', big['explanation'])
+            # A fragment never goes first: "Túi mật bình thường" must not open with absent gallbladder.
+            self.assertEqual([c['id'] for c in gall['candidates']], ['HP:0002240', 'HP:0001640', 'HP:0011467'])
+            self.assertTrue(gall['context_review'])
+            self.assertEqual(gall['mapping'], 'model1_v6_retriever_reranker')
+            self.assertNotIn('bác sĩ đã duyệt', gall['explanation'])
             self.assertEqual([c['id'] for c in poly['candidates']], ['HP:0001561'])  # not reviewed: model order kept
             self.assertEqual(poly['mapping'], 'model1_v6_retriever_reranker')
         finally:
