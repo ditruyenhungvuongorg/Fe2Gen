@@ -33,7 +33,12 @@ class Model1V6Runner:
             return
         if not self.bundle or not (self.bundle / 'manifest.json').is_file():
             raise RuntimeError('Chưa cấu hình bundle Model 1 v6 (MODEL1_V6_BUNDLE).')
-        from unsloth import FastLanguageModel  # must precede transformers
+        # unsloth stays the first import: it sets the CUDA allocator options before torch loads. Without a
+        # usable CUDA GPU its device check raises NotImplementedError, blaming the AMD iGPU on the Ubuntu host.
+        try:
+            from unsloth import FastLanguageModel  # must precede transformers
+        except NotImplementedError as exc:
+            raise RuntimeError('Model 1 v6 cần GPU CUDA.') from exc
         import torch
         from peft import get_peft_model_state_dict
         from peft.utils.save_and_load import load_peft_weights

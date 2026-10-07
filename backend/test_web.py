@@ -1,5 +1,11 @@
+import io
+import sys
+import tempfile
+import types
 import unittest
-from unittest.mock import Mock
+from contextlib import redirect_stderr
+from pathlib import Path
+from unittest.mock import Mock, patch
 from web_service import WebSystem
 from model1_v38_package.core import align
 
@@ -120,6 +126,34 @@ class WebTests(unittest.TestCase):
     def test_requests_queue_instead_of_failing(self):
         import serve_web
         self.assertGreaterEqual(serve_web.QUEUE_SECONDS, 30)
+
+    def test_model1_preload_failure_keeps_service_up(self):
+        # 01-07/10/2026 the NVIDIA driver was missing after a reboot; the preload error stopped the
+        # whole service, though search and matching need no GPU.
+        import serve_web
+        broken = Mock()
+        broken.runner.load_model.side_effect = RuntimeError('Model 1 v6 cần GPU CUDA.')
+        log = io.StringIO()
+        with patch.object(serve_web, 'SYSTEM', broken), redirect_stderr(log):
+            serve_web.preload_model1()
+        self.assertIn('RuntimeError', log.getvalue())
+
+    def test_v6_runner_without_gpu_raises_runtime_error(self):
+        # unsloth's device check raises NotImplementedError at import when CUDA is unusable; its message
+        # blames the AMD iGPU and advises reinstalling PyTorch for ROCm, which would break the NVIDIA setup.
+        from model1_v6.runner import Model1V6Runner
+
+        class NoGpuUnsloth(types.ModuleType):
+            def __getattr__(self, name):
+                if name.startswith('__'):
+                    raise AttributeError(name)
+                raise NotImplementedError('Unsloth detected signs of an AMD ROCm GPU')
+
+        with tempfile.TemporaryDirectory() as bundle:
+            Path(bundle, 'manifest.json').write_text('{}', encoding='utf-8')
+            with patch.dict(sys.modules, {'unsloth': NoGpuUnsloth('unsloth')}):
+                with self.assertRaisesRegex(RuntimeError, 'CUDA'):
+                    Model1V6Runner(bundle).load_model()
 
     def test_shipped_category_table(self):
         from web_service import CATEGORY_FILES, load_categories
