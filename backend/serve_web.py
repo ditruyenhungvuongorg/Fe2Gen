@@ -117,10 +117,20 @@ class Handler(SimpleHTTPRequestHandler):
         finally:
             WORK.release()
 
+def preload_model1():
+    """Load Model 1 at startup. HPO search and disease matching need no GPU, so a failure (e.g. no NVIDIA
+    driver after a reboot) must not stop the service: /api/status reports model_ready=false and text
+    extraction answers 503 until the model loads. Restart the service once the GPU works again."""
+    try:
+        SYSTEM.runner.load_model()
+    except Exception as exc:
+        print('Model 1 not loaded; text extraction unavailable, search and matching still served:',
+              type(exc).__name__, exc, file=sys.stderr, flush=True)
+
 if __name__ == '__main__':
     SYSTEM.initialize()
     if os.getenv('MODEL1_PRELOAD') == '1':
-        SYSTEM.runner.load_model()
+        preload_model1()
     port = int(os.getenv('PORT', '8000'))
     print(f'Web ready on 127.0.0.1:{port}', flush=True)
     ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()

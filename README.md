@@ -68,6 +68,9 @@ The serving wrapper calls that worker without changing training files.
 
 Run `python serve_web.py` from the backend directory.
 Set `MODEL1_PRELOAD=1` to preload on service startup.
+If Model 1 cannot load (for example no NVIDIA driver after a kernel update and reboot), the service still starts:
+HPO search and disease matching keep working, `/api/status` reports `model_ready: false` and text extraction
+answers 503. Check `nvidia-smi`, fix the driver, then restart `prenatal-web` to enable extraction again.
 Set `WEB_ACCESS_TOKEN` and `WEB_ALLOWED_ORIGINS` before enabling public HTTPS.
 The service binds loopback; HTTPS is provided by the Ubuntu reverse proxy.
 `server.py` is retained only as a compatibility base for data loading. Use `serve_web.py` as the entrypoint.
@@ -81,6 +84,7 @@ No training is started by this web application.
 
 ## Checks
 `python test_web.py` checks search, alias normalization, input validation, ranking metadata,
-mechanism grouping and the shipped group table, review requirements, and rejection of ambiguous span alignment.
+mechanism grouping and the shipped group table, review requirements, rejection of ambiguous span alignment,
+and that the service starts without a usable GPU.
 GPU/API/UI deployment checks are documented separately; these tests do not establish clinical accuracy.
 
