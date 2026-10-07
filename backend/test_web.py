@@ -180,6 +180,29 @@ class WebTests(unittest.TestCase):
         finally:
             s.runner = original
 
+    def test_extraction_names_the_bundle_version(self):
+        # The served bundle model1_v7_prod runs on the v6 runner; doctors saw "Model 1 v6" until 07/10/2026.
+        from model1_v6.runner import Model1V6Runner
+        s = self.system
+        original = s.runner
+        text = 'Thai đầu nhỏ.'
+        start = text.index('đầu nhỏ')
+        try:
+            for manifest, expected in (({'model_version': 'v7'}, 'v7'), (None, 'v6')):
+                s.runner = Mock(spec=Model1V6Runner)
+                if manifest is not None:
+                    s.runner.manifest = manifest
+                s.runner.extract.return_value = {'findings': [
+                    {'mention_text': 'đầu nhỏ', 'span_start': start, 'span_end': start + 7, 'assertion': 'present',
+                     'hpo_ranked': [{'id': 'HP:0000252', 'retriever_cosine': 0.9, 'reranker_logprob': -0.1}]}],
+                    'errors': [], 'seconds': 1.0}
+                out = s.extract(text)
+                self.assertEqual(out['model_version'], expected)
+                self.assertTrue(out['mentions'][0]['explanation'].startswith('Model 1 ' + expected + ' '))
+                self.assertEqual(out['engine'], 'model1_v6_ensemble')
+        finally:
+            s.runner = original
+
     def test_v6_contract_alignment_and_chunks(self):
         from model1_v6 import contract as C
         with self.assertRaises(ValueError):

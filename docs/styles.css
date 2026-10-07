@@ -39,6 +39,8 @@ input:focus,textarea:focus,select:focus,button:focus-visible,a:focus-visible{out
 .number,.count{background:var(--lime);color:var(--forest);font-weight:600;border-radius:999px}
 .tabs{background:#eef1ef}.tabs button{color:var(--muted);background:transparent}.tabs button[aria-selected=true]{background:#fff;color:var(--forest);box-shadow:0 1px 4px #10100f14}
 .selection-action{color:var(--forest-mid)}.is-selected{background:var(--lime-soft);border-color:#b6e59a}
+/* Light list cards keep a light hover: the dark button:hover above outranks .search-item and hid their dark text. */
+.search-item:hover{background:#f0f3f1}.is-selected:hover{background:#dcf2cb}.search-item:disabled:hover{background:#fff}.is-selected:disabled:hover{background:var(--lime-soft)}
 .check input{accent-color:var(--forest)}
 .empty{background:#fafbfa;border-color:#cfd9d2}.empty-symbol{color:var(--forest-mid)}
 .pill.green{background:var(--lime-soft);color:var(--forest)}

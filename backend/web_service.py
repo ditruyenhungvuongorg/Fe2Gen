@@ -144,6 +144,8 @@ class WebSystem(Fe2genSystem):
         """Findings + assertion from the v6 ensemble; HPO candidates in reranked order (ranking scores, not probabilities)."""
         result = self.runner.extract(text)
         labels = {'present': 'CÓ', 'suspected': 'NGHI NGỜ'}
+        # v7 bundles run on this v6 runner and name their version in the manifest; earlier bundles carry none.
+        version = getattr(self.runner, 'manifest', {}).get('model_version', 'v6')
         mentions = []
         for f in result['findings']:
             context = re.split(r'[.;,\n]', text[:f['span_start']])[-1]
@@ -152,11 +154,11 @@ class WebSystem(Fe2genSystem):
                        for h in f['hpo_ranked'] if h['id'] in self.canonical]
             mentions.append({'mention_text': f['mention_text'], 'span_start': f['span_start'], 'span_end': f['span_end'],
                              'status': labels[f['assertion']],
-                             'explanation': 'Model 1 v6 gợi ý trạng thái ' + labels[f['assertion']] + '; bác sĩ xác nhận.',
+                             'explanation': 'Model 1 ' + version + ' gợi ý trạng thái ' + labels[f['assertion']] + '; bác sĩ xác nhận.',
                              'context_review': caution, 'alignment': f.get('alignment', 'unique'),
                              'candidates': choices or self.search_hpo(f['mention_text'], 5),
                              'mapping': 'model1_v6_retriever_reranker' if choices else 'search_suggestion', 'approved': False})
-        return {'mentions': mentions, 'engine': 'model1_v6_ensemble', 'review_required': True,
+        return {'mentions': mentions, 'engine': 'model1_v6_ensemble', 'model_version': version, 'review_required': True,
                 'warnings': result.get('errors', []), 'seconds': result.get('seconds')}
 
     def merge_equivalents(self, ranked):
