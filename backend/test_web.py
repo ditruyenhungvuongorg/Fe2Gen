@@ -214,6 +214,72 @@ class WebTests(unittest.TestCase):
         finally:
             s.runner = original
 
+    def test_extraction_names_the_bundle_version(self):
+        # The served bundle model1_v7_prod runs on the v6 runner; doctors saw "Model 1 v6" until 07/10/2026.
+        from model1_v6.runner import Model1V6Runner
+        s = self.system
+        original = s.runner
+        text = 'Thai đầu nhỏ.'
+        start = text.index('đầu nhỏ')
+        try:
+            for manifest, expected in (({'model_version': 'v7'}, 'v7'), (None, 'v6')):
+                s.runner = Mock(spec=Model1V6Runner)
+                if manifest is not None:
+                    s.runner.manifest = manifest
+                s.runner.extract.return_value = {'findings': [
+                    {'mention_text': 'đầu nhỏ', 'span_start': start, 'span_end': start + 7, 'assertion': 'present',
+                     'hpo_ranked': [{'id': 'HP:0000252', 'retriever_cosine': 0.9, 'reranker_logprob': -0.1}]}],
+                    'errors': [], 'seconds': 1.0}
+                out = s.extract(text)
+                self.assertEqual(out['model_version'], expected)
+                self.assertTrue(out['mentions'][0]['explanation'].startswith('Model 1 ' + expected + ' '))
+                self.assertEqual(out['engine'], 'model1_v6_ensemble')
+        finally:
+            s.runner = original
+
+    def test_doctor_reviewed_phrase_is_listed_first(self):
+        # 07/10/2026: "thai to" (reviewed as HP:0001520 large for gestational age) is outside the v7 retriever's
+        # top 10, and the reranker put HP:0001518 small for gestational age first.
+        from unittest.mock import patch
+        from model1_v6.runner import Model1V6Runner
+        from web_service import BASE_DIR
+        s = self.system
+        if (BASE_DIR / 'data/doctor_clinical_phrases.json').is_file():
+            self.assertEqual(s.doctor_phrases.get('thai to'), ['HP:0001520'])
+            # Organ-only fragments of "không thấy ..." sentences mean absence only in their sentence.
+            self.assertLessEqual({'thận (p)', 'thận (t)', 'túi mật', 'xương mũi'}, s.context_phrases)
+            self.assertNotIn('thai to', s.context_phrases)
+        original = s.runner
+        text = 'Thai 36 tuần, Thai to. Túi mật bình thường, đa ối.'
+        a, g, b = text.index('Thai to'), text.index('Túi mật'), text.index('đa ối')
+        s.runner = Mock(spec=Model1V6Runner)
+        s.runner.extract.return_value = {'findings': [
+            {'mention_text': 'Thai to', 'span_start': a, 'span_end': a + 7, 'assertion': 'present',
+             'hpo_ranked': [{'id': 'HP:0001518', 'retriever_cosine': 0.5, 'reranker_logprob': -0.02},
+                            {'id': 'HP:0001640', 'retriever_cosine': 0.68, 'reranker_logprob': -5.8}]},
+            {'mention_text': 'Túi mật', 'span_start': g, 'span_end': g + 7, 'assertion': 'present',
+             'hpo_ranked': [{'id': 'HP:0002240', 'retriever_cosine': 0.6, 'reranker_logprob': -0.5},
+                            {'id': 'HP:0001640', 'retriever_cosine': 0.5, 'reranker_logprob': -3.0}]},
+            {'mention_text': 'đa ối', 'span_start': b, 'span_end': b + 5, 'assertion': 'present',
+             'hpo_ranked': [{'id': 'HP:0001561', 'retriever_cosine': 1.0, 'reranker_logprob': 0.0}]}],
+            'errors': [], 'seconds': 1.0}
+        try:
+            with patch.object(s, 'doctor_phrases', {'thai to': ['HP:0001520'], 'túi mật': ['HP:0011467']}), \
+                 patch.object(s, 'context_phrases', {'túi mật'}):
+                big, gall, poly = s.extract(text)['mentions']
+            self.assertEqual([c['id'] for c in big['candidates']], ['HP:0001520', 'HP:0001518', 'HP:0001640'])
+            self.assertEqual(big['mapping'], 'doctor_reviewed_phrase')
+            self.assertIn('bác sĩ đã duyệt', big['explanation'])
+            # A fragment never goes first: "Túi mật bình thường" must not open with absent gallbladder.
+            self.assertEqual([c['id'] for c in gall['candidates']], ['HP:0002240', 'HP:0001640', 'HP:0011467'])
+            self.assertTrue(gall['context_review'])
+            self.assertEqual(gall['mapping'], 'model1_v6_retriever_reranker')
+            self.assertNotIn('bác sĩ đã duyệt', gall['explanation'])
+            self.assertEqual([c['id'] for c in poly['candidates']], ['HP:0001561'])  # not reviewed: model order kept
+            self.assertEqual(poly['mapping'], 'model1_v6_retriever_reranker')
+        finally:
+            s.runner = original
+
     def test_v6_contract_alignment_and_chunks(self):
         from model1_v6 import contract as C
         with self.assertRaises(ValueError):
