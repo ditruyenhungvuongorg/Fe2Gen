@@ -1,7 +1,9 @@
 """Web boundary for HPO review, evidence formatting and strict model serving."""
 import csv
+import json
 import os
 import re
+import unicodedata
 from collections import defaultdict
 from server import Fe2genSystem, normalize_text, BASE_DIR
 from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy, load_disease_xref
@@ -31,6 +33,10 @@ def load_categories(path):
     version = ' | '.join(line[2:] for line in lines if line.startswith('# '))
     rows = csv.DictReader((line for line in lines if not line.startswith('#')), delimiter='	')
     return {r['disease_id']: (r['nhom'], r['co_che_hon_hop'] == '1') for r in rows}, version
+
+def phrase_key(text):
+    """Exact phrase match ignoring case and spacing but keeping diacritics ("mắt to" and "mặt to" differ)."""
+    return ' '.join(unicodedata.normalize('NFC', text).casefold().split())
 
 class WebSystem(Fe2genSystem):
     def initialize(self):
@@ -70,6 +76,16 @@ class WebSystem(Fe2genSystem):
                 for key in (vi, en):
                     if key and term['id'] not in self.lexicon[key]:
                         self.lexicon[key].append(term['id'])
+        # Doctor-reviewed phrase -> HPO from the 234 gold cases. Model 1 v6/v7 ranks HPO on its own and misses
+        # some of them (e.g. "thai to" -> HP:0001520 is outside its top 10), so extraction lists these first.
+        self.doctor_phrases = {}
+        phrases_path = BASE_DIR / 'data/doctor_clinical_phrases.json'
+        if phrases_path.is_file():
+            for item in json.loads(phrases_path.read_text(encoding='utf-8')):
+                if item['id'] in self.canonical:
+                    ids = self.doctor_phrases.setdefault(phrase_key(item['vi']), [])
+                    if item['id'] not in ids:
+                        ids.append(item['id'])
         path = next((p for p in CATEGORY_FILES if p.is_file()), CATEGORY_FILES[-1])
         self.categories, self.category_version = load_categories(path)
         if self.categories:
@@ -152,12 +168,17 @@ class WebSystem(Fe2genSystem):
             caution = bool(re.search(r'\b(không|chưa|mẹ|cha|gia đình|tiền sử)\b', context, re.I)) or f.get('alignment') == 'ambiguous_first_occurrence'
             choices = [dict(self.term(h['id']), retriever_cosine=h['retriever_cosine'], reranker_logprob=h['reranker_logprob'])
                        for h in f['hpo_ranked'] if h['id'] in self.canonical]
+            reviewed = self.doctor_phrases.get(phrase_key(f['mention_text']), [])
+            if reviewed:  # the doctor's earlier choice first; the model's candidates stay below it
+                choices = [self.term(h) for h in reviewed] + [c for c in choices if c['id'] not in reviewed]
             mentions.append({'mention_text': f['mention_text'], 'span_start': f['span_start'], 'span_end': f['span_end'],
                              'status': labels[f['assertion']],
-                             'explanation': 'Model 1 ' + version + ' gợi ý trạng thái ' + labels[f['assertion']] + '; bác sĩ xác nhận.',
+                             'explanation': 'Model 1 ' + version + ' gợi ý trạng thái ' + labels[f['assertion']]
+                                            + ('; mã đầu tiên theo cụm bác sĩ đã duyệt' if reviewed else '') + '; bác sĩ xác nhận.',
                              'context_review': caution, 'alignment': f.get('alignment', 'unique'),
                              'candidates': choices or self.search_hpo(f['mention_text'], 5),
-                             'mapping': 'model1_v6_retriever_reranker' if choices else 'search_suggestion', 'approved': False})
+                             'mapping': 'doctor_reviewed_phrase' if reviewed else 'model1_v6_retriever_reranker' if choices else 'search_suggestion',
+                             'approved': False})
         return {'mentions': mentions, 'engine': 'model1_v6_ensemble', 'model_version': version, 'review_required': True,
                 'warnings': result.get('errors', []), 'seconds': result.get('seconds')}
 
