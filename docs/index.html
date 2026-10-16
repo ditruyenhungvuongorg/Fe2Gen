@@ -4,11 +4,11 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>Fe2gen · From Fetal to Gene</title>
-<link rel="stylesheet" href="styles.css?v=20261007hover">
-<script defer src="config.js"></script><script defer src="case-state.js?v=20260927c"></script><script defer src="app.js?v=20260927c"></script>
+<link rel="stylesheet" href="styles.css?v=20261017login">
+<script defer src="config.js"></script><script defer src="case-state.js?v=20260927c"></script><script defer src="app.js?v=20261017login"></script>
 </head>
 <body>
-<header class="topbar"><a class="brand" href="./"><span class="brand-icon">F</span><span>Fe2gen<span class="brand-sub">FROM FETAL TO GENE</span></span></a><div class="top-actions"><span id="connection" role="status">Đang kết nối…</span><button id="settings-open" class="quiet">Kết nối</button><button id="new-case" class="quiet">Ca mới</button></div></header>
+<header class="topbar"><a class="brand" href="./"><span class="brand-icon">F</span><span>Fe2gen<span class="brand-sub">FROM FETAL TO GENE</span></span></a><div class="top-actions"><span id="connection" role="status">Đang kết nối…</span><span id="model-state" class="model-state" role="status" hidden></span><span id="user-name" class="user-name" hidden></span><button id="settings-open" class="quiet">Kết nối</button><button id="logout" class="quiet" hidden>Đăng xuất</button><button id="new-case" class="quiet">Ca mới</button></div></header>
 <main>
 <div class="intro"><div><p class="eyebrow">KHÔNG GIAN LÀM VIỆC CỦA BÁC SĨ</p><h1>Từ dấu hiệu đến hướng khảo sát.</h1><p>Duyệt kiểu hình, đối chiếu bệnh hiếm và chuẩn bị phiếu hội chẩn di truyền.</p></div></div>
 <div class="steps"><span><b>01</b> Nhập dấu hiệu</span><span><b>02</b> Duyệt HPO</span><span><b>03</b> Đối chiếu & hội chẩn</span></div>
@@ -30,7 +30,7 @@
 </section><section class="panel lab-panel"><div><p class="eyebrow">HOÀN TẤT HỘI CHẨN</p><h2>Phiếu gửi Lab di truyền</h2><p class="hint">Chọn các bệnh cần hội chẩn trong kết quả, sau đó xem trước và in phiếu.</p></div><button id="export" disabled>Xem trước phiếu Lab ↗</button></section></div>
 <footer>Công cụ hỗ trợ nghiên cứu và hội chẩn · Bác sĩ xác nhận kết quả trước khi sử dụng · Không tự lưu hồ sơ ca trên trình duyệt.</footer>
 </main>
-<dialog id="settings"><form method="dialog"><div class="section-heading"><h2>Kết nối máy chủ</h2><button class="quiet" value="cancel">Đóng</button></div><label>Địa chỉ API HTTPS<input id="api-url" type="url" placeholder="https://may-chu.example"></label><label>Mã truy cập<input id="access-token" type="password" autocomplete="off"></label><p class="hint">Mã truy cập chỉ giữ trong bộ nhớ của tab này. Địa chỉ máy chủ có thể được lưu, không lưu nội dung ca.</p><button id="connect" value="default">Kết nối</button></form></dialog>
+<dialog id="settings"><form method="dialog"><div class="section-heading"><h2 id="settings-title">Kết nối máy chủ</h2><button type="button" id="settings-close" class="quiet">Đóng</button></div><label>Địa chỉ API HTTPS<input id="api-url" type="url" placeholder="https://may-chu.example"></label><div id="login-fields" hidden><label>Tên đăng nhập<input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32"></label><label>Mật khẩu<input id="password" type="password" autocomplete="current-password"></label></div><div id="token-fields"><label>Mã truy cập<input id="access-token" type="password" autocomplete="off"></label></div><p id="settings-hint" class="hint">Mã truy cập chỉ giữ trong bộ nhớ của tab này. Địa chỉ máy chủ có thể được lưu, không lưu nội dung ca.</p><p id="settings-error" class="settings-error" role="alert" hidden></p><button id="connect" value="default">Kết nối</button></form></dialog>
 <dialog id="lab"><div class="no-print section-heading"><h2>Xem trước phiếu Lab</h2><div><button id="print">In / Lưu PDF</button> <button id="close-lab" class="quiet">Đóng</button></div></div><div id="sheet"></div></dialog>
 </body></html>
 

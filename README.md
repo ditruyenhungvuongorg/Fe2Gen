@@ -3,7 +3,8 @@ Vietnamese doctor-reviewed workspace from fetal ultrasound findings to HPO terms
 
 ## Use
 1. Open the GitHub Pages site.
-2. Choose **Kết nối**, enter the access code supplied by the administrator.
+2. Log in with the doctor account created by the administrator (or, on a server without accounts, choose
+   **Kết nối** and enter the shared access code).
 3. Search HPO terms or extract phrases from an ultrasound paragraph.
 4. Review each HPO and its Có / Nghi ngờ / Không status.
 5. Confirm review and compare disease profiles. Results are shown in three columns, left to right
@@ -11,7 +12,8 @@ Vietnamese doctor-reviewed workspace from fetal ultrasound findings to HPO terms
    plus diseases with no established genetic mechanism.
 6. Select diseases for the lab handoff sheet and print/save PDF.
 
-The UI does not persist case text or the access code. Only the API address is saved.
+The UI does not persist case text, the session or the access code. Only the API address is saved.
+Logging out clears the open case from the tab.
 Similarity is IC-weighted phenotype similarity, not disease probability.
 Unrecorded features include postnatal findings and require clinician interpretation.
 Gene associations are displayed as associations, not proof of causality.
@@ -67,23 +69,38 @@ to the original evaluated v3.8 package (worker.py, prepare.py, core.py, tokenize
 The serving wrapper calls that worker without changing training files.
 
 Run `python serve_web.py` from the backend directory.
-Set `MODEL1_PRELOAD=1` to preload on service startup.
-If Model 1 cannot load (for example no NVIDIA driver after a kernel update and reboot), the service still starts:
-HPO search and disease matching keep working, `/api/status` reports `model_ready: false` and text extraction
-answers 503. Check `nvidia-smi`, fix the driver, then restart `prenatal-web` to enable extraction again.
-Set `WEB_ACCESS_TOKEN` and `WEB_ALLOWED_ORIGINS` before enabling public HTTPS.
+
+GPU on demand (`model1_process.py`): the web process never loads torch. Model 1 runs in a child process that
+starts when a doctor logs in, opens **Nhập đoạn văn** or sends a report, and exits after `MODEL1_IDLE_MINUTES`
+(default 60) without doctor activity, or when the last doctor logs out; the driver then gets back all of its
+VRAM (about 12.4 GB for model1_v7_prod). A request arriving while the model loads waits up to
+`MODEL1_LOAD_WAIT_SECONDS` (120). The model is not started when the GPU has less than `MODEL1_MIN_FREE_MIB`
+(13000) free, or while the pause file exists (`bash gpu.sh pause`, for training or local AI; `bash gpu.sh resume`).
+`MODEL1_PRELOAD=1` loads it at startup (still released when idle). The journal shows the load time per step.
+If Model 1 cannot load (for example no NVIDIA driver after a kernel update and reboot), HPO search and disease
+matching keep working, `/api/status` reports `model_state: failed` and text extraction answers 503; the next
+login or extraction tries again, no restart needed.
+
+Accounts (`auth.py`): `python manage_users.py add <username> --name "<display name>"` creates a doctor account in
+`WEB_USERS_FILE` (default `~/prenatal_pubcasefinder/.deployment/users.json`, scrypt hashes, mode 600); also
+`passwd`, `disable`, `enable`, `remove`, `list`. The running service rereads the file. Once it lists an account,
+the shared `WEB_ACCESS_TOKEN` is no longer accepted. Sessions live in memory (12 h, 4 h idle); five wrong
+passwords lock an account for 5 minutes.
+Set `WEB_ALLOWED_ORIGINS` (and accounts or `WEB_ACCESS_TOKEN`) before enabling public HTTPS.
 The service binds loopback; HTTPS is provided by the Ubuntu reverse proxy.
 `server.py` is retained only as a compatibility base for data loading. Use `serve_web.py` as the entrypoint.
 
 ## Training and updates
 The web service uses a fixed adapter path. Training completion never automatically promotes a checkpoint.
-If training needs all GPU memory, stop `prenatal-web` first, then restart after training.
+If training needs the GPU, run `bash gpu.sh pause` first (search and matching stay online) and
+`bash gpu.sh resume` after training.
 Validate a new adapter separately before changing `MODEL1_ADAPTER` in the private environment file.
 Restart and smoke-test extraction and ranking; revert the path if validation fails.
 No training is started by this web application.
 
 ## Checks
-`python test_web.py` checks search, alias normalization, input validation, ranking metadata,
+`python test_access.py` checks Model 1 on demand (idle release, pause file, free-VRAM check, crash recovery) and
+doctor accounts, without GPU or HPO data. `python test_web.py` checks search, alias normalization, input validation, ranking metadata,
 mechanism grouping and the shipped group table, review requirements, rejection of ambiguous span alignment,
 and that the service starts without a usable GPU.
 GPU/API/UI deployment checks are documented separately; these tests do not establish clinical accuracy.

@@ -9,6 +9,7 @@ both use scaling alpha/r = 2 and the padded rows/columns are zero, so B @ A is u
 The model bundle (weights, tokenizer, reviewed-finding memory) lives outside the repository; see README.md here.
 """
 import json
+import sys
 import time
 from pathlib import Path
 from threading import Lock
@@ -45,6 +46,10 @@ class Model1V6Runner:
         from transformers import AutoModel, AutoTokenizer
         if not torch.cuda.is_available():
             raise RuntimeError('Model 1 v6 cần GPU CUDA.')
+        t0 = time.monotonic()
+
+        def step(name):  # load time per step, to see what keeps a released model from serving within 30 s
+            print(f'[Model 1] {name}: {time.monotonic() - t0:.1f} s', file=sys.stderr, flush=True)
         m = json.loads((self.bundle / 'manifest.json').read_text(encoding='utf-8'))
         self.manifest = m
         self.members = [(c, eps) for c, eps in m['extractor']['members']]
@@ -61,6 +66,7 @@ class Model1V6Runner:
         model = FastLanguageModel.get_peft_model(model, r=RANK, lora_alpha=ALPHA, lora_dropout=0, bias='none', target_modules=TARGETS,
                                                  use_gradient_checkpointing=False, random_state=0)
         FastLanguageModel.for_inference(model)
+        step('base model')
         expected = get_peft_model_state_dict(model)
         self.weights = {}
         for name, rel in m['adapters'].items():
@@ -76,6 +82,7 @@ class Model1V6Runner:
                 target[tuple(slice(0, s) for s in t.shape)] = t.to(expected[k].dtype)
                 padded[k] = target.to('cuda')
             self.weights[name] = padded
+        step(f'{len(self.weights)} adapters')
         self.tok, self.model = tok, model
         self.letters = [tok.encode(x, add_special_tokens=False)[0] for x in C.LETTERS]
         self.rtok = AutoTokenizer.from_pretrained(self.bundle / 'retriever', local_files_only=True)
@@ -89,7 +96,9 @@ class Model1V6Runner:
         self.docs = self._encode([c['document_text'] for c in self.catalog])
         self.mem = self._encode([x['query_text'] for x in memory])
         self.mem_hpo = torch.tensor([index[x['hpo_id']] for x in memory], device='cuda', dtype=torch.long)
+        step('retriever + HPO index')
         self.generate('Thai 20 tuần.', next(iter(self.weights)), seconds=90)  # CUDA warm-up
+        step('warm-up')
         self.is_loaded = True
 
     def use(self, name):

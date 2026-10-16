@@ -1,14 +1,13 @@
 """Web boundary for HPO review, evidence formatting and strict model serving."""
 import csv
 import json
-import os
 import re
 import unicodedata
 from collections import defaultdict
 from server import Fe2genSystem, normalize_text, BASE_DIR
 from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy, load_disease_xref
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
-from model1_v38_package.model1_runner import Model1V38Runner
+from model1_process import Model1Process
 from model1_v6.runner import Model1V6Runner
 from model2_reranker import POOL, Reranker, candidate_features, load_validity
 
@@ -100,8 +99,6 @@ class WebSystem(Fe2genSystem):
             print(f'[Model 2] Nạp nhóm cơ chế cho {len(self.categories):,} bệnh từ {path.relative_to(BASE_DIR)}.')
         else:
             print('[Model 2] Chưa có disease_category.tsv: kết quả hiển thị một danh sách chung.')
-        # Model 1 v6 (ensemble extractor + HPO retriever/reranker) when its private bundle is configured; else v3.8.
-        bundle = os.getenv('MODEL1_V6_BUNDLE')
         xref = next((p for p in XREF_FILES if p.is_file()), None)
         self.resolver = load_disease_xref(xref) if xref else None
         print(f'[Model 2] Gộp mã OMIM/ORPHA cùng bệnh: {xref.name if xref else "không có bảng, không gộp"}.')
@@ -109,7 +106,9 @@ class WebSystem(Fe2genSystem):
         self.reranker = Reranker.load(reranker) if reranker and self.categories else None
         self.gene_validity, self.disease_validity = load_validity(BASE_DIR / 'resources/gencc_validity.tsv')
         print(f'[Model 2] Xếp hạng lại: {reranker.name if self.reranker else "không dùng (thứ tự ic_coverage)"}.')
-        self.runner = Model1V6Runner(bundle) if bundle else Model1V38Runner(os.getenv('MODEL1_ADAPTER'), os.getenv('MODEL1_WORKER_DIR'))
+        # Model 1 v6 (ensemble extractor + HPO retriever/reranker) when its private bundle is configured; else v3.8.
+        # It runs in a child process started on demand and stopped when idle, so the GPU is used only while doctors work.
+        self.runner = Model1Process.from_env()
 
     def term(self, hid):
         t = self.canonical.get(hid, {})
@@ -149,7 +148,7 @@ class WebSystem(Fe2genSystem):
     def extract(self, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 6000:
             raise ValueError('Nhập đoạn mô tả từ 1 đến 6.000 ký tự.')
-        if isinstance(self.runner, Model1V6Runner):
+        if isinstance(self.runner, Model1V6Runner) or getattr(self.runner, 'kind', None) == 'v6':
             return self.extract_v6(text)
         mentions = []
         for span in self.runner.extract_spans(text):

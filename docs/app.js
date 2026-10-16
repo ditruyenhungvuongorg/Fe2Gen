@@ -6,6 +6,8 @@ try { base = localStorage.getItem('prenatal-api') || base; } catch {}
 const selection = new CaseSelection(), chosen = selection.items, labIds = new Set(), requests = new Set();
 let access = '', result = null, revision = 0, searchVersion = 0, extractVersion = 0, busy = false;
 let searchTerms = [], extraction = null, connectionVersion = 0, timer;
+// authMode from /api/status: 'accounts' (doctor login), 'token' (shared access code) or 'none'.
+let authMode = '', user = null, modelState = '', modelPoll, lastWarmup = 0;
 function notice(message = '') { $('notice').textContent = message; $('notice').hidden = !message; }
 function localStatus(id, message = '') { $(id).textContent = message; }
 async function api(path, payload, timeout = 120000, controller = new AbortController()) {
@@ -20,13 +22,58 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
     });
     let data;
     try { data = await response.json(); } catch { throw Error('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.'); }
-    if (!response.ok) throw Error(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.');
+    if (!response.ok) {
+      if (response.status === 401 && authMode === 'accounts' && access && path !== '/api/login') sessionEnded();
+      showModel(data);
+      throw Error(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.');
+    }
     return data;
   } catch (e) {
     if (controller.signal.aborted) throw Error(controller.signal.reason === 'timeout' ? 'Máy chủ phản hồi chậm. Danh sách HPO vẫn được giữ; bạn có thể thử lại.' : 'Yêu cầu đã hủy.');
     if (e instanceof TypeError) throw Error('Chưa kết nối được máy chủ. Kiểm tra Ubuntu và mã truy cập; danh sách HPO vẫn được giữ.');
     throw e;
   } finally { clearTimeout(timeoutId); requests.delete(controller); }
+}
+const MODEL_TEXT = {stopped:'Model: nghỉ · tự bật khi dùng', paused:'Model: tạm dừng · GPU bận việc khác', loading:'Model: đang khởi động…', ready:'Model: sẵn sàng', failed:'Model: chưa chạy được'};
+const MODEL_SHORT = {stopped:'GPU nghỉ', paused:'GPU bận', loading:'Đang bật…', ready:'Sẵn sàng', failed:'Lỗi model'};
+function showModel(data) {
+  if (!data || !data.model_state) return;
+  modelState = data.model_state;
+  const el = $('model-state');
+  el.hidden = data.model_configured === false;
+  el.textContent = MODEL_TEXT[modelState] || ''; el.dataset.short = MODEL_SHORT[modelState] || '';
+  el.className = 'model-state ' + modelState;
+  el.title = modelState === 'failed' ? data.model_error || '' : modelState === 'stopped' ? 'Model trích văn bản rời GPU sau ' + (data.idle_minutes || 60) + ' phút không dùng và tự khởi động lại khi bác sĩ đăng nhập hoặc mở Nhập đoạn văn.' : '';
+  clearTimeout(modelPoll);
+  if (modelState === 'loading') modelPoll = setTimeout(pollModel, 3000);
+}
+async function pollModel() { try { showModel(await api('/api/status', null, 15000)); } catch {} }
+// Text extraction is about to be used: ask the server to load Model 1 on the GPU in the background.
+async function warmup() {
+  if (authMode !== 'none' && !access) return;
+  if (['ready','loading','paused'].includes(modelState) || Date.now() - lastWarmup < 30000) return;
+  lastWarmup = Date.now();
+  try { showModel(await api('/api/warmup', {}, 20000)); } catch {}
+}
+function showUser() {
+  $('user-name').textContent = user ? user.name : ''; $('user-name').hidden = !user; $('logout').hidden = !user;
+  $('settings-open').textContent = authMode === 'accounts' ? (user ? 'Máy chủ' : 'Đăng nhập') : 'Kết nối';
+}
+function openSettings(message = '') {
+  const accounts = authMode === 'accounts';
+  $('api-url').value = base; $('login-fields').hidden = !accounts; $('token-fields').hidden = accounts;
+  $('settings-title').textContent = accounts ? 'Đăng nhập' : 'Kết nối máy chủ';
+  $('connect').textContent = accounts ? 'Đăng nhập' : 'Kết nối';
+  $('settings-hint').textContent = accounts
+    ? 'Phiên đăng nhập chỉ giữ trong tab này; tải lại trang cần đăng nhập lại. Model trích văn bản khởi động khi bác sĩ đăng nhập và tự rời GPU khi không dùng.'
+    : 'Mã truy cập chỉ giữ trong bộ nhớ của tab này. Địa chỉ máy chủ có thể được lưu, không lưu nội dung ca.';
+  $('settings-error').textContent = message; $('settings-error').hidden = !message;
+  if (!$('settings').open) $('settings').showModal();
+  if (accounts && !user) ($('username').value ? $('password') : $('username')).focus();
+}
+function sessionEnded() {
+  access = ''; user = null; showUser();
+  openSettings('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
 }
 function updateActions() {
   $('reviewed').disabled = busy || !!selection.conflicts || !chosen.size;
@@ -123,6 +170,7 @@ function activateTab(mode, focus = true) {
   $('manual').hidden = mode !== 'search'; $('paragraph').hidden = mode !== 'text';
   for (const m of ['search','text']) { $('tab-' + m).setAttribute('aria-selected', String(m === mode)); $('tab-' + m).tabIndex = m === mode ? 0 : -1; }
   if (focus) $(mode === 'search' ? 'query' : 'clinical-text').focus();
+  if (mode === 'text') warmup();
 }
 for (const mode of ['search','text']) {
   $('tab-' + mode).onclick = () => activateTab(mode);
@@ -143,6 +191,7 @@ $('query').oninput = () => {
     } catch (e) { if (seq === searchVersion) localStatus('search-status', e.message); }
   },250);
 };
+$('clinical-text').onfocus = warmup;
 $('clinical-text').oninput = () => {
   extractVersion++; extraction = null; renderMentions(); invalidate(); renderSelected();
   localStatus('extract-status', 'Đoạn văn đã thay đổi. HPO đã chọn vẫn được giữ; tách lại để cập nhật gợi ý.');
@@ -152,9 +201,11 @@ $('extract').onclick = async () => {
   const text = $('clinical-text').value;
   if (!text.trim()) { localStatus('extract-status','Nhập đoạn mô tả siêu âm trước.'); return; }
   const seq = ++extractVersion; busy = 'extract'; updateActions();
-  localStatus('extract-status','Model 1 đang tách dấu hiệu. Các HPO đã chọn được giữ nguyên.');
+  localStatus('extract-status', modelState === 'ready' ? 'Model 1 đang tách dấu hiệu. Các HPO đã chọn được giữ nguyên.'
+    : 'Model 1 đang khởi động trên GPU (thường dưới 1 phút) rồi tách dấu hiệu. Các HPO đã chọn được giữ nguyên.');
   try {
-    const data = await api('/api/extract_hpo', {text});
+    const data = await api('/api/extract_hpo', {text}, 420000);  // server: up to 120 s loading + 300 s extraction
+    pollModel();
     if (seq !== extractVersion) return;
     extraction = {text, mentions:data.mentions.map(m => ({...m, reviewStatus:m.context_review ? '' : m.status}))};
     renderMentions();
@@ -265,25 +316,53 @@ $('export').onclick=()=>{
   $('lab').showModal();
 };
 $('print').onclick=()=>window.print();$('close-lab').onclick=()=>$('lab').close();
+function hasCase(){return chosen.size||$('clinical-text').value||$('case-id').value||$('wes-genes').value;}
 $('new-case').onclick=()=>{
   if((chosen.size||$('clinical-text').value)&&!confirm('Bắt đầu ca mới và xóa nội dung ca hiện tại trong phiên này?'))return;
+  resetCase();
+};
+function resetCase(){
   extractVersion++;searchVersion++;connectionVersion++;clearTimeout(timer);for(const c of requests)c.abort('new-case');selection.clear();extraction=null;searchTerms=[];for(const id of ['case-id','gestation','doctor','clinical-text','query','wes-genes'])$(id).value='';
   renderMentions();renderSearch();invalidate();renderSelected();notice('');localStatus('extract-status','');localStatus('search-status','Nhập tên dấu hiệu để bắt đầu tìm.');
+}
+$('settings-open').onclick=()=>openSettings();
+$('settings-close').onclick=()=>$('settings').close();
+$('logout').onclick=async()=>{
+  // A shared hospital computer: the next person must not see this case.
+  if(hasCase()&&!confirm('Đăng xuất sẽ xóa nội dung ca đang mở trong tab này. Tiếp tục?'))return;
+  try{await api('/api/logout',{},15000);}catch{}
+  resetCase();access='';user=null;showUser();checkConnection();
 };
-$('settings-open').onclick=()=>{$('api-url').value=base;$('settings').showModal();};
-$('connect').onclick=e=>{
+$('connect').onclick=async e=>{
   e.preventDefault();
   try{
     const value=$('api-url').value.trim().replace(/\/+$/,'');
     if(value){const u=new URL(value);if(u.protocol!=='https:'&&!(u.protocol==='http:'&&['localhost','127.0.0.1'].includes(u.hostname)))throw Error('Máy chủ từ xa phải dùng HTTPS.');if(u.username||u.password||u.search||u.hash)throw Error('Chỉ nhập địa chỉ gốc của máy chủ.');}
-    for(const c of requests)c.abort('connection-changed');searchVersion++;extractVersion++;connectionVersion++;clearTimeout(timer);if(value!==base)access='';base=value;if($('access-token').value)access=$('access-token').value;$('access-token').value='';searchTerms=[];extraction=null;renderSearch();renderMentions();
+    for(const c of requests)c.abort('connection-changed');searchVersion++;extractVersion++;connectionVersion++;clearTimeout(timer);
+    if(value!==base){access='';user=null;authMode='';showUser();}
+    base=value;
     try{localStorage.setItem('prenatal-api',base);}catch{}
+    if(authMode==='accounts'){
+      const username=$('username').value.trim(),password=$('password').value;
+      if(!username||!password)throw Error('Nhập tên đăng nhập và mật khẩu.');
+      $('connect').disabled=true;
+      try{const data=await api('/api/login',{username,password},30000);access=data.token;user=data.user;showModel(data);}
+      finally{$('connect').disabled=false;$('password').value='';}
+      showUser();
+    }else if($('access-token').value)access=$('access-token').value;
+    $('access-token').value='';searchTerms=[];extraction=null;renderSearch();renderMentions();
     invalidate();$('settings').close();checkConnection();
-  }catch(err){notice(err.message);}
+  }catch(err){$('settings-error').textContent=err.message;$('settings-error').hidden=false;}
 };
 async function checkConnection(){
   const seq=connectionVersion;
-  try{const status=await api('/api/status',null,15000);if(seq!==connectionVersion)return;$('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';if(!status.model_configured)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');else if(status.auth_required&&!access)notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');else notice('');}
+  try{const status=await api('/api/status',null,15000);if(seq!==connectionVersion)return;
+    authMode=status.auth_mode||(status.auth_required?'token':'none');
+    $('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';showModel(status);showUser();
+    if(authMode==='accounts'&&!access){notice('Đăng nhập để sử dụng. Model trích văn bản khởi động sau khi bác sĩ đăng nhập.');openSettings();}
+    else if(authMode==='token'&&!access)notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');
+    else if(!status.model_configured)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');
+    else notice('');}
   catch(e){if(seq!==connectionVersion)return;$('connection').textContent='○ Chưa kết nối Ubuntu';notice(e.message);}
 }
 renderSelected();checkConnection();
