@@ -81,11 +81,22 @@ If Model 1 cannot load (for example no NVIDIA driver after a kernel update and r
 matching keep working, `/api/status` reports `model_state: failed` and text extraction answers 503; the next
 login or extraction tries again, no restart needed.
 
-Accounts (`auth.py`): `python manage_users.py add <username> --name "<display name>"` creates a doctor account in
-`WEB_USERS_FILE` (default `~/prenatal_pubcasefinder/.deployment/users.json`, scrypt hashes, mode 600); also
-`passwd`, `disable`, `enable`, `remove`, `list`. The running service rereads the file. Once it lists an account,
-the shared `WEB_ACCESS_TOKEN` is no longer accepted. Sessions live in memory (12 h, 4 h idle); five wrong
-passwords lock an account for 5 minutes.
+Accounts and roles (`auth.py`, `audit.py`, admin page `docs/admin.js`):
+- `admin` (everything plus the admin page), `doctor` (search, text extraction, matching, lab sheet) and `lab`
+  (search, matching, lab sheet; no text extraction, so a lab login never loads the GPU).
+- The first admin is created on the server: `python manage_users.py add <username> --name "<name>" --role admin`.
+  Admins then create accounts on the web; each new or reset account gets a one-time password shown once, which
+  the user must replace at the first login. Admins also lock/unlock, change roles, delete, end sessions, release
+  or pause the GPU and read the audit log; the last active admin cannot be removed, demoted or locked.
+- Accounts live in `WEB_USERS_FILE` (default `~/prenatal_pubcasefinder/.deployment/users.json`, scrypt hashes,
+  mode 600); the service rereads it, so `manage_users.py` (`add`, `passwd`, `role`, `disable`, `enable`, `remove`,
+  `list`) works while it runs. Once it lists an account, the shared `WEB_ACCESS_TOKEN` is no longer accepted.
+- Passwords: at least 10 characters, not a common password, not containing the username. Five wrong passwords in
+  a row lock a username for 1, 2, 4 ... up to 15 minutes; more than 30 wrong passwords in a minute pause all
+  logins for that minute. Sessions live in memory (12 h, 4 h idle); changing a password ends the other sessions.
+- Audit log `WEB_AUDIT_FILE` (default `~/prenatal_pubcasefinder/.deployment/audit.jsonl`): logins, logouts,
+  password changes, admin actions, and each extraction or matching with counts only, never report text, HPO or genes.
+- Responses carry a Content-Security-Policy (own scripts only) and `X-Frame-Options: DENY`.
 Set `WEB_ALLOWED_ORIGINS` (and accounts or `WEB_ACCESS_TOKEN`) before enabling public HTTPS.
 The service binds loopback; HTTPS is provided by the Ubuntu reverse proxy.
 `server.py` is retained only as a compatibility base for data loading. Use `serve_web.py` as the entrypoint.

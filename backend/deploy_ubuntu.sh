@@ -36,5 +36,5 @@ systemctl --user daemon-reload
 systemctl --user enable --now prenatal-web.service
 echo 'Installed prenatal-web user service. Check: systemctl --user status prenatal-web'
 echo 'For boot without login, an administrator must enable linger for this user.'
-echo 'Doctor accounts: python manage_users.py add <username> --name "<display name>" (then the shared code is no longer accepted)'
+echo 'First admin: python manage_users.py add <username> --name "<display name>" --role admin; other accounts on the admin page'
 echo 'GPU for training/local AI: bash gpu.sh pause | resume | status'

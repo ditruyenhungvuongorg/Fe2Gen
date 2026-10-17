@@ -7,7 +7,8 @@ const selection = new CaseSelection(), chosen = selection.items, labIds = new Se
 let access = '', result = null, revision = 0, searchVersion = 0, extractVersion = 0, busy = false;
 let searchTerms = [], extraction = null, connectionVersion = 0, timer;
 // authMode from /api/status: 'accounts' (doctor login), 'token' (shared access code) or 'none'.
-let authMode = '', user = null, modelState = '', modelPoll, lastWarmup = 0;
+// user: {username, name, role ('admin' | 'doctor' | 'lab'), must_change}; lab accounts do not use text extraction.
+let authMode = '', user = null, modelState = '', modelPoll, lastWarmup = 0, lastModel = null;
 function notice(message = '') { $('notice').textContent = message; $('notice').hidden = !message; }
 function localStatus(id, message = '') { $(id).textContent = message; }
 async function api(path, payload, timeout = 120000, controller = new AbortController()) {
@@ -24,6 +25,7 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
     try { data = await response.json(); } catch { throw Error('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.'); }
     if (!response.ok) {
       if (response.status === 401 && authMode === 'accounts' && access && path !== '/api/login') sessionEnded();
+      if (response.status === 403 && data.must_change && user) { user.must_change = true; openAccount(); }
       showModel(data);
       throw Error(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.');
     }
@@ -38,9 +40,9 @@ const MODEL_TEXT = {stopped:'Model: nghỉ · tự bật khi dùng', paused:'Mod
 const MODEL_SHORT = {stopped:'GPU nghỉ', paused:'GPU bận', loading:'Đang bật…', ready:'Sẵn sàng', failed:'Lỗi model'};
 function showModel(data) {
   if (!data || !data.model_state) return;
-  modelState = data.model_state;
+  modelState = data.model_state; lastModel = data;
   const el = $('model-state');
-  el.hidden = data.model_configured === false;
+  el.hidden = data.model_configured === false || user?.role === 'lab';
   el.textContent = MODEL_TEXT[modelState] || ''; el.dataset.short = MODEL_SHORT[modelState] || '';
   el.className = 'model-state ' + modelState;
   el.title = modelState === 'failed' ? data.model_error || '' : modelState === 'stopped' ? 'Model trích văn bản rời GPU sau ' + (data.idle_minutes || 60) + ' phút không dùng và tự khởi động lại khi bác sĩ đăng nhập hoặc mở Nhập đoạn văn.' : '';
@@ -50,14 +52,33 @@ function showModel(data) {
 async function pollModel() { try { showModel(await api('/api/status', null, 15000)); } catch {} }
 // Text extraction is about to be used: ask the server to load Model 1 on the GPU in the background.
 async function warmup() {
-  if (authMode !== 'none' && !access) return;
+  if (authMode !== 'none' && !access || user?.role === 'lab' || user?.must_change) return;
   if (['ready','loading','paused'].includes(modelState) || Date.now() - lastWarmup < 30000) return;
   lastWarmup = Date.now();
   try { showModel(await api('/api/warmup', {}, 20000)); } catch {}
 }
+const ROLE_NAMES = {admin:'Quản trị', doctor:'Bác sĩ', lab:'Phòng Lab'};
 function showUser() {
-  $('user-name').textContent = user ? user.name : ''; $('user-name').hidden = !user; $('logout').hidden = !user;
-  $('settings-open').textContent = authMode === 'accounts' ? (user ? 'Máy chủ' : 'Đăng nhập') : 'Kết nối';
+  $('account-open').textContent = user ? user.name : ''; $('account-open').hidden = !user;
+  $('account-open').title = user ? 'Tài khoản · ' + (ROLE_NAMES[user.role] || '') : '';
+  $('admin-open').hidden = $('account-admin').hidden = user?.role !== 'admin';
+  $('settings-open').hidden = !!user;
+  $('settings-open').textContent = authMode === 'accounts' ? 'Đăng nhập' : 'Kết nối';
+  // Phòng Lab: HPO search, matching and the lab sheet; no text extraction on the GPU.
+  const lab = user?.role === 'lab';
+  $('tab-text').hidden = lab;
+  if (lab && !$('paragraph').hidden) activateTab('search', false);
+  showModel(lastModel);
+}
+function openAccount() {
+  const forced = !!user?.must_change;
+  $('account-title').textContent = forced ? 'Đặt mật khẩu mới' : 'Tài khoản';
+  $('account-who').textContent = user ? user.name + ' · ' + user.username + ' · ' + (ROLE_NAMES[user.role] || '') : '';
+  $('account-forced').hidden = !forced; $('account-close').hidden = forced;
+  $('account-admin').hidden = forced || user?.role !== 'admin'; $('account-server').hidden = forced;
+  $('account-error').hidden = true; $('account-ok').hidden = true;
+  if (!$('account').open) $('account').showModal();
+  $('old-password').focus();
 }
 function openSettings(message = '') {
   const accounts = authMode === 'accounts';
@@ -73,6 +94,8 @@ function openSettings(message = '') {
 }
 function sessionEnded() {
   access = ''; user = null; showUser();
+  if ($('account').open) $('account').close();
+  if ($('admin').open) $('admin').close();
   openSettings('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
 }
 function updateActions() {
@@ -331,7 +354,30 @@ $('logout').onclick=async()=>{
   // A shared hospital computer: the next person must not see this case.
   if(hasCase()&&!confirm('Đăng xuất sẽ xóa nội dung ca đang mở trong tab này. Tiếp tục?'))return;
   try{await api('/api/logout',{},15000);}catch{}
+  for(const d of ['account','admin'])if($(d).open)$(d).close();
   resetCase();access='';user=null;showUser();checkConnection();
+};
+$('account-open').onclick=()=>openAccount();
+$('account-close').onclick=()=>$('account').close();
+$('account').oncancel=e=>{if(user?.must_change)e.preventDefault();};  // Esc cannot skip a temporary password
+$('account-server').onclick=()=>{$('account').close();openSettings();};
+$('account-admin').onclick=$('admin-open').onclick=()=>{$('account').close();openAdmin();};
+$('password-form').onsubmit=async e=>{
+  e.preventDefault();
+  const show=(id,msg)=>{$(id).textContent=msg;$(id).hidden=!msg;};
+  show('account-error','');show('account-ok','');
+  const old_password=$('old-password').value,new_password=$('new-password').value;
+  if(new_password!==$('new-password2').value)return show('account-error','Hai lần nhập mật khẩu mới không khớp.');
+  if(new_password.length<10)return show('account-error','Mật khẩu mới cần ít nhất 10 ký tự.');
+  $('change-password').disabled=true;
+  try{
+    const data=await api('/api/change_password',{old_password,new_password},30000);
+    const forced=user.must_change;user=data.user;showUser();
+    for(const id of ['old-password','new-password','new-password2'])$(id).value='';
+    if(forced){$('account').close();notice('Đã đặt mật khẩu mới. Chào '+user.name+'.');pollModel();}
+    else show('account-ok','Đã đổi mật khẩu. Các thiết bị khác đã đăng nhập bằng tài khoản này cần đăng nhập lại.');
+  }catch(err){show('account-error',err.message);}
+  finally{$('change-password').disabled=false;}
 };
 $('connect').onclick=async e=>{
   e.preventDefault();
@@ -346,9 +392,10 @@ $('connect').onclick=async e=>{
       const username=$('username').value.trim(),password=$('password').value;
       if(!username||!password)throw Error('Nhập tên đăng nhập và mật khẩu.');
       $('connect').disabled=true;
-      try{const data=await api('/api/login',{username,password},30000);access=data.token;user=data.user;showModel(data);}
+      try{const data=await api('/api/login',{username,password},30000);access=data.token;user=data.user;lastModel=data;}
       finally{$('connect').disabled=false;$('password').value='';}
       showUser();
+      if(user.must_change){$('settings').close();openAccount();return;}
     }else if($('access-token').value)access=$('access-token').value;
     $('access-token').value='';searchTerms=[];extraction=null;renderSearch();renderMentions();
     invalidate();$('settings').close();checkConnection();

@@ -15,7 +15,8 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from auth import Auth, UserStore, check_password, hash_password
+from audit import AuditLog
+from auth import Auth, UserStore, check_password, hash_password, password_problem, temporary_password
 from model1_process import Model1Process, ModelProcessError, ModelUnavailable
 
 FAKE = [sys.executable, '-c', 'import sys, model1_process, test_access; '
@@ -195,7 +196,7 @@ class AuthTests(unittest.TestCase):
         a = Auth(self.store, token='abc')
         self.assertFalse(a.check('Bearer abc')[0])  # the shared code stops working once accounts exist
         token, user = a.login(' BS.AN ', 'mat-khau-1')
-        self.assertEqual(user, {'username': 'bs.an', 'name': 'BS. An'})
+        self.assertEqual(user, {'username': 'bs.an', 'name': 'BS. An', 'role': 'doctor', 'must_change': False})
         ok, session = a.check('Bearer ' + token)
         self.assertTrue(ok)
         self.assertEqual(session['user'], 'bs.an')
@@ -232,12 +233,69 @@ class AuthTests(unittest.TestCase):
         a.sessions[a._key(token)]['seen'] -= 3601
         self.assertFalse(a.check('Bearer ' + token)[0])
 
+    def test_password_policy_and_temporary_password(self):
+        self.assertIn('10', password_problem('ngan-qua'))
+        self.assertIn('dễ đoán', password_problem('1234567890'))
+        self.assertIn('dễ đoán', password_problem('aaaaaaaaaaaa'))
+        self.assertIn('tên đăng nhập', password_problem('bs.an-2026-xyz', 'bs.an'))
+        self.assertIsNone(password_problem('mây trắng bay qua đồi'))
+        temp = temporary_password()
+        self.assertRegex(temp, r'^[a-z2-9]{5}-[a-z2-9]{5}-[a-z2-9]{5}$')
+        self.assertIsNone(password_problem(temp))
+
+    def test_global_limit_stops_password_spraying(self):
+        self.add()
+        a = Auth(self.store)
+        for i in range(30):
+            with self.assertRaises(PermissionError):
+                a.login(f'user{i:02d}', 'mat-khau-1')
+        with self.assertRaisesRegex(PermissionError, 'tạm ngừng'):
+            a.login('bs.an', 'mat-khau-1')
+
+    def test_admin_actions_and_last_admin(self):
+        self.add('quan.tri')
+        self.store.modify(lambda u: u['quan.tri'].update(role='admin'))
+        a = Auth(self.store)
+        temp = a.create_user('Lab.Mot', 'Phòng Lab 1', 'lab')
+        token, user = a.login('lab.mot', temp)
+        self.assertEqual((user['role'], user['must_change']), ('lab', True))
+        with self.assertRaisesRegex(ValueError, 'hiện tại'):
+            a.change_password(token, 'sai', 'mây trắng bay qua đồi')
+        a.change_password(token, temp, 'mây trắng bay qua đồi')
+        self.assertFalse(a.check('Bearer ' + token)[1]['must_change'])
+        self.assertEqual(a.update_user('quan.tri', 'lab.mot', role='doctor'), {'role': 'doctor'})
+        self.assertEqual(a.check('Bearer ' + token)[1]['role'], 'doctor')  # applies to the open session
+        new_temp = a.reset_password('lab.mot')
+        self.assertFalse(a.check('Bearer ' + token)[0])  # reset logs the user out
+        self.assertTrue(a.login('lab.mot', new_temp)[1]['must_change'])
+        with self.assertRaisesRegex(ValueError, 'quản trị'):
+            a.update_user('lab.mot', 'quan.tri', role='doctor')
+        with self.assertRaisesRegex(ValueError, 'tự khóa'):
+            a.update_user('quan.tri', 'quan.tri', disabled=True)
+        with self.assertRaisesRegex(ValueError, 'tự xóa'):
+            a.delete_user('quan.tri', 'quan.tri')
+        with self.assertRaisesRegex(ValueError, 'đã có'):
+            a.create_user('lab.mot', '', 'lab')
+        a.delete_user('quan.tri', 'lab.mot')
+        self.assertNotIn('lab.mot', self.store.all())
+
+    def test_audit_log(self):
+        log = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+        log.write('login_ok', 'bs.an', role='doctor')
+        log.write('extract', 'bs.an', chars=20, findings=2)
+        log.write('login_fail', 'khach')
+        self.assertEqual([e['event'] for e in log.tail()], ['login_fail', 'extract', 'login_ok'])
+        self.assertEqual([e['event'] for e in log.tail(user='bs.an', event='extract')], ['extract'])
+        self.assertEqual(os.stat(log.path).st_mode & 0o777, 0o600)
+
     def test_manage_users_cli(self):
         import manage_users
         with patch('getpass.getpass', return_value='mat-khau-2'), redirect_stderr(StringIO()), \
              patch('sys.stdout', StringIO()):
-            manage_users.main(['add', 'bs.binh', '--name', 'BS. Bình', '--file', str(self.store.path)])
-            self.assertEqual(Auth(self.store).login('bs.binh', 'mat-khau-2')[1]['name'], 'BS. Bình')
+            manage_users.main(['add', 'bs.binh', '--name', 'BS. Bình', '--role', 'admin', '--file', str(self.store.path)])
+            self.assertEqual(Auth(self.store).login('bs.binh', 'mat-khau-2')[1]['role'], 'admin')
+            manage_users.main(['role', 'bs.binh', '--role', 'lab', '--file', str(self.store.path)])
+            self.assertEqual(self.store.get('bs.binh')['role'], 'lab')
             manage_users.main(['disable', 'bs.binh', '--file', str(self.store.path)])
             self.assertIsNone(self.store.get('bs.binh'))
             with self.assertRaises(SystemExit):
@@ -311,3 +369,97 @@ class HttpTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class AdminHttpTests(unittest.TestCase):
+    """Roles on the HTTP API: admin page, lab without GPU, first login with a temporary password, audit log."""
+
+    @classmethod
+    def setUpClass(cls):
+        import serve_web
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.store = UserStore(Path(cls.dir.name, 'users.json'))
+        cls.store.save({'quan.tri': {'name': 'Quản trị', 'role': 'admin', 'password': hash_password('mat-khau-quan-tri')},
+                        'bs.an': {'name': 'BS. An', 'role': 'doctor', 'password': hash_password('mat-khau-1')}})
+        cls.audit = AuditLog(Path(cls.dir.name, 'audit.jsonl'))
+        cls.quiet = redirect_stderr(StringIO())
+        cls.quiet.__enter__()
+        cls.runner = model(pause_file=Path(cls.dir.name, 'gpu_pause'))
+        system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={'HP:1': {}}, runner=cls.runner,
+                                       search_hpo=lambda q: [], extract=lambda text: {'mentions': [1, 2], 'seconds': 0.1},
+                                       match=lambda p: {'ok': True})
+        cls.patches = [patch.object(serve_web, 'SYSTEM', system), patch.object(serve_web, 'AUTH', Auth(cls.store)),
+                       patch.object(serve_web, 'AUDIT', cls.audit), patch.object(serve_web, 'free_vram_mib', lambda: 20000)]
+        for p in cls.patches:
+            p.start()
+        cls.server = ThreadingHTTPServer(('127.0.0.1', 0), serve_web.Handler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = 'http://127.0.0.1:%d' % cls.server.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.runner.stop()
+        for p in cls.patches:
+            p.stop()
+        cls.quiet.__exit__(None, None, None)
+        cls.dir.cleanup()
+
+    call = HttpTests.call
+
+    def login(self, username, password):
+        code, data = self.call('/api/login', {'username': username, 'password': password})
+        self.assertEqual(code, 200, data)
+        return data['token'], data
+
+    def test_roles_and_admin_page(self):
+        doctor, _ = self.login('bs.an', 'mat-khau-1')
+        self.assertEqual(self.call('/api/admin/users', token=doctor)[0], 403)
+        admin, _ = self.login('quan.tri', 'mat-khau-quan-tri')
+        code, users = self.call('/api/admin/users', token=admin)
+        self.assertEqual((code, sorted(u['username'] for u in users['users'])), (200, ['bs.an', 'quan.tri']))
+        self.assertNotIn('password', json.dumps(users))  # hashes never leave the server
+        code, made = self.call('/api/admin/users/create', {'username': 'lab.hv', 'name': 'Lab HV', 'role': 'lab'}, admin)
+        self.assertEqual(code, 200)
+        self.runner.stop()
+        lab, data = self.login('lab.hv', made['temp_password'])
+        self.assertTrue(data['user']['must_change'])
+        self.assertIsNone(self.runner.proc)  # a lab login never loads the GPU
+        self.assertEqual(self.call('/api/hpo_search?q=a', token=lab)[0], 403)  # temporary password first
+        self.assertEqual(self.call('/api/change_password', {'old_password': made['temp_password'],
+                                                            'new_password': '123'}, lab)[0], 422)
+        self.assertEqual(self.call('/api/change_password', {'old_password': made['temp_password'],
+                                                            'new_password': 'mây trắng bay qua đồi'}, lab)[0], 200)
+        self.assertEqual(self.call('/api/hpo_search?q=a', token=lab)[0], 200)
+        self.assertEqual(self.call('/api/match_diseases', {'hpos': []}, lab)[0], 200)
+        self.assertEqual(self.call('/api/extract_hpo', {'text': 'x'}, lab)[0], 403)
+        self.assertEqual(self.call('/api/warmup', {}, lab)[0], 403)
+        self.assertIsNone(self.runner.proc)
+        code, sessions = self.call('/api/admin/sessions', token=admin)
+        self.assertIn('lab.hv', [s['username'] for s in sessions['sessions']])
+        self.assertEqual(self.call('/api/admin/sessions/end', {'username': 'lab.hv'}, admin)[1]['ended'], 1)
+        self.assertEqual(self.call('/api/hpo_search?q=a', token=lab)[0], 401)
+        self.assertEqual(self.call('/api/admin/users/update', {'username': 'quan.tri', 'role': 'doctor'}, admin)[0], 422)
+        self.assertEqual(self.call('/api/admin/users/delete', {'username': 'lab.hv'}, admin)[0], 200)
+
+    def test_gpu_controls_and_audit(self):
+        admin, _ = self.login('quan.tri', 'mat-khau-quan-tri')
+        doctor, _ = self.login('bs.an', 'mat-khau-1')
+        self.assertEqual(self.call('/api/extract_hpo', {'text': 'Thai đầu nhỏ, bí mật.'}, doctor)[0], 200)
+        code, gpu = self.call('/api/admin/gpu', {'action': 'pause'}, admin)
+        self.assertEqual((code, gpu['paused'], gpu['free_mib']), (200, True, 20000))
+        self.assertEqual(self.call('/api/extract_hpo', {'text': 'x'}, doctor)[0], 503)
+        self.assertFalse(self.call('/api/admin/gpu', {'action': 'resume'}, admin)[1]['paused'])
+        self.assertEqual(self.call('/api/login', {'username': 'bs.an', 'password': 'sai'})[0], 401)
+        code, log = self.call('/api/admin/audit?limit=50', token=admin)
+        events = [e['event'] for e in log['entries']]
+        for event in ('login_ok', 'extract', 'gpu', 'login_fail'):
+            self.assertIn(event, events)
+        self.assertNotIn('bí mật', json.dumps(log, ensure_ascii=False))  # no case content in the log
+        extract = next(e for e in log['entries'] if e['event'] == 'extract')
+        self.assertEqual((extract['user'], extract['findings']), ('bs.an', 2))
+
+    def test_security_headers(self):
+        with urllib.request.urlopen(self.base + '/api/status', timeout=30) as r:
+            self.assertIn("script-src 'self'", r.headers['Content-Security-Policy'])
+            self.assertEqual(r.headers['X-Frame-Options'], 'DENY')
