@@ -12,7 +12,7 @@ if [ ! -f "$ENV_FILE" ]; then
   printf '%s\n' \
     "MODEL1_ADAPTER=$HOME/Downloads/model1_extract_ubuntu_v3_8/runs/v38_20260918T175546Z_293892/adapter" \
     "MODEL1_WORKER_DIR=$HOME/Downloads/model1_extract_ubuntu_v3_8" \
-    'MODEL1_PRELOAD=1' 'CUDA_VISIBLE_DEVICES=0' 'PORT=8000' \
+    'MODEL1_PRELOAD=0' 'MODEL1_IDLE_MINUTES=60' 'MODEL1_MIN_FREE_MIB=13000' 'CUDA_VISIBLE_DEVICES=0' 'PORT=8000' \
     "WEB_ACCESS_TOKEN=$WEB_TOKEN" \
     'WEB_ALLOWED_ORIGINS=https://ditruyenhungvuongorg.github.io' \
     'PYTHONUNBUFFERED=1' > "$ENV_FILE"
@@ -36,3 +36,5 @@ systemctl --user daemon-reload
 systemctl --user enable --now prenatal-web.service
 echo 'Installed prenatal-web user service. Check: systemctl --user status prenatal-web'
 echo 'For boot without login, an administrator must enable linger for this user.'
+echo 'First admin: python manage_users.py add <username> --name "<display name>" --role admin; other accounts on the admin page'
+echo 'GPU for training/local AI: bash gpu.sh pause | resume | status'
