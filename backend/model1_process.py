@@ -10,6 +10,9 @@ Protocol: JSON lines. The parent writes {"id", "text"} to the child's stdin; the
 {"id", "ok", "result"} or {"id", "ok": false, "error_type", "message"} on a private copy of its stdout, after
 an {"event": "ready"} or {"event": "failed"} line. The child's own stdout goes to stderr (journal), so library
 banners cannot break the protocol. The child exits when stdin closes, also if the web process dies.
+
+Error messages cross to the doctor only when they are fixed strings listed below: a message built from model
+output or exception text may quote part of the report. The child never writes request text to stderr.
 """
 import json
 import os
@@ -22,6 +25,53 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_PAUSE_FILE = Path.home() / 'prenatal_pubcasefinder/.deployment/gpu_pause'
+
+
+# Fixed ValueError messages that may reach the doctor (grep "raise ValueError" in model1_v6/, model1_v38_package/ and
+# web_service.py). Messages that append data (a JSON key, an assertion value, a gene symbol, a sample id) are left out
+# on purpose: that data comes from the report or the model output.
+KNOWN_INPUT_ERRORS = frozenset({
+    # web_service.py
+    'Nhập đoạn mô tả từ 1 đến 6.000 ký tự.',
+    'Danh sách gene WES không hợp lệ (tối đa 1.000 gene).',
+    'Chọn từ 1 đến 100 HPO đã duyệt.',
+    'HPO không hợp lệ.',
+    'Mã HPO, trạng thái không hợp lệ hoặc bị trùng.',
+    'Cần ít nhất một HPO Có hoặc Nghi ngờ để đối chiếu.',
+    # model1_v6/runner.py
+    'Đoạn quá dài cho một lần trích.',
+    # model1_v6/contract.py
+    'Expected exactly one findings list',
+    'Too many findings',
+    'Each finding needs exactly text and assertion',
+    'Finding text must be a nonempty trimmed string',
+    'Finding text absent from report or cuts a word',
+    'Ambiguous repeated occurrences',
+    'Overlapping or out-of-order findings',
+    'not a findings list',
+    'bad item',
+    'finding text absent or out of order',
+    'all ensemble members invalid',  # contract.vote error, returned as a warning
+    # model1_v38_package/core.py
+    'Expected exactly one phrases field',
+    'phrases must be a list with at most 40 entries',
+    'Every phrase must be a nonempty exact string',
+    'Phrase absent from source or partial word',
+    'Overlapping or out-of-order phrases',
+    'Empty text or external whitespace',
+})
+KNOWN_RUNTIME_ERRORS = frozenset({'Model đang bận.'})
+GENERIC_INPUT_ERROR = 'Đoạn văn không xử lý được; kiểm tra lại nội dung.'
+GENERIC_RUNTIME_ERROR = 'Model gặp lỗi khi xử lý.'
+
+
+def safe_input_error(message):
+    """The message itself when it is a known fixed input error, else a generic one (never echoes report text)."""
+    return message if isinstance(message, str) and message in KNOWN_INPUT_ERRORS else GENERIC_INPUT_ERROR
+
+
+def safe_runtime_error(message):
+    return message if isinstance(message, str) and message in KNOWN_RUNTIME_ERRORS else GENERIC_RUNTIME_ERROR
 
 
 class ModelUnavailable(RuntimeError):
@@ -211,12 +261,12 @@ class Model1Process:
                 self.touch()
         if msg.get('ok'):
             return msg['result']
-        kind = msg.get('error_type')
+        kind = msg.get('error_type')  # filtered again here: the child may be an older build
         if kind == 'ValueError':
-            raise ValueError(msg.get('message', ''))
+            raise ValueError(safe_input_error(msg.get('message')))
         if kind == 'RuntimeError':
-            raise RuntimeError(msg.get('message', ''))
-        raise ModelProcessError(msg.get('message', ''))
+            raise RuntimeError(safe_runtime_error(msg.get('message')))
+        raise ModelProcessError(GENERIC_RUNTIME_ERROR)
 
     # ------------------------------------------------------------------ threads
     def _read(self, proc, responses):
@@ -301,11 +351,16 @@ def worker_main(runner_factory=build_runner):
             continue
         try:
             send({'id': request.get('id'), 'ok': True, 'result': extract(request.get('text'))})
-        except Exception as exc:
-            kind = 'ValueError' if isinstance(exc, ValueError) else 'RuntimeError' if isinstance(exc, RuntimeError) else 'Exception'
-            if kind == 'Exception':
-                print('[Model 1] Lỗi xử lý:', type(exc).__name__, exc, file=sys.stderr, flush=True)
-            send({'id': request.get('id'), 'ok': False, 'error_type': kind, 'message': str(exc)})
+        except Exception as exc:  # the class name only: str(exc) may quote the report
+            if isinstance(exc, ValueError):
+                kind, message = 'ValueError', safe_input_error(str(exc))
+            elif isinstance(exc, RuntimeError):
+                kind, message = 'RuntimeError', safe_runtime_error(str(exc))
+            else:
+                kind, message = 'Exception', GENERIC_RUNTIME_ERROR
+            if kind != 'ValueError':
+                print('[Model 1] Lỗi xử lý:', type(exc).__name__, file=sys.stderr, flush=True)
+            send({'id': request.get('id'), 'ok': False, 'error_type': kind, 'message': message})
     return 0
 
 
