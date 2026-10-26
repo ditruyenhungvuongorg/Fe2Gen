@@ -59,11 +59,12 @@ async function warmup() {
 }
 const ROLE_NAMES = {admin:'Quản trị', doctor:'Bác sĩ', lab:'Phòng Lab'};
 function showUser() {
-  $('account-open').textContent = user ? user.name : ''; $('account-open').hidden = !user;
+  // One account button for everything: password, admin page (admins), server, logout.
+  $('account-open').textContent = user ? '👤 ' + user.name : ''; $('account-open').hidden = !user;
   $('account-open').title = user ? 'Tài khoản · ' + (ROLE_NAMES[user.role] || '') : '';
-  $('admin-open').hidden = $('account-admin').hidden = user?.role !== 'admin';
-  $('settings-open').hidden = !!user;
-  $('settings-open').textContent = authMode === 'accounts' ? 'Đăng nhập' : 'Kết nối';
+  $('account-admin').hidden = user?.role !== 'admin';
+  // With accounts the sign-in page logs people in; this button only sets the server for the shared access code.
+  $('settings-open').hidden = !!user || authMode === 'accounts';
   // Phòng Lab: HPO search, matching and the lab sheet; no text extraction on the GPU.
   const lab = user?.role === 'lab';
   $('tab-text').hidden = lab;
@@ -80,18 +81,17 @@ function openAccount() {
   if (!$('account').open) $('account').showModal();
   $('old-password').focus();
 }
-// serverOnly: change the server address without signing in here (the sign-in page does that).
-function openSettings(message = '', serverOnly = false) {
-  const accounts = authMode === 'accounts', login = accounts && !serverOnly;
-  $('api-url').value = base; $('login-fields').hidden = !login; $('token-fields').hidden = accounts;
-  $('settings-title').textContent = login ? 'Đăng nhập' : 'Kết nối máy chủ';
-  $('connect').textContent = login ? 'Đăng nhập' : 'Kết nối';
+// Server address (and the shared access code when the server has no accounts); signing in is on the sign-in page.
+function openSettings(message = '') {
+  const accounts = authMode === 'accounts';
+  $('api-url').value = base; $('token-fields').hidden = accounts;
+  $('settings-title').textContent = 'Kết nối máy chủ';
+  $('connect').textContent = 'Kết nối';
   $('settings-hint').textContent = accounts
     ? 'Phiên đăng nhập chỉ giữ trong tab này; tải lại trang cần đăng nhập lại. Model trích văn bản khởi động khi bác sĩ đăng nhập và tự rời GPU khi không dùng.'
     : 'Mã truy cập chỉ giữ trong bộ nhớ của tab này. Địa chỉ máy chủ có thể được lưu, không lưu nội dung ca.';
   $('settings-error').textContent = message; $('settings-error').hidden = !message;
   if (!$('settings').open) $('settings').showModal();
-  if (login && !user) ($('username').value ? $('password') : $('username')).focus();
 }
 // With accounts, the page shows only the sign-in card until someone is logged in.
 // state: 'checking' | 'login' | 'offline', or null to show the workspace.
@@ -376,8 +376,8 @@ $('logout').onclick=async()=>{
 $('account-open').onclick=()=>openAccount();
 $('account-close').onclick=()=>$('account').close();
 $('account').oncancel=e=>{if(user?.must_change)e.preventDefault();};  // Esc cannot skip a temporary password
-$('account-server').onclick=()=>{$('account').close();openSettings('',true);};
-$('account-admin').onclick=$('admin-open').onclick=()=>{$('account').close();openAdmin();};
+$('account-server').onclick=()=>{$('account').close();openSettings();};
+$('account-admin').onclick=()=>{$('account').close();openAdmin();};
 $('password-form').onsubmit=async e=>{
   e.preventDefault();
   const show=(id,msg)=>{$(id).textContent=msg;$(id).hidden=!msg;};
@@ -404,15 +404,7 @@ $('connect').onclick=async e=>{
     if(value!==base){access='';user=null;authMode='';showUser();}
     base=value;
     try{localStorage.setItem('prenatal-api',base);}catch{}
-    if(!$('login-fields').hidden){
-      const username=$('username').value.trim(),password=$('password').value;
-      if(!username||!password)throw Error('Nhập tên đăng nhập và mật khẩu.');
-      $('connect').disabled=true;
-      try{const data=await api('/api/login',{username,password},30000);access=data.token;user=data.user;lastModel=data;}
-      finally{$('connect').disabled=false;$('password').value='';}
-      showUser();
-      if(user.must_change){$('settings').close();openAccount();return;}
-    }else if($('access-token').value)access=$('access-token').value;
+    if($('access-token').value)access=$('access-token').value;
     $('access-token').value='';searchTerms=[];extraction=null;renderSearch();renderMentions();
     invalidate();$('settings').close();checkConnection();
   }catch(err){$('settings-error').textContent=err.message;$('settings-error').hidden=false;}
@@ -445,6 +437,6 @@ $('login-form').onsubmit=async e=>{
   finally{$('login-submit').disabled=false;$('login-password').value='';}
 };
 $('login-retry').onclick=()=>{showGate('checking');checkConnection();};
-$('login-server').onclick=()=>openSettings('',true);
+$('login-server').onclick=()=>openSettings();
 renderSelected();showGate('checking');checkConnection();
 
