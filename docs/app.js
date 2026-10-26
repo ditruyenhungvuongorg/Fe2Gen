@@ -1,22 +1,36 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let base = window.PRENATAL_CONFIG?.apiBase || '';
+const DEFAULT_BASE = window.PRENATAL_CONFIG?.apiBase || '';
+let base = DEFAULT_BASE;
 try { base = localStorage.getItem('prenatal-api') || base; } catch {}
 const selection = new CaseSelection(), chosen = selection.items, labIds = new Set(), requests = new Set();
 let access = '', result = null, revision = 0, searchVersion = 0, extractVersion = 0, busy = false;
 let searchTerms = [], extraction = null, connectionVersion = 0, timer;
 // authMode from /api/status: 'accounts' (doctor login), 'token' (shared access code) or 'none'.
-// user: {username, name, role ('admin' | 'doctor' | 'lab'), must_change, totp, needs_2fa}; lab accounts do not use
-// text extraction. needs_2fa: an admin who must turn on two-factor sign-in before anything else.
-// pendingLogin: the password was right and the account has 2FA; the code is asked next.
-let pendingLogin = '';
+// user: {username, name, role ('admin' | 'doctor' | 'lab'), must_change}; lab accounts do not use text extraction.
 let authMode = '', user = null, modelState = '', modelPoll, lastWarmup = 0, lastModel = null;
+// B26: the public page keeps the API server from config.js; only a page served from localhost (or Shift+click on
+// the server name, for testing) may change it, and a different saved server shows a permanent red warning.
+let serverUnlocked = false;
+const canChangeServer = () => serverUnlocked || FrontLogic.serverLockState(location.hostname, base, DEFAULT_BASE).canChange;
+function showServerLock() {
+  const s = FrontLogic.serverLockState(location.hostname, base, DEFAULT_BASE);
+  $('server-warning').hidden = !s.warn; $('server-warning-host').textContent = s.host || '(chưa đặt)';
+  $('login-server').classList.toggle('locked', !canChangeServer());
+  $('login-server').title = canChangeServer() ? 'Đổi máy chủ' : '';
+}
 function notice(message = '') { $('notice').textContent = message; $('notice').hidden = !message; }
 function localStatus(id, message = '') { $(id).textContent = message; }
+// A 401 from these means a wrong password or code, not an ended session.
+const CREDENTIAL_PATHS = new Set(['/api/login', '/api/login/totp', '/api/totp/enable', '/api/totp/disable', '/api/change_password']);
+const apiError = (message, status = 0, data = {}) => Object.assign(Error(message), {status, data});
+// Polling and keep-alive checks; they do not count as the user being at the computer.
+const BACKGROUND_PATHS = new Set(['/api/status', '/api/session']);
 async function api(path, payload, timeout = 120000, controller = new AbortController()) {
   if (!base && location.hostname.endsWith('github.io')) throw Error('Mở Kết nối để nhập địa chỉ máy chủ Ubuntu.');
   requests.add(controller);
+  if (!BACKGROUND_PATHS.has(path)) markActivity();  // a request the user started counts as activity
   const timeoutId = setTimeout(() => controller.abort('timeout'), timeout);
   try {
     const response = await fetch(base + path, {
@@ -24,14 +38,18 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
       headers: {...(payload ? {'Content-Type':'application/json'} : {}), ...(access ? {Authorization:'Bearer ' + access} : {})},
       ...(payload ? {body:JSON.stringify(payload)} : {}), signal:controller.signal, cache:'no-store'
     });
-    let data;
-    try { data = await response.json(); } catch { throw Error('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.'); }
+    let data = null;
+    try { data = await response.json(); } catch {}
+    // Too many requests: say how long to wait and keep the session (the server sends Retry-After).
+    if (response.status === 429) throw apiError(FrontLogic.tooFastMessage(response.headers.get('Retry-After'), data || {}, {preferServer:path.startsWith('/api/login')}), 429, data || {});
+    if (!data || typeof data !== 'object') throw apiError('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.', response.status);
     if (!response.ok) {
-      if (response.status === 401 && authMode === 'accounts' && access && user && !path.startsWith('/api/login')) sessionEnded();
+      if (response.status === 401 && authMode === 'accounts' && access && !CREDENTIAL_PATHS.has(path)) sessionEnded();
       if (response.status === 403 && data.must_change && user) { user.must_change = true; openAccount(); }
-      if (response.status === 403 && data.needs_2fa && user) { user.needs_2fa = true; openAccount(); }
+      // Admin without 2FA: only /api/session, /api/totp/* and logout work until it is turned on.
+      if (response.status === 403 && data.totp_required && user) { sessionInfo = {...(sessionInfo || {}), totp_required:true}; openAccount(); }
       showModel(data);
-      throw Error(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.');
+      throw apiError(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.', response.status, data);
     }
     return data;
   } catch (e) {
@@ -49,12 +67,22 @@ function showModel(data) {
   el.hidden = data.model_configured === false || user?.role === 'lab';
   el.textContent = MODEL_TEXT[modelState] || ''; el.dataset.short = MODEL_SHORT[modelState] || '';
   el.className = 'model-state ' + modelState;
-  el.title = modelState === 'failed' ? data.model_error || '' : modelState === 'stopped' ? 'Model trích văn bản rời GPU sau ' + (data.idle_minutes || 60) + ' phút không dùng và tự khởi động lại khi bác sĩ đăng nhập hoặc mở Nhập đoạn văn.' : '';
+  el.title = modelState === 'failed' ? data.model_error || '' : modelState === 'stopped' ? 'Model trích văn bản rời GPU sau ' + (data.gpu_idle_minutes || 60) + ' phút không dùng và tự khởi động lại khi bác sĩ đăng nhập hoặc mở Nhập đoạn văn.' : '';
   clearTimeout(modelPoll);
   if (modelState === 'loading') modelPoll = setTimeout(pollModel, 3000);
 }
-// Model state comes with the session: /api/status only says whether the server is online and how to sign in.
-async function pollModel() { if (authMode !== 'none' && !access) return; try { showModel(await api('/api/session', null, 15000)); } catch {} }
+// Model state, 2FA state and the idle limit come from /api/session after sign-in; /api/status only says online.
+let sessionInfo = null;
+function applySession(data) {
+  if (!data || typeof data !== 'object') return;
+  sessionInfo = data;
+  if (user && data.user && data.user.username === user.username) user = {...user, ...data.user};
+  showModel(data);
+}
+async function refreshSession() {
+  try { const data = await api('/api/session', null, 15000); applySession(data); return data; } catch { return null; }
+}
+async function pollModel() { await refreshSession(); }
 // Text extraction is about to be used: ask the server to load Model 1 on the GPU in the background.
 async function warmup() {
   if (authMode !== 'none' && !access || user?.role === 'lab' || user?.must_change) return;
@@ -76,36 +104,27 @@ function showUser() {
   if (lab && !$('paragraph').hidden) activateTab('search', false);
   showModel(lastModel);
 }
+// The account dialog blocks the workspace (no Close, Esc ignored) while a temporary password must be replaced,
+// then, for an admin without 2FA, until two-step verification is on.
+const totpForced = () => !user?.must_change && !!sessionInfo?.totp_required;
+const accountLocked = () => !!user?.must_change || totpForced() || !!window.twoFactorBlocking?.();
 function openAccount() {
-  const password = !!user?.must_change, second = !password && !!user?.needs_2fa, forced = password || second;
-  $('account-title').textContent = password ? 'Đặt mật khẩu mới' : second ? 'Bật xác thực 2 lớp' : 'Tài khoản';
+  const forced = !!user?.must_change, totp = totpForced();
+  $('account-title').textContent = forced ? 'Đặt mật khẩu mới' : totp ? 'Bật xác thực 2 lớp' : 'Tài khoản';
   $('account-who').textContent = user ? user.name + ' · ' + user.username + ' · ' + (ROLE_NAMES[user.role] || '') : '';
-  $('account-forced').textContent = password ? 'Bạn đang dùng mật khẩu tạm do quản trị viên cấp. Đặt mật khẩu mới của riêng bạn để tiếp tục.'
-    : 'Tài khoản quản trị phải bật xác thực 2 lớp trước khi dùng web. Làm theo phần Xác thực 2 lớp bên dưới.';
-  $('account-forced').hidden = !forced; $('account-close').hidden = forced;
-  $('account-admin').hidden = forced || user?.role !== 'admin'; $('account-server').hidden = forced;
+  $('account-forced').hidden = !forced; $('totp-forced').hidden = !totp;
+  $('password-form').hidden = totp; $('totp-section').hidden = forced || !user;
+  $('account-admin').hidden = forced || totp || user?.role !== 'admin'; $('account-server').hidden = forced || totp || !canChangeServer();
   $('account-error').hidden = true; $('account-ok').hidden = true;
-  showTotp();
+  window.renderTwoFactor?.();
+  $('account-close').hidden = accountLocked();
   if (!$('account').open) $('account').showModal();
-  (second ? $('totp-start') : $('old-password')).focus();
-}
-// Two-factor section of the account dialog; setup state lives only while the dialog shows it.
-function showTotp(setup = null, codes = null) {
-  const on = !!user?.totp;
-  $('totp-state').textContent = on ? 'Đang bật: mỗi lần đăng nhập cần thêm mã 6 số trong ứng dụng trên điện thoại.'
-    : user?.role === 'admin' ? 'Chưa bật. Bắt buộc với tài khoản quản trị.' : 'Chưa bật. Không bắt buộc; nên bật nếu bạn đăng nhập từ máy dùng chung.';
-  $('totp-start').hidden = on || !!setup || !user;
-  $('totp-setup').hidden = !setup;
-  $('totp-secret').textContent = setup ? setup.secret.replace(/(.{4})/g, '$1 ').trim() : '';
-  $('totp-uri').textContent = setup ? setup.uri : '';
-  $('totp-code').value = '';
-  $('totp-backup').hidden = !codes;
-  $('totp-backup-codes').textContent = codes ? codes.join('  ') : '';
+  (totp ? $('totp-body').querySelector('button, input') : $('old-password'))?.focus();
 }
 // Server address (and the shared access code when the server has no accounts); signing in is on the sign-in page.
 function openSettings(message = '') {
   const accounts = authMode === 'accounts';
-  $('api-url').value = base; $('token-fields').hidden = accounts;
+  $('api-url').value = base; $('api-url').readOnly = !canChangeServer(); $('token-fields').hidden = accounts;
   $('settings-title').textContent = 'Kết nối máy chủ';
   $('connect').textContent = 'Kết nối';
   $('settings-hint').textContent = accounts
@@ -115,28 +134,30 @@ function openSettings(message = '') {
   if (!$('settings').open) $('settings').showModal();
 }
 // With accounts, the page shows only the sign-in card until someone is logged in.
-// state: 'checking' | 'login' | 'offline', or null to show the workspace.
+// state: 'checking' | 'login' | 'totp' (second step) | 'offline' | 'locked', or null to show the workspace.
 function showGate(state, message = '') {
   $('login-screen').hidden = !state; document.querySelector('main').hidden = !!state;
   document.querySelector('.top-actions').hidden = !!state;
   if (!state) return;
-  $('login-inputs').hidden = state !== 'login'; $('login-code-box').hidden = state !== 'code';
-  $('login-submit').hidden = state !== 'login' && state !== 'code';
-  $('login-submit').textContent = state === 'code' ? 'Xác nhận mã' : 'Đăng nhập';
-  if (state !== 'code') pendingLogin = '';
-  $('login-retry').hidden = state !== 'offline';
+  $('login-inputs').hidden = state !== 'login'; $('login-totp').hidden = $('login-back').hidden = state !== 'totp';
+  $('login-submit').hidden = !['login', 'totp'].includes(state);
+  $('login-submit').textContent = state === 'totp' ? 'Xác nhận' : 'Đăng nhập';
+  $('login-title').textContent = state === 'totp' ? 'Xác thực 2 lớp' : 'Đăng nhập';
+  $('login-retry').hidden = !['offline', 'locked'].includes(state);
   $('login-sub').textContent = state === 'checking' ? 'Đang kết nối máy chủ…'
     : state === 'offline' ? 'Chưa kết nối được máy chủ. Kiểm tra mạng rồi bấm Thử kết nối lại.'
-    : state === 'code' ? 'Mật khẩu đúng. Nhập mã xác thực 2 lớp để vào (mã đổi sau mỗi 30 giây).' : 'Dùng tài khoản do quản trị viên cấp.';
+    : state === 'locked' ? 'Hệ thống tạm khóa: máy chủ không đọc được danh sách tài khoản. Liên hệ quản trị viên rồi bấm Thử kết nối lại.'
+    : state === 'totp' ? (pendingLogin?.user?.name ? pendingLogin.user.name + ': m' : 'M') + 'ở ứng dụng xác thực trên điện thoại và nhập mã 6 số của Fe2Gen.'
+    : 'Dùng tài khoản do quản trị viên cấp.';
   $('login-error').textContent = message; $('login-error').hidden = !message;
   let host = location.host;
   try { if (base) host = new URL(base).host; } catch {}
-  $('login-server-name').textContent = host;
+  $('login-server-name').textContent = host; showServerLock();
   if (state === 'login') ($('login-username').value ? $('login-password') : $('login-username')).focus();
-  if (state === 'code') $('login-code').focus();
+  if (state === 'totp') ($('login-backup-label').hidden ? $('login-code') : $('login-backup')).focus();
 }
 function sessionEnded() {
-  access = ''; user = null; showUser();
+  access = ''; user = null; sessionInfo = null; pendingLogin = null; window.resetTwoFactor?.(); showUser();
   for (const d of ['account', 'admin', 'settings', 'lab']) if ($(d).open) $(d).close();
   showGate('login', 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
 }
@@ -265,7 +286,7 @@ $('extract').onclick = async () => {
   if (busy) return;
   const text = $('clinical-text').value;
   if (!text.trim()) { localStatus('extract-status','Nhập đoạn mô tả siêu âm trước.'); return; }
-  const seq = ++extractVersion; busy = 'extract'; updateActions();
+  const seq = ++extractVersion; busy = 'extract'; idle.busy++; updateActions();
   localStatus('extract-status', modelState === 'ready' ? 'Model 1 đang tách dấu hiệu. Các HPO đã chọn được giữ nguyên.'
     : 'Model 1 đang khởi động trên GPU (thường dưới 1 phút) rồi tách dấu hiệu. Các HPO đã chọn được giữ nguyên.');
   try {
@@ -276,7 +297,7 @@ $('extract').onclick = async () => {
     renderMentions();
     localStatus('extract-status', data.mentions.length ? 'Tìm thấy ' + data.mentions.length + ' cụm. Chọn HPO phù hợp bên dưới; không tự ghi đè danh sách đã duyệt.' : 'Chưa tách được dấu hiệu. Bạn vẫn có thể tìm HPO thủ công.');
   } catch (e) { if (seq === extractVersion) localStatus('extract-status', e.message); }
-  finally { busy = false; updateActions(); }
+  finally { busy = false; idle.busy--; markActivity(); updateActions(); }
 };
 $('clear-hpos').onclick = () => { selection.clear(); invalidate(); renderSelected(); renderSearch(); renderMentions(); notice('Đã xóa danh sách HPO. Đoạn văn và gợi ý vẫn được giữ.'); };
 $('reviewed').onchange = updateActions;
@@ -285,7 +306,7 @@ $('match').onclick = async () => {
   if (busy || selection.conflicts || !$('reviewed').checked) return;
   const seq = revision;
   const snapshot = {hpos:structuredClone([...chosen.values()]), text:$('clinical-text').value, wesText:$('wes-genes').value.trim()};
-  busy = 'match'; updateActions(); notice('Đang đối chiếu hồ sơ bệnh hiếm…');
+  busy = 'match'; idle.busy++; updateActions(); notice('Đang đối chiếu hồ sơ bệnh hiếm…');
   try {
     const data = await api('/api/match_diseases', {hpos:snapshot.hpos.map(h => ({id:h.id,status:h.status})), genes:snapshot.wesText});
     if (seq !== revision) return;
@@ -298,7 +319,7 @@ $('match').onclick = async () => {
     $('inheritance-filter').innerHTML = '<option value="">Tất cả kiểu di truyền</option>' + modes.map(m => '<option>' + escape(m) + '</option>').join('');
     renderResults(); notice('');
   } catch (e) { if (seq === revision) {result = null;labIds.clear();notice(e.message);} }
-  finally { busy = false; updateActions(); }
+  finally { busy = false; idle.busy--; markActivity(); updateActions(); }
 };
 
 const GROUPS=[
@@ -397,28 +418,61 @@ $('logout').onclick=async()=>{
   if(hasCase()&&!confirm('Đăng xuất sẽ xóa nội dung ca đang mở trong tab này. Tiếp tục?'))return;
   try{await api('/api/logout',{},15000);}catch{}
   for(const d of ['account','admin'])if($(d).open)$(d).close();
-  resetCase();access='';user=null;showUser();showGate('login');checkConnection();
+  signedOut();showGate('login');checkConnection();
 };
+// After logout: forget the user, the 2FA state and the case. /api/logout sends Clear-Site-Data "cache", which
+// leaves localStorage alone; still reread the saved server instead of assuming it is kept or gone.
+function signedOut(){
+  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();showUser();
+  $('idle-warning').hidden=true;
+  try{const saved=localStorage.getItem('prenatal-api');if(saved)base=saved;}catch{}
+}
+
+// B12/B27: sign out by itself after idle_minutes (from /api/session) without mouse, keyboard, touch or scrolling,
+// with a 60-second warning. Text extraction and matching pause the countdown while they run. A shared hospital
+// computer left signed in must not show the case to the next person.
+const idle={last:Date.now(),busy:0,lastPing:Date.now(),ending:false};
+const idleOn=()=>authMode==='accounts'&&!!access&&!!user;
+function markActivity(){idle.last=Date.now();if(!$('idle-warning').hidden)checkIdle();}
+function placeIdleWarning(){
+  // Modal dialogs make the rest of the page inert: show the warning inside the open one.
+  const host=[...document.querySelectorAll('dialog')].reverse().find(d=>d.open&&d.matches(':modal'))||document.body;
+  if($('idle-warning').parentElement!==host)host.prepend($('idle-warning'));
+}
+function checkIdle(){
+  if(idle.ending)return;
+  if(!idleOn()){$('idle-warning').hidden=true;return;}
+  const now=Date.now();
+  const s=FrontLogic.idleState({now,lastActivity:idle.last,idleMinutes:sessionInfo?.idle_minutes,busy:idle.busy>0});
+  if(s.phase==='expired')return idleLogout();
+  if(s.phase==='warn'){$('idle-seconds').textContent=s.secondsLeft;placeIdleWarning();}
+  $('idle-warning').hidden=s.phase!=='warn';
+  // Typing a long report sends no request: keep the server session alive while the doctor is active.
+  if(FrontLogic.shouldPing({now,lastActivity:idle.last,lastPing:idle.lastPing})){idle.lastPing=now;refreshSession();}
+}
+async function idleLogout(){
+  idle.ending=true;
+  const minutes=FrontLogic.idleMinutesOf(sessionInfo?.idle_minutes);
+  for(const d of ['account','admin','settings','lab'])if($(d).open)$(d).close();
+  resetCase();  // clear the case first, before waiting for the network
+  try{await api('/api/logout',{},15000);}catch{}
+  signedOut();idle.ending=false;
+  showGate('login','Đã tự đăng xuất sau '+minutes+' phút không thao tác; nội dung ca trong tab này đã được xóa.');
+}
+for(const type of ['pointerdown','pointermove','keydown','wheel','scroll','touchstart'])
+  addEventListener(type,markActivity,{capture:true,passive:true});
+$('idle-stay').onclick=()=>{markActivity();idle.lastPing=Date.now();refreshSession();};
+// Back to a hidden tab: timers may have been slowed, so decide at once; then ask the server whether the session
+// still exists (401 → sign-in page).
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState!=='visible'||!idleOn())return;
+  checkIdle();
+  if(idleOn())refreshSession();
+});
+setInterval(checkIdle,1000);
 $('account-open').onclick=()=>openAccount();
 $('account-close').onclick=()=>$('account').close();
-$('account').oncancel=e=>{if(user?.must_change||user?.needs_2fa)e.preventDefault();};  // Esc cannot skip a temporary password or required 2FA
-$('totp-start').onclick=async()=>{
-  $('account-error').hidden=true;
-  try{showTotp(await api('/api/totp/setup',{},20000));$('totp-code').focus();}
-  catch(err){$('account-error').textContent=err.message;$('account-error').hidden=false;}
-};
-$('totp-code').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('totp-confirm').click();}};
-$('totp-confirm').onclick=async()=>{
-  $('account-error').hidden=true;
-  try{
-    const data=await api('/api/totp/enable',{code:$('totp-code').value.trim()},20000);
-    const wasForced=user.needs_2fa;user=data.user;showUser();showTotp(null,data.backup_codes);
-    $('account-forced').hidden=true;$('account-close').hidden=false;$('account-server').hidden=false;
-    $('account-admin').hidden=user.role!=='admin';$('account-title').textContent='Tài khoản';
-    $('account-ok').textContent='Đã bật xác thực 2 lớp. Các thiết bị khác đang đăng nhập bằng tài khoản này cần đăng nhập lại.'+(wasForced?' Bạn có thể dùng web bình thường.':'');
-    $('account-ok').hidden=false;
-  }catch(err){$('account-error').textContent=err.message;$('account-error').hidden=false;}
-};
+$('account').oncancel=e=>{if(accountLocked())e.preventDefault();};  // Esc cannot skip a temporary password or required 2FA
 $('account-server').onclick=()=>{$('account').close();openSettings();};
 $('account-admin').onclick=()=>{$('account').close();openAdmin();};
 $('password-form').onsubmit=async e=>{
@@ -433,8 +487,8 @@ $('password-form').onsubmit=async e=>{
     const data=await api('/api/change_password',{old_password,new_password},30000);
     const forced=user.must_change;user=data.user;showUser();
     for(const id of ['old-password','new-password','new-password2'])$(id).value='';
-    if(forced&&user.needs_2fa){openAccount();}
-    else if(forced){$('account').close();notice('Đã đặt mật khẩu mới. Chào '+user.name+'.');pollModel();}
+    if(forced){notice('Đã đặt mật khẩu mới. Chào '+user.name+'.');await refreshSession();
+      if(totpForced())openAccount();else $('account').close();}
     else show('account-ok','Đã đổi mật khẩu. Các thiết bị khác đã đăng nhập bằng tài khoản này cần đăng nhập lại.');
   }catch(err){show('account-error',err.message);}
   finally{$('change-password').disabled=false;}
@@ -442,12 +496,13 @@ $('password-form').onsubmit=async e=>{
 $('connect').onclick=async e=>{
   e.preventDefault();
   try{
-    const value=$('api-url').value.trim().replace(/\/+$/,'');
+    // The public page ignores a typed address unless changing server is allowed (see canChangeServer).
+    const value=canChangeServer()?$('api-url').value.trim().replace(/\/+$/,''):base;
     if(value){const u=new URL(value);if(u.protocol!=='https:'&&!(u.protocol==='http:'&&['localhost','127.0.0.1'].includes(u.hostname)))throw Error('Máy chủ từ xa phải dùng HTTPS.');if(u.username||u.password||u.search||u.hash)throw Error('Chỉ nhập địa chỉ gốc của máy chủ.');}
     for(const c of requests)c.abort('connection-changed');searchVersion++;extractVersion++;connectionVersion++;clearTimeout(timer);
     if(value!==base){access='';user=null;authMode='';showUser();}
-    base=value;
-    try{localStorage.setItem('prenatal-api',base);}catch{}
+    if(value!==base){base=value;try{localStorage.setItem('prenatal-api',base);}catch{}}
+    showServerLock();
     if($('access-token').value)access=$('access-token').value;
     $('access-token').value='';searchTerms=[];extraction=null;renderSearch();renderMentions();
     invalidate();$('settings').close();checkConnection();
@@ -457,64 +512,80 @@ async function checkConnection(){
   const seq=connectionVersion;
   try{const status=await api('/api/status',null,15000);if(seq!==connectionVersion)return;
     authMode=status.auth_mode||(status.auth_required?'token':'none');
+    // 'locked': the server could not read its accounts and refuses everything until an admin fixes it.
+    if(authMode==='locked'){$('connection').textContent='○ Máy chủ tạm khóa';if(!user)showGate('locked');else notice('Máy chủ tạm khóa: không đọc được danh sách tài khoản. Liên hệ quản trị viên.');return;}
     $('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';showUser();
     if(authMode==='accounts'&&!access){showGate('login');return;}
     showGate(null);
     if(authMode==='token'&&!access){notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');return;}
-    const session=await api('/api/session',null,15000);if(seq!==connectionVersion)return;
-    showModel(session);
-    if(!session.model_configured)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');
-    else notice('');}
-  catch(e){if(seq!==connectionVersion)return;$('connection').textContent='○ Chưa kết nối Ubuntu';
+    notice('');
+    const session=await refreshSession();
+    if(seq===connectionVersion&&session&&session.model_configured===false)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');}
+  catch(e){if(seq!==connectionVersion)return;
+    if(e.data?.auth_mode==='locked'||e.status===503&&/tạm khóa/i.test(e.message)){$('connection').textContent='○ Máy chủ tạm khóa';if(!user)showGate('locked');else notice(e.message);return;}
+    $('connection').textContent='○ Chưa kết nối Ubuntu';
     // The generic network error mentions the access code; the sign-in card says it more simply.
     if(user)notice(e.message);else showGate('offline',/Chưa kết nối được máy chủ/.test(e.message)?'':e.message);}
 }
+// Sign-in: password, then (accounts with 2FA) a 6-digit code or a backup code within 5 minutes.
+let pendingLogin=null;  // {pending, user, at, failures}
+const PENDING_MS=5*60000,CODE_TRIES=5;
+const BAD_REPLY='Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.';
+async function signedIn(step,data){
+  access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();
+  idle.last=idle.lastPing=Date.now();
+  showUser();notice('');
+  await refreshSession();  // 2FA requirement and the idle limit
+  showGate(null);
+  if(user.must_change||totpForced())openAccount();
+}
+function useBackup(on){
+  $('login-backup-label').hidden=!on;$('login-code-label').hidden=on;
+  $('login-use-backup').textContent=on?'Dùng mã 6 số trong ứng dụng':'Không có điện thoại? Dùng mã dự phòng';
+  $('login-code').value=$('login-backup').value='';
+}
+function backToPassword(message=''){pendingLogin=null;useBackup(false);showGate('login',message);}
+async function submitCode(){
+  const backup=!$('login-backup-label').hidden;
+  if(Date.now()-pendingLogin.at>PENDING_MS)return backToPassword('Đã quá 5 phút từ khi nhập mật khẩu. Vui lòng đăng nhập lại.');
+  const code=FrontLogic.normalizeCode(backup?$('login-backup').value:$('login-code').value,backup);
+  if(!code)return showGate('totp',backup?'Nhập mã dự phòng đúng như trong danh sách đã lưu.':'Nhập đủ 6 chữ số đang hiện trong ứng dụng.');
+  const attempt=pendingLogin;
+  try{
+    const data=await api('/api/login/totp',{pending:attempt.pending,code},30000);
+    const step=FrontLogic.loginStep(data);
+    if(step.kind!=='session')throw Error(BAD_REPLY);
+    await signedIn(step,data);
+  }catch(err){
+    if(pendingLogin!==attempt)return;  // went back meanwhile
+    // The server cancels the pending sign-in after 5 wrong codes or 5 minutes: start again from the password.
+    if(err.status===401)attempt.failures++;
+    if(attempt.failures>=CODE_TRIES||[400,410].includes(err.status)||err.data?.pending_invalid)return backToPassword(err.message+' Vui lòng đăng nhập lại từ bước mật khẩu.');
+    showGate('totp',err.message);
+  }finally{$('login-code').value=$('login-backup').value='';}
+}
 $('login-form').onsubmit=async e=>{
   e.preventDefault();
-  const username=$('login-username').value.trim(),password=$('login-password').value,code=$('login-code').value.trim();
-  if(pendingLogin&&!code)return showGate('code','Nhập mã 6 số đang hiện trong ứng dụng xác thực.');
-  if(!pendingLogin&&(!username||!password))return showGate('login','Nhập tên đăng nhập và mật khẩu.');
+  if($('login-submit').disabled)return;
   $('login-submit').disabled=true;$('login-error').hidden=true;
   try{
-    const data=pendingLogin?await api('/api/login/totp',{pending:pendingLogin,code},30000):await api('/api/login',{username,password},30000);
-    if(data.second_factor){pendingLogin=data.pending;showGate('code');return;}
-    pendingLogin='';access=data.token;user=data.user;lastModel=data;lastActivity=Date.now();
-    showUser();showGate(null);notice('');
-    if(user.must_change||user.needs_2fa)openAccount();
-  }catch(err){
-    // A wrong code keeps the code step; after 5 wrong codes or 5 minutes the server asks for the password again.
-    if(pendingLogin&&!/đăng nhập lại/.test(err.message))showGate('code',err.message);
-    else{pendingLogin='';showGate('login',err.message);}
-  }
-  finally{$('login-submit').disabled=false;$('login-password').value='';$('login-code').value='';}
+    if(pendingLogin)return await submitCode();
+    const username=$('login-username').value.trim(),password=$('login-password').value;
+    if(!username||!password)return showGate('login','Nhập tên đăng nhập và mật khẩu.');
+    try{
+      const data=await api('/api/login',{username,password},30000);
+      const step=FrontLogic.loginStep(data);
+      if(step.kind==='totp'){pendingLogin={pending:step.pending,user:step.user,at:Date.now(),failures:0};useBackup(false);showGate('totp');return;}
+      if(step.kind!=='session')throw Error(BAD_REPLY);
+      await signedIn(step,data);
+    }catch(err){showGate('login',err.message);}
+    finally{$('login-password').value='';}
+  }finally{$('login-submit').disabled=false;}
 };
+$('login-back').onclick=()=>backToPassword();
+$('login-use-backup').onclick=()=>{useBackup($('login-backup-label').hidden);$('login-error').hidden=true;($('login-backup-label').hidden?$('login-code'):$('login-backup')).focus();};
 $('login-retry').onclick=()=>{showGate('checking');checkConnection();};
-// Idle logout (B27): after WEB_IDLE_MINUTES without a click, key or scroll (and no request in flight) the page
-// logs out and clears the case, with a 60-second warning. Timers slow down in hidden tabs, so the check also runs
-// when the tab becomes visible again; it compares wall-clock times, not ticks.
-let lastActivity=Date.now();
-for(const ev of ['pointerdown','keydown','input','wheel','touchstart'])
-  document.addEventListener(ev,()=>{lastActivity=Date.now();if(!$('idle-warning').hidden)$('idle-warning').hidden=true;},{capture:true,passive:true});
-function idleTick(){
-  if(!user||!access){$('idle-warning').hidden=true;return;}
-  const minutes=user.session_idle_minutes||60;
-  const step=SecurityState.idleStep({now:Date.now(),lastActivity,idleMs:minutes*60000,busy:requests.size>0});
-  lastActivity=step.lastActivity;
-  if(step.state==='expired')return autoLogout(minutes);
-  $('idle-warning').hidden=step.state!=='warn';
-  if(step.state==='warn')$('idle-warning').textContent='Không thao tác: tự đăng xuất và xóa ca sau '+Math.ceil(step.remainingMs/1000)+' giây. Bấm hoặc gõ phím bất kỳ để tiếp tục.';
-}
-async function autoLogout(minutes){
-  user=null;showUser();$('idle-warning').hidden=true;
-  for(const d of ['account','admin','settings','lab'])if($(d).open)$(d).close();
-  resetCase();
-  showGate('login','Đã tự đăng xuất sau '+minutes+' phút không thao tác; nội dung ca đã được xóa khỏi tab này.');
-  const token=access;
-  try{await api('/api/logout',{},15000);}catch{}
-  if(access===token)access='';
-}
-setInterval(idleTick,1000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)idleTick();});
-$('login-server').onclick=()=>openSettings();
+$('login-server').onclick=e=>{if(e.shiftKey)serverUnlocked=true;if(canChangeServer()){showServerLock();openSettings();}};
+$('server-default').onclick=()=>{try{localStorage.removeItem('prenatal-api');}catch{}location.reload();};
 renderSelected();showGate('checking');checkConnection();
 

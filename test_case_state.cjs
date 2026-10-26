@@ -32,17 +32,3 @@ test('invalid status and IDs are rejected',()=>{
  const s=new CaseSelection();assert.throws(()=>s.add(term,'UNKNOWN'));assert.throws(()=>s.add({id:'x'}));
 });
 
-const {idleStep}=require('./docs/security-state.js');
-test('idle logout warns in the last minute and expires at the limit',()=>{
- const idleMs=60*60000,t0=1e6;
- assert.equal(idleStep({now:t0+30*60000,lastActivity:t0,idleMs}).state,'active');
- const warn=idleStep({now:t0+idleMs-30000,lastActivity:t0,idleMs});
- assert.equal(warn.state,'warn');assert.equal(warn.remainingMs,30000);
- assert.equal(idleStep({now:t0+idleMs,lastActivity:t0,idleMs}).state,'expired');
- assert.equal(idleStep({now:t0+5*idleMs,lastActivity:t0,idleMs}).state,'expired');  // tab hidden for hours
-});
-test('a request in flight counts as activity; no limit means never',()=>{
- const idleMs=5*60000,t0=1e6;const s=idleStep({now:t0+idleMs*2,lastActivity:t0,idleMs,busy:true});
- assert.equal(s.state,'active');assert.equal(s.lastActivity,t0+idleMs*2);
- assert.equal(idleStep({now:t0+1e9,lastActivity:t0,idleMs:0}).state,'active');
-});

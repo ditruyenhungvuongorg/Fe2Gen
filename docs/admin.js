@@ -3,8 +3,7 @@
 (() => {
   const STATE = {stopped:'Nghỉ (không chiếm GPU)', loading:'Đang khởi động', ready:'Sẵn sàng (đang chiếm GPU)', paused:'Tạm dừng', failed:'Chưa chạy được'};
   const DETAIL = {target:'tài khoản', role:'vai', changes:'thay đổi', chars:'số ký tự', findings:'số cụm', seconds:'giây',
-                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên',
-                  group:'nhóm', kind:'loại', was_locked:'đang bị khóa', mfa:'có mã 2 lớp'};
+                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên'};
   const ACTIONS = {pause:'tạm dừng', resume:'cho chạy lại', release:'giải phóng ngay'};
   let tab = 'users', temp = null;
 
@@ -24,6 +23,13 @@
     status('');
     try { const data = await run(); if (done) status(done(data)); await show(tab, true); }
     catch (e) { status(e.message, true); }
+  }
+  // locked_until: epoch seconds or ms, or a date string; returns false, true (time unknown) or the local time.
+  function lockUntil(value) {
+    if (value == null || value === '' || value === false || value === 0) return false;
+    const ms = typeof value === 'number' ? (value < 1e12 ? value * 1000 : value) : Date.parse(value);
+    if (!Number.isFinite(ms)) return true;
+    return ms > Date.now() ? new Date(ms).toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'}) : false;
   }
   async function show(name, keepStatus = false) {
     tab = name;
@@ -63,25 +69,20 @@
       parts.push(el('h3', {class:'account-sub'}, data.users.length + ' tài khoản · ' + online.size + ' đang online'));
       for (const u of data.users) {
         const self = u.username === user?.username;
-        const state = u.disabled ? ['Đã khóa', 'locked'] : u.temp_expired ? ['Mật khẩu tạm hết hạn', 'locked']
-          : u.must_change ? ['Chờ đặt mật khẩu', 'pending'] : ['Hoạt động', 'active'];
+        const state = u.disabled ? ['Đã khóa', 'locked'] : u.must_change ? ['Chờ đặt mật khẩu', 'pending'] : ['Hoạt động', 'active'];
+        // Login lockout after wrong passwords: shown when the server reports it; without the field the button stays.
+        const lockedUntil = lockUntil(u.locked_until), lockKnown = 'locked_until' in u;
+        const totp = u.totp_enabled === true ? ' · 2FA bật' : u.totp_enabled === false ? ' · chưa bật 2FA' : '';
         const role = roleSelect(u.role, {'aria-label':'Vai trò của ' + u.username});
         role.onchange = () => {
           if (!confirm('Đổi vai trò của ' + u.username + ' thành ' + data.roles[role.value] + '?')) { role.value = u.role; return; }
           act(() => api('/api/admin/users/update', {username:u.username, role:role.value}, 20000), () => 'Đã đổi vai trò ' + u.username + '.');
         };
         parts.push(el('div', {class:'admin-row'},
-          el('div', {class:'admin-who'}, el('strong', {}, u.name), el('small', {}, u.username + (self ? ' · bạn' : '') + ' · tạo ' + (u.created || '—') + ' · đăng nhập gần nhất ' + (u.last_login || 'chưa'))),
-          el('span', {class:'state-pill ' + state[1]}, state[0], online.has(u.username) ? ' · online' : null,
-             u.login_locked ? ' · tạm khóa do nhập sai' : null, u.totp ? ' · 2FA' : null), role,
+          el('div', {class:'admin-who'}, el('strong', {}, u.name), el('small', {}, u.username + (self ? ' · bạn' : '') + totp + ' · tạo ' + (u.created || '—') + ' · đăng nhập gần nhất ' + (u.last_login || 'chưa')),
+            lockedUntil ? el('small', {class:'lock-note'}, 'Tạm khóa đăng nhập do nhập sai nhiều lần' + (lockedUntil === true ? '' : ' · đến ' + lockedUntil)) : null),
+          el('span', {class:'state-pill ' + state[1]}, state[0], online.has(u.username) ? ' · online' : null), role,
           el('div', {class:'admin-buttons'},
-            u.login_locked ? el('button', {type:'button', class:'quiet', onclick:() => {
-              act(() => api('/api/admin/users/unlock', {username:u.username}, 20000), () => 'Đã gỡ khóa đăng nhập của ' + u.username + '.');
-            }}, 'Gỡ khóa đăng nhập') : null,
-            u.totp && !self ? el('button', {type:'button', class:'quiet', onclick:() => {
-              if (!confirm('Đặt lại xác thực 2 lớp của ' + u.username + '? Dùng khi người này mất điện thoại. Họ bị đăng xuất và đăng nhập lại chỉ bằng mật khẩu' + (u.role === 'admin' ? ', rồi phải bật lại 2FA.' : '.'))) return;
-              act(() => api('/api/admin/users/totp_reset', {username:u.username}, 20000), () => 'Đã đặt lại 2FA của ' + u.username + '.');
-            }}, 'Đặt lại 2FA') : null,
             el('button', {type:'button', class:'quiet', onclick:() => {
               const name = prompt('Tên hiển thị mới của ' + u.username + ':', u.name);
               if (name == null || !name.trim() || name.trim() === u.name) return;
@@ -98,6 +99,16 @@
               if (!confirm('Đặt lại mật khẩu của ' + u.username + '? Người này bị đăng xuất và nhận mật khẩu tạm mới.')) return;
               act(async () => { temp = await api('/api/admin/users/reset', {username:u.username}, 20000); }, () => 'Đã đặt lại mật khẩu ' + u.username + '.');
             }}, 'Đặt lại mật khẩu'),
+            u.totp_enabled === false ? null : el('button', {type:'button', class:'quiet', onclick:() => {
+              if (!confirm('Đặt lại xác thực 2 lớp của ' + u.username + '? Ứng dụng trên điện thoại cũ và các mã dự phòng hết hiệu lực; ' +
+                (u.role === 'admin' ? 'tài khoản quản trị phải bật lại 2FA ngay khi đăng nhập.' : 'người này đăng nhập chỉ bằng mật khẩu cho đến khi tự bật lại.'))) return;
+              act(async () => {
+                await api('/api/admin/users/totp_reset', {username:u.username}, 20000);
+                if (self) { await refreshSession(); if (sessionInfo?.totp_required) { $('admin').close(); openAccount(); } }
+              }, () => 'Đã đặt lại 2FA của ' + u.username + '.');
+            }}, 'Đặt lại 2FA'),
+            u.disabled || (lockKnown && !lockedUntil) ? null : el('button', {type:'button', class:'quiet', title:'Xóa đếm đăng nhập sai để người này thử lại ngay', onclick:() =>
+              act(() => api('/api/admin/users/unlock', {username:u.username}, 20000), () => 'Đã mở khóa đăng nhập cho ' + u.username + '.')}, 'Mở khóa đăng nhập'),
             el('button', {type:'button', class:'quiet danger', disabled:self, onclick:() => {
               if (prompt('Xóa vĩnh viễn tài khoản này? Gõ "' + u.username + '" để xác nhận.') !== u.username) return;
               act(() => api('/api/admin/users/delete', {username:u.username}, 20000), () => 'Đã xóa ' + u.username + '.');
@@ -114,7 +125,7 @@
           if (!confirm('Buộc ' + s.username + ' đăng xuất trên mọi thiết bị' + (s.username === user?.username ? ' khác' : '') + '?')) return;
           act(() => api('/api/admin/sessions/end', {username:s.username}, 20000), r => 'Đã đăng xuất ' + r.ended + ' phiên của ' + s.username + '.');
         }}, 'Buộc đăng xuất')));
-      return el('div', {}, el('p', {class:'hint'}, data.sessions.length + ' phiên đang mở. Phiên tự hết sau ' + (data.idle_minutes || 60) + ' phút không thao tác hoặc ' + (data.session_hours || 12) + ' giờ kể từ khi đăng nhập; khởi động lại dịch vụ thì mọi người đăng nhập lại.'), rows);
+      return el('div', {}, el('p', {class:'hint'}, data.sessions.length + ' phiên đang mở. Phiên tự hết sau ' + FrontLogic.idleMinutesOf(sessionInfo?.idle_minutes) + ' phút không thao tác' + (sessionInfo?.session_hours ? ' hoặc ' + sessionInfo.session_hours + ' giờ kể từ khi đăng nhập' : '') + '; khởi động lại dịch vụ thì mọi người đăng nhập lại.'), rows);
     },
 
     async audit() {
@@ -127,7 +138,7 @@
       form.onsubmit = e => { e.preventDefault(); f.user = who.value.trim().toLowerCase(); f.event = what.value; show('audit'); };
       const describe = e => Object.entries(e).filter(([k]) => !['time','event','user'].includes(k)).map(([k, v]) =>
         (DETAIL[k] || k) + ': ' + (k === 'role' ? ROLE_NAMES[v] || v : k === 'action' ? ACTIONS[v] || v : typeof v === 'object' ? JSON.stringify(v) : v === true ? 'có' : v === false ? 'không' : v)).join(' · ');
-      const rows = data.entries.map(e => el('div', {class:'audit-row' + (/fail|locked|paused|limited|error|expired/.test(e.event) ? ' warn' : '')},
+      const rows = data.entries.map(e => el('div', {class:'audit-row' + (/fail|locked|paused|rate_limited|error|expired|totp_reset/.test(e.event) ? ' warn' : '')},
         el('span', {class:'audit-time'}, e.time), el('strong', {}, e.user || '—'), el('span', {}, data.events[e.event] || e.event), el('small', {}, describe(e))));
       return el('div', {}, form, el('p', {class:'hint'}, 'Nhật ký ghi ai làm gì và lúc nào; không ghi nội dung ca (đoạn văn, HPO, gene). ' + data.entries.length + ' dòng mới nhất.'),
         rows.length ? rows : el('p', {class:'hint'}, 'Chưa có dòng nào.'));
@@ -143,7 +154,7 @@
         row('Lần nạp gần nhất', g.model_load_seconds != null ? g.model_load_seconds + ' giây' : '—'),
         row('VRAM còn trống', g.free_mib != null ? g.free_mib.toLocaleString('vi-VN') + ' MiB' : 'không đọc được'),
         row('Bác sĩ thao tác trong 10 phút', String(g.doctors_active)),
-        row('Tự giải phóng sau', g.idle_minutes + ' phút không dùng'),
+        row('Tự giải phóng sau', (g.gpu_idle_minutes ?? g.idle_minutes) + ' phút không dùng'),
         row('Cờ tạm dừng (train, AI cục bộ)', g.paused ? 'ĐANG BẬT' : 'tắt'),
         el('div', {class:'account-actions'},
           el('button', {type:'button', class:'quiet', onclick:() => show('gpu')}, 'Làm mới'),
