@@ -9,12 +9,20 @@ from unittest.mock import Mock, patch
 from web_service import WebSystem
 from model1_v38_package.core import align
 
+# backend/data/ (licensed HPO files) is not in the repository, so CI has none: tests that need it are skipped.
+DATA = Path(__file__).resolve().parent / 'data'
+HAS_DATA = (DATA / 'hp.obo').is_file() and (DATA / 'phenotype.hpoa').is_file()
+needs_data = unittest.skipUnless(HAS_DATA, 'backend/data/ (hp.obo, phenotype.hpoa) is not available')
+
+
 class WebTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.system = WebSystem()
-        cls.system.initialize()
+        if HAS_DATA:
+            cls.system = WebSystem()
+            cls.system.initialize()
 
+    @needs_data
     def test_search_id_alias_and_vietnamese(self):
         s = self.system
         self.assertEqual(s.search_hpo('HP:0009729')[0]['id'], 'HP:0009729')
@@ -22,6 +30,7 @@ class WebTests(unittest.TestCase):
         self.assertTrue(s.search_hpo('dau nho'))
         self.assertEqual(len({t['id'] for t in s.search_hpo('tim')}), len(s.search_hpo('tim')))
 
+    @needs_data
     def test_input_validation(self):
         for payload in ({'hpos': []}, {'hpos': [{'id': 'HP:9999999', 'status': 'CÓ'}]},
                         {'hpos': [{'id': 'HP:0000252', 'status': 'KHÔNG'}]},
@@ -29,6 +38,7 @@ class WebTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.system.match(payload)
 
+    @needs_data
     def test_real_ranking_and_inheritance(self):
         result = self.system.match({'hpos': [{'id': 'HP:0009729', 'status': 'CÓ'}]})
         self.assertTrue(result['grouped'])
@@ -42,6 +52,7 @@ class WebTests(unittest.TestCase):
             self.assertTrue(all(p['relation'] not in ('no_match', 'ignored') for p in c['matched_phenotypes']))
             self.assertNotIn('HP:0009729', {p['id'] for p in c['clinical_features_to_check']})
 
+    @needs_data
     def test_groups_follow_test_sequence(self):
         # Trisomy 18 pattern from gold case 2: AVSD, corpus callosum agenesis,
         # omphalocele, IUGR.
@@ -60,6 +71,7 @@ class WebTests(unittest.TestCase):
         nst = [c['disease_id'] for c in result['candidates'] if c['group'] == 'NST']
         self.assertIn('ORPHA:3380', nst)
 
+    @needs_data
     def test_equivalent_ids_are_listed_once(self):
         # 4 HPO of the trisomy 18 pattern; the MONDO table merges OMIM/ORPHA pairs.
         hpos = [{'id': h, 'status': 'CÓ'} for h in ('HP:0001674', 'HP:0001274', 'HP:0001539', 'HP:0001511')]
@@ -72,6 +84,7 @@ class WebTests(unittest.TestCase):
         for c in merged:
             self.assertTrue(all(resolve(e) == resolve(c['disease_id']) for e in c['equivalent_ids']))
 
+    @needs_data
     def test_merge_matches_matcher_resolver(self):
         # Same result as HPOAgent2Matcher.rank with the resolver loaded, on the top-100.
         from hpo_agents.agent2_matcher import HPOAgent2Matcher
@@ -83,6 +96,7 @@ class WebTests(unittest.TestCase):
         expected = reference.rank(obs, top_k=100, ranking_strategy=RankingStrategy.IC_COVERAGE)
         self.assertEqual([c.disease_id for c in merged_here[:100]], [c.disease_id for c in expected])
 
+    @needs_data
     def test_reranker_keeps_columns_and_top_overall(self):
         hpos = [{'id': h, 'status': 'CÓ'} for h in ('HP:0001674', 'HP:0001274', 'HP:0001539', 'HP:0001511')]
         result = self.system.match({'hpos': hpos})
@@ -102,6 +116,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(tuple(model.spec['features']), FEATURES)
         self.assertIsInstance(model.score([0.5] * len(FEATURES)), float)
 
+    @needs_data
     def test_wes_genes_rank_listed_genes_by_phenotype(self):
         # Cardiac rhabdomyoma with a WES list holding TSC2 among unrelated genes.
         result = self.system.match({'hpos': [{'id': 'HP:0009729', 'status': 'CÓ'}],
@@ -118,6 +133,7 @@ class WebTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.system.match({'hpos': [{'id': 'HP:0009729', 'status': 'CÓ'}], 'genes': 'TSC2 <script>'})
 
+    @needs_data
     def test_no_genes_means_no_wes_block(self):
         result = self.system.match({'hpos': [{'id': 'HP:0009729', 'status': 'CÓ'}]})
         self.assertIsNone(result['wes'])
@@ -165,6 +181,7 @@ class WebTests(unittest.TestCase):
             self.assertEqual(table[disease][0], group, disease)
         self.assertTrue(table['ORPHA:567'][1])  # 22q11.2 deletion: mixed mechanism (TBX1)
 
+    @needs_data
     def test_extraction_requires_review_and_preserves_spans(self):
         s = self.system
         original = s.runner
@@ -187,6 +204,7 @@ class WebTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             align('tim bình thường', '{"phrases":["đầu nhỏ"]}')
 
+    @needs_data
     def test_v6_extraction_keeps_review_gate_and_ranked_candidates(self):
         from model1_v6.runner import Model1V6Runner
         s = self.system
@@ -214,6 +232,7 @@ class WebTests(unittest.TestCase):
         finally:
             s.runner = original
 
+    @needs_data
     def test_extraction_names_the_bundle_version(self):
         # The served bundle model1_v7_prod runs on the v6 runner; doctors saw "Model 1 v6" until 07/10/2026.
         from model1_v6.runner import Model1V6Runner
@@ -237,6 +256,7 @@ class WebTests(unittest.TestCase):
         finally:
             s.runner = original
 
+    @needs_data
     def test_doctor_reviewed_phrase_is_listed_first(self):
         # 07/10/2026: "thai to" (reviewed as HP:0001520 large for gestational age) is outside the v7 retriever's
         # top 10, and the reranker put HP:0001518 small for gestational age first.
