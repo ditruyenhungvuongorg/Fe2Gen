@@ -109,6 +109,25 @@ Validate a new adapter separately before changing `MODEL1_ADAPTER` in the privat
 Restart and smoke-test extraction and ranking; revert the path if validation fails.
 No training is started by this web application.
 
+## Vận hành an toàn
+Server-side operations, all run by hand on the Ubuntu host (nothing here runs automatically):
+- `backend/deploy_ubuntu.sh` writes the user unit with systemd sandboxing (`PRENATAL_HARDENING=full|basic|off`),
+  restarts the service, falls back to a weaker mode or the previous unit if `/api/status` does not answer, and
+  prints `systemd-analyze security --user prenatal-web`. It never rewrites an existing `web.env`.
+- `backend/ops/harden_host.sh` (sudo, `--dry-run` first): ufw open only on Tailscale, SSH keys only,
+  unattended security updates (kernel/NVIDIA kept manual), fail2ban for sshd.
+- `backend/ops/backup_deployment.sh`: daily encrypted backup (age or gpg) of accounts, logs and `web.env`; restore steps.
+- `backend/ops/rotate_token.md`: remove the shared `WEB_ACCESS_TOKEN` once accounts exist.
+- `backend/ops/separate_user.md` and `backend/ops/prenatal-web.system.service.example`: run the service as a
+  dedicated user without sudo, as a user or a system unit.
+- `backend/ops/ADR-funnel-vs-tailnet.md`: public Funnel with admin 2FA versus tailnet-only access.
+- `backend/ops/nckh_purge_history.md`: removing clinical files and secrets from the old `C:\NCKH` repository
+  (destructive; for the owner to run).
+
+## Bản cũ `web_prenatal_pubcasefinder` trong `C:\NCKH` là lưu trữ, không triển khai
+That older web has only a shared access code, no personal accounts, 2FA or audit log. Keep it as an archive;
+deploy only this repository.
+
 ## Checks
 `python test_access.py` checks Model 1 on demand (idle release, pause file, free-VRAM check, crash recovery) and
 doctor accounts, without GPU or HPO data. `python test_web.py` checks search, alias normalization, input validation, ranking metadata,
