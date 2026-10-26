@@ -80,23 +80,39 @@ function openAccount() {
   if (!$('account').open) $('account').showModal();
   $('old-password').focus();
 }
-function openSettings(message = '') {
-  const accounts = authMode === 'accounts';
-  $('api-url').value = base; $('login-fields').hidden = !accounts; $('token-fields').hidden = accounts;
-  $('settings-title').textContent = accounts ? 'Đăng nhập' : 'Kết nối máy chủ';
-  $('connect').textContent = accounts ? 'Đăng nhập' : 'Kết nối';
+// serverOnly: change the server address without signing in here (the sign-in page does that).
+function openSettings(message = '', serverOnly = false) {
+  const accounts = authMode === 'accounts', login = accounts && !serverOnly;
+  $('api-url').value = base; $('login-fields').hidden = !login; $('token-fields').hidden = accounts;
+  $('settings-title').textContent = login ? 'Đăng nhập' : 'Kết nối máy chủ';
+  $('connect').textContent = login ? 'Đăng nhập' : 'Kết nối';
   $('settings-hint').textContent = accounts
     ? 'Phiên đăng nhập chỉ giữ trong tab này; tải lại trang cần đăng nhập lại. Model trích văn bản khởi động khi bác sĩ đăng nhập và tự rời GPU khi không dùng.'
     : 'Mã truy cập chỉ giữ trong bộ nhớ của tab này. Địa chỉ máy chủ có thể được lưu, không lưu nội dung ca.';
   $('settings-error').textContent = message; $('settings-error').hidden = !message;
   if (!$('settings').open) $('settings').showModal();
-  if (accounts && !user) ($('username').value ? $('password') : $('username')).focus();
+  if (login && !user) ($('username').value ? $('password') : $('username')).focus();
+}
+// With accounts, the page shows only the sign-in card until someone is logged in.
+// state: 'checking' | 'login' | 'offline', or null to show the workspace.
+function showGate(state, message = '') {
+  $('login-screen').hidden = !state; document.querySelector('main').hidden = !!state;
+  document.querySelector('.top-actions').hidden = !!state;
+  if (!state) return;
+  $('login-inputs').hidden = $('login-submit').hidden = state !== 'login';
+  $('login-retry').hidden = state !== 'offline';
+  $('login-sub').textContent = state === 'checking' ? 'Đang kết nối máy chủ…'
+    : state === 'offline' ? 'Chưa kết nối được máy chủ. Kiểm tra mạng rồi bấm Thử kết nối lại.' : 'Dùng tài khoản do quản trị viên cấp.';
+  $('login-error').textContent = message; $('login-error').hidden = !message;
+  let host = location.host;
+  try { if (base) host = new URL(base).host; } catch {}
+  $('login-server-name').textContent = host;
+  if (state === 'login') ($('login-username').value ? $('login-password') : $('login-username')).focus();
 }
 function sessionEnded() {
   access = ''; user = null; showUser();
-  if ($('account').open) $('account').close();
-  if ($('admin').open) $('admin').close();
-  openSettings('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
+  for (const d of ['account', 'admin', 'settings', 'lab']) if ($(d).open) $(d).close();
+  showGate('login', 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
 }
 function updateActions() {
   $('reviewed').disabled = busy || !!selection.conflicts || !chosen.size;
@@ -355,12 +371,12 @@ $('logout').onclick=async()=>{
   if(hasCase()&&!confirm('Đăng xuất sẽ xóa nội dung ca đang mở trong tab này. Tiếp tục?'))return;
   try{await api('/api/logout',{},15000);}catch{}
   for(const d of ['account','admin'])if($(d).open)$(d).close();
-  resetCase();access='';user=null;showUser();checkConnection();
+  resetCase();access='';user=null;showUser();showGate('login');checkConnection();
 };
 $('account-open').onclick=()=>openAccount();
 $('account-close').onclick=()=>$('account').close();
 $('account').oncancel=e=>{if(user?.must_change)e.preventDefault();};  // Esc cannot skip a temporary password
-$('account-server').onclick=()=>{$('account').close();openSettings();};
+$('account-server').onclick=()=>{$('account').close();openSettings('',true);};
 $('account-admin').onclick=$('admin-open').onclick=()=>{$('account').close();openAdmin();};
 $('password-form').onsubmit=async e=>{
   e.preventDefault();
@@ -388,7 +404,7 @@ $('connect').onclick=async e=>{
     if(value!==base){access='';user=null;authMode='';showUser();}
     base=value;
     try{localStorage.setItem('prenatal-api',base);}catch{}
-    if(authMode==='accounts'){
+    if(!$('login-fields').hidden){
       const username=$('username').value.trim(),password=$('password').value;
       if(!username||!password)throw Error('Nhập tên đăng nhập và mật khẩu.');
       $('connect').disabled=true;
@@ -406,11 +422,29 @@ async function checkConnection(){
   try{const status=await api('/api/status',null,15000);if(seq!==connectionVersion)return;
     authMode=status.auth_mode||(status.auth_required?'token':'none');
     $('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';showModel(status);showUser();
-    if(authMode==='accounts'&&!access){notice('Đăng nhập để sử dụng. Model trích văn bản khởi động sau khi bác sĩ đăng nhập.');openSettings();}
-    else if(authMode==='token'&&!access)notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');
+    if(authMode==='accounts'&&!access){showGate('login');return;}
+    showGate(null);
+    if(authMode==='token'&&!access)notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');
     else if(!status.model_configured)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');
     else notice('');}
-  catch(e){if(seq!==connectionVersion)return;$('connection').textContent='○ Chưa kết nối Ubuntu';notice(e.message);}
+  catch(e){if(seq!==connectionVersion)return;$('connection').textContent='○ Chưa kết nối Ubuntu';
+    // The generic network error mentions the access code; the sign-in card says it more simply.
+    if(user)notice(e.message);else showGate('offline',/Chưa kết nối được máy chủ/.test(e.message)?'':e.message);}
 }
-renderSelected();checkConnection();
+$('login-form').onsubmit=async e=>{
+  e.preventDefault();
+  const username=$('login-username').value.trim(),password=$('login-password').value;
+  if(!username||!password)return showGate('login','Nhập tên đăng nhập và mật khẩu.');
+  $('login-submit').disabled=true;$('login-error').hidden=true;
+  try{
+    const data=await api('/api/login',{username,password},30000);
+    access=data.token;user=data.user;lastModel=data;
+    showUser();showGate(null);notice('');
+    if(user.must_change)openAccount();
+  }catch(err){showGate('login',err.message);}
+  finally{$('login-submit').disabled=false;$('login-password').value='';}
+};
+$('login-retry').onclick=()=>{showGate('checking');checkConnection();};
+$('login-server').onclick=()=>openSettings('',true);
+renderSelected();showGate('checking');checkConnection();
 
