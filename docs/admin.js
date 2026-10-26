@@ -3,7 +3,8 @@
 (() => {
   const STATE = {stopped:'Nghỉ (không chiếm GPU)', loading:'Đang khởi động', ready:'Sẵn sàng (đang chiếm GPU)', paused:'Tạm dừng', failed:'Chưa chạy được'};
   const DETAIL = {target:'tài khoản', role:'vai', changes:'thay đổi', chars:'số ký tự', findings:'số cụm', seconds:'giây',
-                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên'};
+                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên',
+                  group:'nhóm', kind:'loại', was_locked:'đang bị khóa'};
   const ACTIONS = {pause:'tạm dừng', resume:'cho chạy lại', release:'giải phóng ngay'};
   let tab = 'users', temp = null;
 
@@ -70,8 +71,12 @@
         };
         parts.push(el('div', {class:'admin-row'},
           el('div', {class:'admin-who'}, el('strong', {}, u.name), el('small', {}, u.username + (self ? ' · bạn' : '') + ' · tạo ' + (u.created || '—') + ' · đăng nhập gần nhất ' + (u.last_login || 'chưa'))),
-          el('span', {class:'state-pill ' + state[1]}, state[0], online.has(u.username) ? ' · online' : null), role,
+          el('span', {class:'state-pill ' + state[1]}, state[0], online.has(u.username) ? ' · online' : null,
+             u.login_locked ? ' · tạm khóa do nhập sai' : null), role,
           el('div', {class:'admin-buttons'},
+            u.login_locked ? el('button', {type:'button', class:'quiet', onclick:() => {
+              act(() => api('/api/admin/users/unlock', {username:u.username}, 20000), () => 'Đã gỡ khóa đăng nhập của ' + u.username + '.');
+            }}, 'Gỡ khóa đăng nhập') : null,
             el('button', {type:'button', class:'quiet', onclick:() => {
               const name = prompt('Tên hiển thị mới của ' + u.username + ':', u.name);
               if (name == null || !name.trim() || name.trim() === u.name) return;
@@ -117,7 +122,7 @@
       form.onsubmit = e => { e.preventDefault(); f.user = who.value.trim().toLowerCase(); f.event = what.value; show('audit'); };
       const describe = e => Object.entries(e).filter(([k]) => !['time','event','user'].includes(k)).map(([k, v]) =>
         (DETAIL[k] || k) + ': ' + (k === 'role' ? ROLE_NAMES[v] || v : k === 'action' ? ACTIONS[v] || v : typeof v === 'object' ? JSON.stringify(v) : v === true ? 'có' : v === false ? 'không' : v)).join(' · ');
-      const rows = data.entries.map(e => el('div', {class:'audit-row' + (/fail|locked|paused/.test(e.event) ? ' warn' : '')},
+      const rows = data.entries.map(e => el('div', {class:'audit-row' + (/fail|locked|paused|limited|error|expired/.test(e.event) ? ' warn' : '')},
         el('span', {class:'audit-time'}, e.time), el('strong', {}, e.user || '—'), el('span', {}, data.events[e.event] || e.event), el('small', {}, describe(e))));
       return el('div', {}, form, el('p', {class:'hint'}, 'Nhật ký ghi ai làm gì và lúc nào; không ghi nội dung ca (đoạn văn, HPO, gene). ' + data.entries.length + ' dòng mới nhất.'),
         rows.length ? rows : el('p', {class:'hint'}, 'Chưa có dòng nào.'));
