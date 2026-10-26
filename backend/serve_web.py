@@ -27,6 +27,8 @@ LOGOUT_GRACE_SECONDS = 600
 # Only the page's own files run; inline style attributes are used by the lab sheet.
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+PERMISSIONS_POLICY = 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'
+HSTS = os.getenv('WEB_HSTS', '1') != '0'
 # With a temporary password, only these work until the user sets a new one.
 FIRST_LOGIN_PATHS = ('/api/session', '/api/change_password', '/api/logout')
 
@@ -59,13 +61,22 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy', CSP)
         self.send_header('X-Frame-Options', 'DENY')
+        if HSTS:  # Tailscale Funnel terminates TLS but does not add HSTS; browsers ignore it on plain http
+            self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+        self.send_header('Permissions-Policy', PERMISSIONS_POLICY)
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        # CORP only applies to no-cors loads (<img>, <script> from another site). The GitHub Pages UI reads the
+        # API with CORS-mode fetch, which CORP does not block (Fetch standard), so it is safe on /api/* as well.
+        self.send_header('Cross-Origin-Resource-Policy', 'same-site')
         super().end_headers()
 
-    def send_json(self, data, code=200):
+    def send_json(self, data, code=200, headers=None):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 

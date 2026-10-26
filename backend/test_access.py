@@ -529,6 +529,59 @@ class SingleResponseTests(unittest.TestCase):
                     self.assertTrue(raw.startswith(b'HTTP/1.0 403'), raw[:80])
 
 
+class HeaderTests(unittest.TestCase):
+    """B9: hardening headers on API and static responses; CORS from the GitHub Pages origin still works."""
+
+    ORIGIN = 'https://ditruyenhungvuongorg.github.io'
+
+    def test_headers_and_cors(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'WEB_ALLOWED_ORIGINS': self.ORIGIN}):
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+            with LiveServer(AUTH=Auth(store), AUDIT=AuditLog(Path(d, 'audit.jsonl'))) as srv:
+                for path in ('/api/status', '/', '/app.js'):
+                    req = urllib.request.Request(srv.base + path, headers={'Origin': self.ORIGIN})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        h = r.headers
+                    self.assertEqual(h['Strict-Transport-Security'], 'max-age=31536000; includeSubDomains')
+                    self.assertIn('camera=()', h['Permissions-Policy'])
+                    self.assertIn('microphone=()', h['Permissions-Policy'])
+                    self.assertEqual(h['Cross-Origin-Opener-Policy'], 'same-origin')
+                    self.assertEqual(h['Cross-Origin-Resource-Policy'], 'same-site')
+                    self.assertEqual(h['Access-Control-Allow-Origin'], self.ORIGIN)
+                    self.assertEqual(h['X-Content-Type-Options'], 'nosniff')
+                    self.assertEqual(h['Referrer-Policy'], 'no-referrer')
+                    self.assertIn("frame-ancestors 'none'", h['Content-Security-Policy'])
+                req = urllib.request.Request(srv.base + '/api/login', method='OPTIONS', headers={
+                    'Origin': self.ORIGIN, 'Access-Control-Request-Method': 'POST',
+                    'Access-Control-Request-Headers': 'content-type,authorization'})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual((r.status, r.headers['Access-Control-Allow-Origin']), (204, self.ORIGIN))
+                evil = {'Origin': 'https://evil.example'}
+                with urllib.request.urlopen(urllib.request.Request(srv.base + '/api/status', headers=evil), timeout=30) as r:
+                    self.assertIsNone(r.headers['Access-Control-Allow-Origin'])  # a foreign page cannot read it
+                code, _ = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-1'}, headers=evil)
+                self.assertEqual(code, 403)
+
+    def test_hsts_can_be_turned_off_for_plain_http(self):
+        import serve_web
+        with patch.object(serve_web, 'HSTS', False), tempfile.TemporaryDirectory() as d:
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+            with LiveServer(AUTH=Auth(store), AUDIT=AuditLog(Path(d, 'audit.jsonl'))) as srv:
+                with urllib.request.urlopen(srv.base + '/api/status', timeout=30) as r:
+                    self.assertIsNone(r.headers['Strict-Transport-Security'])
+
+    def test_page_csp_allows_only_the_configured_api(self):
+        docs = Path(__file__).resolve().parent.parent / 'docs'
+        html = (docs / 'index.html').read_text(encoding='utf-8')
+        csp = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', html).group(1)
+        connect = next(d.split()[1:] for d in csp.split(';') if d.strip().startswith('connect-src'))
+        api = re.search(r"apiBase:\s*'([^']*)'", (docs / 'config.js').read_text(encoding='utf-8')).group(1)
+        self.assertEqual(sorted(connect), sorted(["'self'", api.rstrip('/')]))  # no https:, no localhost
+        self.assertIn("script-src 'self';", csp)
+
+
 class FailClosedTests(unittest.TestCase):
     """B3/B4: a missing, corrupt or empty users.json never opens the API (WEB_REQUIRE_ACCOUNTS=1)."""
 
