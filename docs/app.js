@@ -11,6 +11,9 @@ let searchTerms = [], extraction = null, connectionVersion = 0, timer;
 let authMode = '', user = null, modelState = '', modelPoll, lastWarmup = 0, lastModel = null;
 function notice(message = '') { $('notice').textContent = message; $('notice').hidden = !message; }
 function localStatus(id, message = '') { $(id).textContent = message; }
+// A 401 from these means a wrong password or code, not an ended session.
+const CREDENTIAL_PATHS = new Set(['/api/login', '/api/login/totp', '/api/totp/enable', '/api/totp/disable', '/api/change_password']);
+const apiError = (message, status = 0, data = {}) => Object.assign(Error(message), {status, data});
 async function api(path, payload, timeout = 120000, controller = new AbortController()) {
   if (!base && location.hostname.endsWith('github.io')) throw Error('Mở Kết nối để nhập địa chỉ máy chủ Ubuntu.');
   requests.add(controller);
@@ -21,13 +24,16 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
       headers: {...(payload ? {'Content-Type':'application/json'} : {}), ...(access ? {Authorization:'Bearer ' + access} : {})},
       ...(payload ? {body:JSON.stringify(payload)} : {}), signal:controller.signal, cache:'no-store'
     });
-    let data;
-    try { data = await response.json(); } catch { throw Error('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.'); }
+    let data = null;
+    try { data = await response.json(); } catch {}
+    // Too many requests: say how long to wait and keep the session (the server sends Retry-After).
+    if (response.status === 429) throw apiError(FrontLogic.tooFastMessage(response.headers.get('Retry-After'), data || {}, {preferServer:path.startsWith('/api/login')}), 429, data || {});
+    if (!data || typeof data !== 'object') throw apiError('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.', response.status);
     if (!response.ok) {
-      if (response.status === 401 && authMode === 'accounts' && access && path !== '/api/login') sessionEnded();
+      if (response.status === 401 && authMode === 'accounts' && access && !CREDENTIAL_PATHS.has(path)) sessionEnded();
       if (response.status === 403 && data.must_change && user) { user.must_change = true; openAccount(); }
       showModel(data);
-      throw Error(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.');
+      throw apiError(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.', response.status, data);
     }
     return data;
   } catch (e) {
@@ -45,11 +51,22 @@ function showModel(data) {
   el.hidden = data.model_configured === false || user?.role === 'lab';
   el.textContent = MODEL_TEXT[modelState] || ''; el.dataset.short = MODEL_SHORT[modelState] || '';
   el.className = 'model-state ' + modelState;
-  el.title = modelState === 'failed' ? data.model_error || '' : modelState === 'stopped' ? 'Model trích văn bản rời GPU sau ' + (data.idle_minutes || 60) + ' phút không dùng và tự khởi động lại khi bác sĩ đăng nhập hoặc mở Nhập đoạn văn.' : '';
+  el.title = modelState === 'failed' ? data.model_error || '' : modelState === 'stopped' ? 'Model trích văn bản rời GPU sau ' + (data.gpu_idle_minutes || 60) + ' phút không dùng và tự khởi động lại khi bác sĩ đăng nhập hoặc mở Nhập đoạn văn.' : '';
   clearTimeout(modelPoll);
   if (modelState === 'loading') modelPoll = setTimeout(pollModel, 3000);
 }
-async function pollModel() { try { showModel(await api('/api/status', null, 15000)); } catch {} }
+// Model state, 2FA state and the idle limit come from /api/session after sign-in; /api/status only says online.
+let sessionInfo = null;
+function applySession(data) {
+  if (!data || typeof data !== 'object') return;
+  sessionInfo = data;
+  if (user && data.user && data.user.username === user.username) user = {...user, ...data.user};
+  showModel(data);
+}
+async function refreshSession() {
+  try { const data = await api('/api/session', null, 15000); applySession(data); return data; } catch { return null; }
+}
+async function pollModel() { await refreshSession(); }
 // Text extraction is about to be used: ask the server to load Model 1 on the GPU in the background.
 async function warmup() {
   if (authMode !== 'none' && !access || user?.role === 'lab' || user?.must_change) return;
@@ -100,9 +117,11 @@ function showGate(state, message = '') {
   document.querySelector('.top-actions').hidden = !!state;
   if (!state) return;
   $('login-inputs').hidden = $('login-submit').hidden = state !== 'login';
-  $('login-retry').hidden = state !== 'offline';
+  $('login-retry').hidden = !['offline', 'locked'].includes(state);
   $('login-sub').textContent = state === 'checking' ? 'Đang kết nối máy chủ…'
-    : state === 'offline' ? 'Chưa kết nối được máy chủ. Kiểm tra mạng rồi bấm Thử kết nối lại.' : 'Dùng tài khoản do quản trị viên cấp.';
+    : state === 'offline' ? 'Chưa kết nối được máy chủ. Kiểm tra mạng rồi bấm Thử kết nối lại.'
+    : state === 'locked' ? 'Hệ thống tạm khóa: máy chủ không đọc được danh sách tài khoản. Liên hệ quản trị viên rồi bấm Thử kết nối lại.'
+    : 'Dùng tài khoản do quản trị viên cấp.';
   $('login-error').textContent = message; $('login-error').hidden = !message;
   let host = location.host;
   try { if (base) host = new URL(base).host; } catch {}
@@ -413,13 +432,18 @@ async function checkConnection(){
   const seq=connectionVersion;
   try{const status=await api('/api/status',null,15000);if(seq!==connectionVersion)return;
     authMode=status.auth_mode||(status.auth_required?'token':'none');
-    $('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';showModel(status);showUser();
+    // 'locked': the server could not read its accounts and refuses everything until an admin fixes it.
+    if(authMode==='locked'){$('connection').textContent='○ Máy chủ tạm khóa';if(!user)showGate('locked');else notice('Máy chủ tạm khóa: không đọc được danh sách tài khoản. Liên hệ quản trị viên.');return;}
+    $('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';showUser();
     if(authMode==='accounts'&&!access){showGate('login');return;}
     showGate(null);
-    if(authMode==='token'&&!access)notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');
-    else if(!status.model_configured)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');
-    else notice('');}
-  catch(e){if(seq!==connectionVersion)return;$('connection').textContent='○ Chưa kết nối Ubuntu';
+    if(authMode==='token'&&!access){notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');return;}
+    notice('');
+    const session=await refreshSession();
+    if(seq===connectionVersion&&session&&session.model_configured===false)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');}
+  catch(e){if(seq!==connectionVersion)return;
+    if(e.data?.auth_mode==='locked'||e.status===503&&/tạm khóa/i.test(e.message)){$('connection').textContent='○ Máy chủ tạm khóa';if(!user)showGate('locked');else notice(e.message);return;}
+    $('connection').textContent='○ Chưa kết nối Ubuntu';
     // The generic network error mentions the access code; the sign-in card says it more simply.
     if(user)notice(e.message);else showGate('offline',/Chưa kết nối được máy chủ/.test(e.message)?'':e.message);}
 }
@@ -431,7 +455,7 @@ $('login-form').onsubmit=async e=>{
   try{
     const data=await api('/api/login',{username,password},30000);
     access=data.token;user=data.user;lastModel=data;
-    showUser();showGate(null);notice('');
+    showUser();showGate(null);notice('');refreshSession();
     if(user.must_change)openAccount();
   }catch(err){showGate('login',err.message);}
   finally{$('login-submit').disabled=false;$('login-password').value='';}

@@ -133,7 +133,7 @@
         row('Lần nạp gần nhất', g.model_load_seconds != null ? g.model_load_seconds + ' giây' : '—'),
         row('VRAM còn trống', g.free_mib != null ? g.free_mib.toLocaleString('vi-VN') + ' MiB' : 'không đọc được'),
         row('Bác sĩ thao tác trong 10 phút', String(g.doctors_active)),
-        row('Tự giải phóng sau', g.idle_minutes + ' phút không dùng'),
+        row('Tự giải phóng sau', (g.gpu_idle_minutes ?? g.idle_minutes) + ' phút không dùng'),
         row('Cờ tạm dừng (train, AI cục bộ)', g.paused ? 'ĐANG BẬT' : 'tắt'),
         el('div', {class:'account-actions'},
           el('button', {type:'button', class:'quiet', onclick:() => show('gpu')}, 'Làm mới'),
