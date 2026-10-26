@@ -52,6 +52,8 @@ PERMISSIONS_POLICY = 'camera=(), microphone=(), geolocation=(), payment=(), usb=
 HSTS = os.getenv('WEB_HSTS', '1') != '0'
 # With a temporary password, only these work until the user sets a new one.
 FIRST_LOGIN_PATHS = ('/api/session', '/api/change_password', '/api/logout')
+# An admin without a verified second factor (WEB_ADMIN_2FA_REQUIRED=1) can only set one up.
+SECOND_FACTOR_PATHS = ('/api/session', '/api/totp/setup', '/api/totp/enable', '/api/change_password', '/api/logout')
 
 class Handler(SimpleHTTPRequestHandler):
     extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.woff2': 'font/woff2'}
@@ -171,9 +173,17 @@ class Handler(SimpleHTTPRequestHandler):
         if self.session and self.session['must_change'] and path not in FIRST_LOGIN_PATHS:
             self.send_json({'error': 'Đặt mật khẩu mới trước khi tiếp tục.', 'must_change': True}, 403)
             return False
+        if AUTH.needs_2fa(self.session) and path not in SECOND_FACTOR_PATHS:
+            self.send_json({'error': self.second_factor_message(), 'needs_2fa': True}, 403)
+            return False
         if self.role in GPU_ROLES:
             SYSTEM.runner.touch()  # a doctor is working: postpone releasing the GPU
         return True
+
+    def second_factor_message(self):
+        if self.session.get('totp'):  # enabled, but this session was opened before (e.g. promoted to admin)
+            return 'Đăng xuất rồi đăng nhập lại bằng mã xác thực 2 lớp để dùng chức năng quản trị.'
+        return 'Tài khoản quản trị cần bật xác thực 2 lớp trước khi tiếp tục (Tài khoản → Xác thực 2 lớp).'
 
     def source(self):
         """Where the connection comes from, for login limits (see TRUST_PROXY)."""
@@ -247,8 +257,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not self.authorized(path.path):
                 return
             if path.path == '/api/session':
-                user = ({'username': self.session['user'], 'name': self.session['name'], 'role': self.session['role'],
-                         'must_change': self.session['must_change']} if self.session else None)
+                user = AUTH.describe(self.session) if self.session else None
                 return self.send_json({'user': user, 'role': self.role, **self.model_status()})
             if path.path == '/api/hpo_search':
                 if self.limited('hpo_search'):
@@ -269,8 +278,8 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if self.locked():
             return
-        if path == '/api/login':
-            return self.login()
+        if path in ('/api/login', '/api/login/totp'):
+            return self.login(second=path.endswith('totp'))
         if not self.authorized(path):
             return
         if path == '/api/logout':
@@ -285,6 +294,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == '/api/change_password':
             return self.change_password(payload)
+        if path in ('/api/totp/setup', '/api/totp/enable'):
+            return self.totp(path, payload)
         if path.startswith('/api/admin/'):
             if self.admin_only() and not self.limited('admin'):
                 self.admin_post(path, payload)
@@ -328,7 +339,9 @@ class Handler(SimpleHTTPRequestHandler):
             WORK.release()
 
     # ------------------------------------------------------------------ login, logout, own password
-    def login(self):
+    def login(self, second=False):
+        """/api/login {username, password}; with 2FA it answers {second_factor, pending} and the page sends
+        /api/login/totp {pending, code} (a 6-digit code or a backup code) within 5 minutes."""
         if not self.allowed_origin():
             return self.send_json({'error': 'Nguồn truy cập chưa được cấu hình.'}, 403)
         if AUTH.mode != 'accounts':
@@ -336,22 +349,49 @@ class Handler(SimpleHTTPRequestHandler):
         payload = self.read_json()
         if payload is None:
             return
-        name = str(payload.get('username') or '').strip().lower()
+        if second:
+            pending = AUTH.pending.get(AUTH._key(str(payload.get('pending') or '')))
+            name = pending['user'] if pending else ''
+        else:
+            name = str(payload.get('username') or '').strip().lower()
         who = name if USERNAME.match(name) else '(tên không hợp lệ)'
         source_key, user_key = 'source:' + self.source(), 'user:' + name[:64]
         if self.limited('login', source_key, who) or self.limited('login_user', user_key, who):
             return
+        backup = False
         try:
-            token, user = AUTH.login(name, payload.get('password'))
+            if second:
+                token, user, backup = AUTH.login_totp(payload.get('pending'), payload.get('code'))
+            else:
+                token, user = AUTH.login(name, payload.get('password'))
         except LoginRefused as exc:
             AUDIT.write(exc.event, who)
-            return self.send_json({'error': str(exc)}, 429 if exc.event != 'login_fail' else 401)
+            return self.send_json({'error': str(exc)}, 401 if exc.event in ('login_fail', 'totp_fail', 'totp_expired') else 429)
         RATES['login'].give_back(source_key)  # only failed attempts use up the source's budget
         RATES['login_user'].give_back(user_key)
-        AUDIT.write('login_ok', user['username'], role=user['role'])
+        if token is None:  # password right; the code comes next
+            return self.send_json(user)
+        if backup:
+            AUDIT.write('totp_backup_used', user['username'])
+        AUDIT.write('login_ok', user['username'], role=user['role'], **({'mfa': True} if second else {}))
+        session = AUTH.session(token)
         if user['role'] == 'doctor' and not user['must_change']:
             SYSTEM.runner.start()  # a doctor is working now: load Model 1 while they enter the case
-        self.send_json({'token': token, 'user': user, **self.model_status()})
+        self.send_json({'token': token, 'user': AUTH.describe(session) if session else user, **self.model_status()})
+
+    def totp(self, path, payload):
+        """Turn on the second factor for the logged-in account: setup gives a secret, enable confirms it."""
+        if not self.session:
+            return self.send_json({'error': 'Chỉ tài khoản cá nhân mới bật được xác thực 2 lớp.'}, 400)
+        try:
+            if path.endswith('setup'):
+                secret, uri = AUTH.totp_setup(self.token())
+                return self.send_json({'secret': secret, 'uri': uri})
+            codes = AUTH.totp_enable(self.token(), payload.get('code'))
+        except ValueError as exc:
+            return self.send_json({'error': str(exc)}, 422)
+        AUDIT.write('totp_enabled', self.user)
+        self.send_json({'ok': True, 'backup_codes': codes, 'user': AUTH.describe(self.session)})
 
     def logout(self):
         AUTH.logout(self.token())
@@ -371,12 +411,11 @@ class Handler(SimpleHTTPRequestHandler):
         AUDIT.write('password_changed', self.user)
         if self.role == 'doctor':
             SYSTEM.runner.start()
-        self.send_json({'ok': True, 'user': {'username': self.session['user'], 'name': self.session['name'],
-                                             'role': self.session['role'], 'must_change': False}})
+        self.send_json({'ok': True, 'user': AUTH.describe(self.session)})
 
     # ------------------------------------------------------------------ admin page
     def admin_only(self):
-        if self.session and self.role == 'admin':
+        if self.session and self.role == 'admin' and not AUTH.needs_2fa(self.session):
             return True
         self.send_json({'error': 'Chỉ tài khoản quản trị dùng được chức năng này.'}, 403)
         return False
@@ -425,6 +464,10 @@ class Handler(SimpleHTTPRequestHandler):
             if path == '/api/admin/users/delete':
                 AUTH.delete_user(self.user, target)
                 AUDIT.write('user_deleted', self.user, target=target)
+                return self.send_json({'ok': True})
+            if path == '/api/admin/users/totp_reset':
+                AUTH.totp_reset(self.user, target)
+                AUDIT.write('totp_reset', self.user, target=target)
                 return self.send_json({'ok': True})
             if path == '/api/admin/users/unlock':
                 if target not in AUTH.store.all():

@@ -4,7 +4,7 @@
   const STATE = {stopped:'Nghỉ (không chiếm GPU)', loading:'Đang khởi động', ready:'Sẵn sàng (đang chiếm GPU)', paused:'Tạm dừng', failed:'Chưa chạy được'};
   const DETAIL = {target:'tài khoản', role:'vai', changes:'thay đổi', chars:'số ký tự', findings:'số cụm', seconds:'giây',
                   hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên',
-                  group:'nhóm', kind:'loại', was_locked:'đang bị khóa'};
+                  group:'nhóm', kind:'loại', was_locked:'đang bị khóa', mfa:'có mã 2 lớp'};
   const ACTIONS = {pause:'tạm dừng', resume:'cho chạy lại', release:'giải phóng ngay'};
   let tab = 'users', temp = null;
 
@@ -72,11 +72,15 @@
         parts.push(el('div', {class:'admin-row'},
           el('div', {class:'admin-who'}, el('strong', {}, u.name), el('small', {}, u.username + (self ? ' · bạn' : '') + ' · tạo ' + (u.created || '—') + ' · đăng nhập gần nhất ' + (u.last_login || 'chưa'))),
           el('span', {class:'state-pill ' + state[1]}, state[0], online.has(u.username) ? ' · online' : null,
-             u.login_locked ? ' · tạm khóa do nhập sai' : null), role,
+             u.login_locked ? ' · tạm khóa do nhập sai' : null, u.totp ? ' · 2FA' : null), role,
           el('div', {class:'admin-buttons'},
             u.login_locked ? el('button', {type:'button', class:'quiet', onclick:() => {
               act(() => api('/api/admin/users/unlock', {username:u.username}, 20000), () => 'Đã gỡ khóa đăng nhập của ' + u.username + '.');
             }}, 'Gỡ khóa đăng nhập') : null,
+            u.totp && !self ? el('button', {type:'button', class:'quiet', onclick:() => {
+              if (!confirm('Đặt lại xác thực 2 lớp của ' + u.username + '? Dùng khi người này mất điện thoại. Họ bị đăng xuất và đăng nhập lại chỉ bằng mật khẩu' + (u.role === 'admin' ? ', rồi phải bật lại 2FA.' : '.'))) return;
+              act(() => api('/api/admin/users/totp_reset', {username:u.username}, 20000), () => 'Đã đặt lại 2FA của ' + u.username + '.');
+            }}, 'Đặt lại 2FA') : null,
             el('button', {type:'button', class:'quiet', onclick:() => {
               const name = prompt('Tên hiển thị mới của ' + u.username + ':', u.name);
               if (name == null || !name.trim() || name.trim() === u.name) return;

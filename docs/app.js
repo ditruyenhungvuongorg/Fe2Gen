@@ -7,7 +7,10 @@ const selection = new CaseSelection(), chosen = selection.items, labIds = new Se
 let access = '', result = null, revision = 0, searchVersion = 0, extractVersion = 0, busy = false;
 let searchTerms = [], extraction = null, connectionVersion = 0, timer;
 // authMode from /api/status: 'accounts' (doctor login), 'token' (shared access code) or 'none'.
-// user: {username, name, role ('admin' | 'doctor' | 'lab'), must_change}; lab accounts do not use text extraction.
+// user: {username, name, role ('admin' | 'doctor' | 'lab'), must_change, totp, needs_2fa}; lab accounts do not use
+// text extraction. needs_2fa: an admin who must turn on two-factor sign-in before anything else.
+// pendingLogin: the password was right and the account has 2FA; the code is asked next.
+let pendingLogin = '';
 let authMode = '', user = null, modelState = '', modelPoll, lastWarmup = 0, lastModel = null;
 function notice(message = '') { $('notice').textContent = message; $('notice').hidden = !message; }
 function localStatus(id, message = '') { $(id).textContent = message; }
@@ -26,6 +29,7 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
     if (!response.ok) {
       if (response.status === 401 && authMode === 'accounts' && access && path !== '/api/login') sessionEnded();
       if (response.status === 403 && data.must_change && user) { user.must_change = true; openAccount(); }
+      if (response.status === 403 && data.needs_2fa && user) { user.needs_2fa = true; openAccount(); }
       showModel(data);
       throw Error(data.error || 'Không xử lý được yêu cầu. Vui lòng thử lại.');
     }
@@ -72,14 +76,30 @@ function showUser() {
   showModel(lastModel);
 }
 function openAccount() {
-  const forced = !!user?.must_change;
-  $('account-title').textContent = forced ? 'Đặt mật khẩu mới' : 'Tài khoản';
+  const password = !!user?.must_change, second = !password && !!user?.needs_2fa, forced = password || second;
+  $('account-title').textContent = password ? 'Đặt mật khẩu mới' : second ? 'Bật xác thực 2 lớp' : 'Tài khoản';
   $('account-who').textContent = user ? user.name + ' · ' + user.username + ' · ' + (ROLE_NAMES[user.role] || '') : '';
+  $('account-forced').textContent = password ? 'Bạn đang dùng mật khẩu tạm do quản trị viên cấp. Đặt mật khẩu mới của riêng bạn để tiếp tục.'
+    : 'Tài khoản quản trị phải bật xác thực 2 lớp trước khi dùng web. Làm theo phần Xác thực 2 lớp bên dưới.';
   $('account-forced').hidden = !forced; $('account-close').hidden = forced;
   $('account-admin').hidden = forced || user?.role !== 'admin'; $('account-server').hidden = forced;
   $('account-error').hidden = true; $('account-ok').hidden = true;
+  showTotp();
   if (!$('account').open) $('account').showModal();
-  $('old-password').focus();
+  (second ? $('totp-start') : $('old-password')).focus();
+}
+// Two-factor section of the account dialog; setup state lives only while the dialog shows it.
+function showTotp(setup = null, codes = null) {
+  const on = !!user?.totp;
+  $('totp-state').textContent = on ? 'Đang bật: mỗi lần đăng nhập cần thêm mã 6 số trong ứng dụng trên điện thoại.'
+    : user?.role === 'admin' ? 'Chưa bật. Bắt buộc với tài khoản quản trị.' : 'Chưa bật. Không bắt buộc; nên bật nếu bạn đăng nhập từ máy dùng chung.';
+  $('totp-start').hidden = on || !!setup || !user;
+  $('totp-setup').hidden = !setup;
+  $('totp-secret').textContent = setup ? setup.secret.replace(/(.{4})/g, '$1 ').trim() : '';
+  $('totp-uri').textContent = setup ? setup.uri : '';
+  $('totp-code').value = '';
+  $('totp-backup').hidden = !codes;
+  $('totp-backup-codes').textContent = codes ? codes.join('  ') : '';
 }
 // Server address (and the shared access code when the server has no accounts); signing in is on the sign-in page.
 function openSettings(message = '') {
@@ -99,15 +119,20 @@ function showGate(state, message = '') {
   $('login-screen').hidden = !state; document.querySelector('main').hidden = !!state;
   document.querySelector('.top-actions').hidden = !!state;
   if (!state) return;
-  $('login-inputs').hidden = $('login-submit').hidden = state !== 'login';
+  $('login-inputs').hidden = state !== 'login'; $('login-code-box').hidden = state !== 'code';
+  $('login-submit').hidden = state !== 'login' && state !== 'code';
+  $('login-submit').textContent = state === 'code' ? 'Xác nhận mã' : 'Đăng nhập';
+  if (state !== 'code') pendingLogin = '';
   $('login-retry').hidden = state !== 'offline';
   $('login-sub').textContent = state === 'checking' ? 'Đang kết nối máy chủ…'
-    : state === 'offline' ? 'Chưa kết nối được máy chủ. Kiểm tra mạng rồi bấm Thử kết nối lại.' : 'Dùng tài khoản do quản trị viên cấp.';
+    : state === 'offline' ? 'Chưa kết nối được máy chủ. Kiểm tra mạng rồi bấm Thử kết nối lại.'
+    : state === 'code' ? 'Mật khẩu đúng. Nhập mã xác thực 2 lớp để vào (mã đổi sau mỗi 30 giây).' : 'Dùng tài khoản do quản trị viên cấp.';
   $('login-error').textContent = message; $('login-error').hidden = !message;
   let host = location.host;
   try { if (base) host = new URL(base).host; } catch {}
   $('login-server-name').textContent = host;
   if (state === 'login') ($('login-username').value ? $('login-password') : $('login-username')).focus();
+  if (state === 'code') $('login-code').focus();
 }
 function sessionEnded() {
   access = ''; user = null; showUser();
@@ -375,7 +400,24 @@ $('logout').onclick=async()=>{
 };
 $('account-open').onclick=()=>openAccount();
 $('account-close').onclick=()=>$('account').close();
-$('account').oncancel=e=>{if(user?.must_change)e.preventDefault();};  // Esc cannot skip a temporary password
+$('account').oncancel=e=>{if(user?.must_change||user?.needs_2fa)e.preventDefault();};  // Esc cannot skip a temporary password or required 2FA
+$('totp-start').onclick=async()=>{
+  $('account-error').hidden=true;
+  try{showTotp(await api('/api/totp/setup',{},20000));$('totp-code').focus();}
+  catch(err){$('account-error').textContent=err.message;$('account-error').hidden=false;}
+};
+$('totp-code').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('totp-confirm').click();}};
+$('totp-confirm').onclick=async()=>{
+  $('account-error').hidden=true;
+  try{
+    const data=await api('/api/totp/enable',{code:$('totp-code').value.trim()},20000);
+    const wasForced=user.needs_2fa;user=data.user;showUser();showTotp(null,data.backup_codes);
+    $('account-forced').hidden=true;$('account-close').hidden=false;$('account-server').hidden=false;
+    $('account-admin').hidden=user.role!=='admin';$('account-title').textContent='Tài khoản';
+    $('account-ok').textContent='Đã bật xác thực 2 lớp. Các thiết bị khác đang đăng nhập bằng tài khoản này cần đăng nhập lại.'+(wasForced?' Bạn có thể dùng web bình thường.':'');
+    $('account-ok').hidden=false;
+  }catch(err){$('account-error').textContent=err.message;$('account-error').hidden=false;}
+};
 $('account-server').onclick=()=>{$('account').close();openSettings();};
 $('account-admin').onclick=()=>{$('account').close();openAdmin();};
 $('password-form').onsubmit=async e=>{
@@ -390,7 +432,8 @@ $('password-form').onsubmit=async e=>{
     const data=await api('/api/change_password',{old_password,new_password},30000);
     const forced=user.must_change;user=data.user;showUser();
     for(const id of ['old-password','new-password','new-password2'])$(id).value='';
-    if(forced){$('account').close();notice('Đã đặt mật khẩu mới. Chào '+user.name+'.');pollModel();}
+    if(forced&&user.needs_2fa){openAccount();}
+    else if(forced){$('account').close();notice('Đã đặt mật khẩu mới. Chào '+user.name+'.');pollModel();}
     else show('account-ok','Đã đổi mật khẩu. Các thiết bị khác đã đăng nhập bằng tài khoản này cần đăng nhập lại.');
   }catch(err){show('account-error',err.message);}
   finally{$('change-password').disabled=false;}
@@ -425,16 +468,22 @@ async function checkConnection(){
 }
 $('login-form').onsubmit=async e=>{
   e.preventDefault();
-  const username=$('login-username').value.trim(),password=$('login-password').value;
-  if(!username||!password)return showGate('login','Nhập tên đăng nhập và mật khẩu.');
+  const username=$('login-username').value.trim(),password=$('login-password').value,code=$('login-code').value.trim();
+  if(pendingLogin&&!code)return showGate('code','Nhập mã 6 số đang hiện trong ứng dụng xác thực.');
+  if(!pendingLogin&&(!username||!password))return showGate('login','Nhập tên đăng nhập và mật khẩu.');
   $('login-submit').disabled=true;$('login-error').hidden=true;
   try{
-    const data=await api('/api/login',{username,password},30000);
-    access=data.token;user=data.user;lastModel=data;
+    const data=pendingLogin?await api('/api/login/totp',{pending:pendingLogin,code},30000):await api('/api/login',{username,password},30000);
+    if(data.second_factor){pendingLogin=data.pending;showGate('code');return;}
+    pendingLogin='';access=data.token;user=data.user;lastModel=data;
     showUser();showGate(null);notice('');
-    if(user.must_change)openAccount();
-  }catch(err){showGate('login',err.message);}
-  finally{$('login-submit').disabled=false;$('login-password').value='';}
+    if(user.must_change||user.needs_2fa)openAccount();
+  }catch(err){
+    // A wrong code keeps the code step; after 5 wrong codes or 5 minutes the server asks for the password again.
+    if(pendingLogin&&!/đăng nhập lại/.test(err.message))showGate('code',err.message);
+    else{pendingLogin='';showGate('login',err.message);}
+  }
+  finally{$('login-submit').disabled=false;$('login-password').value='';$('login-code').value='';}
 };
 $('login-retry').onclick=()=>{showGate('checking');checkConnection();};
 $('login-server').onclick=()=>openSettings();

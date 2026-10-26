@@ -19,6 +19,8 @@ EVENTS = {
     'user_deleted': 'Xóa tài khoản', 'sessions_ended': 'Buộc đăng xuất', 'gpu': 'Điều khiển GPU',
     'extract': 'Tách đoạn văn', 'match': 'Đối chiếu bệnh', 'auth_store_error': 'Lỗi đọc danh sách tài khoản',
     'rate_limited': 'Vượt giới hạn tốc độ', 'login_unlocked': 'Gỡ khóa đăng nhập',
+    'totp_enabled': 'Bật xác thực 2 lớp', 'totp_fail': 'Nhập sai mã 2 lớp', 'totp_expired': 'Hết hạn bước mã 2 lớp',
+    'totp_backup_used': 'Dùng mã dự phòng 2 lớp', 'totp_reset': 'Đặt lại xác thực 2 lớp',
 }
 
 

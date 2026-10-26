@@ -400,7 +400,7 @@ class AdminHttpTests(unittest.TestCase):
         system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={'HP:1': {}}, runner=cls.runner,
                                        search_hpo=lambda q: [], extract=lambda text: {'mentions': [1, 2], 'seconds': 0.1},
                                        match=lambda p: {'ok': True})
-        cls.patches = [patch.object(serve_web, 'SYSTEM', system), patch.object(serve_web, 'AUTH', Auth(cls.store)),
+        cls.patches = [patch.object(serve_web, 'SYSTEM', system), patch.object(serve_web, 'AUTH', Auth(cls.store, admin_2fa=False)),
                        patch.object(serve_web, 'AUDIT', cls.audit), patch.object(serve_web, 'free_vram_mib', lambda: 20000)]
         for p in cls.patches:
             p.start()
@@ -668,7 +668,7 @@ class LimitTests(unittest.TestCase):
         return data['token']
 
     def test_search_budget_per_session(self):
-        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(hpo_search=3)) as srv:
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit, RATES=fresh_rates(hpo_search=3)) as srv:
             token = self.login(srv, 'bs.an')
             other = self.login(srv, 'quan.tri')
             self.assertEqual([srv.call('/api/hpo_search?q=a', token=token)[0] for _ in range(3)], [200] * 3)
@@ -772,7 +772,7 @@ class LimitTests(unittest.TestCase):
                 server.server_close()
 
     def test_admin_unlocks_a_locked_login(self):
-        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
             admin = self.login(srv, 'quan.tri')
             for _ in range(5):
                 srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})
@@ -794,6 +794,179 @@ class LimitTests(unittest.TestCase):
         self.assertEqual(r.take('k', now=0), 1)
         self.assertEqual(r.take('k', now=1.01), 0)  # one per second comes back
         self.assertEqual(RateLimiter(0).take('k'), 0)  # 0 = off
+
+
+class TotpTests(unittest.TestCase):
+    """B5: TOTP (RFC 6238) for admins (required) and doctors (optional); backup codes; reset."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin', 'quan.tri2': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_rfc6238_vectors_and_window(self):
+        import base64
+        import totp
+        secret = base64.b32encode(b'12345678901234567890').decode()  # RFC 6238 appendix B, SHA-1
+        for t, expected in ((59, '94287082'), (1111111109, '07081804'), (1234567890, '89005924')):
+            self.assertEqual(totp.code(secret, t, digits=8), expected)
+        self.assertEqual(totp.code(secret, 59), '287082')
+        now = 1_700_000_000
+        self.assertIsNotNone(totp.verify(secret, totp.code(secret, now), t=now))
+        self.assertIsNotNone(totp.verify(secret, totp.code(secret, now - 30), t=now))   # one step late: accepted
+        self.assertIsNotNone(totp.verify(secret, totp.code(secret, now + 30), t=now))   # one step early: accepted
+        self.assertIsNone(totp.verify(secret, totp.code(secret, now - 60), t=now))      # two steps: refused
+        self.assertIsNone(totp.verify(secret, totp.code(secret, now + 60), t=now))
+        step = totp.verify(secret, totp.code(secret, now), t=now)
+        self.assertIsNone(totp.verify(secret, totp.code(secret, now), t=now, after=step))  # no replay
+        self.assertIsNone(totp.verify(secret, 'abcdef', t=now))
+        self.assertEqual(len(totp.generate_secret()), 32)
+        self.assertTrue(totp.uri('bs.an', 'ABC').startswith('otpauth://totp/Fe2Gen%3Abs.an?secret=ABC&issuer=Fe2Gen'))
+        codes = totp.backup_codes()
+        self.assertEqual((len(codes), len(set(codes))), (8, 8))
+        self.assertRegex(codes[0], r'^[a-z2-9]{4}-[a-z2-9]{4}$')
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data
+
+    def enable(self, srv, token):
+        import totp
+        code, setup = srv.call('/api/totp/setup', {}, token)
+        self.assertEqual(code, 200, setup)
+        self.assertTrue(setup['uri'].startswith('otpauth://totp/'))
+        self.assertEqual(srv.call('/api/totp/enable', {'code': '000000'}, token)[0], 422)
+        code, done = srv.call('/api/totp/enable', {'code': totp.code(setup['secret'])}, token)
+        self.assertEqual(code, 200, done)
+        self.assertEqual(len(done['backup_codes']), 8)
+        return setup['secret'], done['backup_codes']
+
+    def test_admin_must_enable_before_admin_pages(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertTrue(admin['user']['needs_2fa'])
+            token = admin['token']
+            code, data = srv.call('/api/admin/users', token=token)
+            self.assertEqual((code, data.get('needs_2fa')), (403, True))
+            self.assertEqual(srv.call('/api/admin/users/create', {'username': 'x.y', 'role': 'lab'}, token)[0], 403)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=token)[0], 403)
+            self.assertEqual(srv.call('/api/session', token=token)[0], 200)
+            secret, backup = self.enable(srv, token)
+            code, users = srv.call('/api/admin/users', token=token)  # the same session is now verified
+            self.assertEqual(code, 200)
+            self.assertNotIn(secret, json.dumps(users))                   # the secret never leaves again
+            self.assertNotIn('backup', json.dumps(users))
+            self.assertTrue(next(u for u in users['users'] if u['username'] == 'quan.tri')['totp'])
+            # next login: password, then code
+            code, first = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})
+            self.assertEqual((code, first['second_factor']), (200, True))
+            self.assertNotIn('token', first)
+            self.assertEqual(srv.call('/api/admin/users', token=first['pending'])[0], 401)  # pending is no session
+            code, bad = srv.call('/api/login/totp', {'pending': first['pending'], 'code': '000000'})
+            self.assertEqual(code, 401)
+            # the code used to enable cannot be replayed; wait for the next step is too slow, use a backup code
+            code, ok = srv.call('/api/login/totp', {'pending': first['pending'], 'code': backup[0]})
+            self.assertEqual(code, 200, ok)
+            self.assertFalse(ok['user']['needs_2fa'])
+            self.assertEqual(srv.call('/api/admin/users', token=ok['token'])[0], 200)
+            # a backup code works once
+            first = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})[1]
+            self.assertEqual(srv.call('/api/login/totp', {'pending': first['pending'], 'code': backup[0]})[0], 401)
+            self.assertEqual(srv.call('/api/login/totp', {'pending': first['pending'], 'code': backup[1]})[0], 200)
+        stored = self.store.all()['quan.tri']['totp']
+        self.assertEqual(len(stored['backup']), 6)
+        self.assertNotIn(backup[2], json.dumps(stored))  # only hashes are kept
+        events = [e['event'] for e in self.audit.tail()]
+        for event in ('totp_enabled', 'totp_fail', 'totp_backup_used', 'login_ok'):
+            self.assertIn(event, events)
+
+    def test_five_wrong_codes_end_the_pending_login(self):
+        import totp
+        auth = Auth(self.store)
+        users = self.store.all()
+        users['bs.an']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        with LiveServer(AUTH=auth, AUDIT=self.audit) as srv:
+            first = self.login(srv, 'bs.an')
+            for _ in range(4):
+                self.assertEqual(srv.call('/api/login/totp', {'pending': first['pending'], 'code': '000000'})[0], 401)
+            code, data = srv.call('/api/login/totp', {'pending': first['pending'], 'code': '000000'})
+            self.assertIn('đăng nhập lại', data['error'])
+            secret = self.store.all()['bs.an']['totp']['secret']
+            code, data = srv.call('/api/login/totp', {'pending': first['pending'], 'code': totp.code(secret)})
+            self.assertEqual(code, 401)  # the pending login is gone, even with the right code
+            # wrong codes count toward the username lock like wrong passwords
+            self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})[0], 429)
+        self.assertEqual(sum(e['event'] == 'totp_fail' for e in self.audit.tail()), 5)
+
+    def test_pending_login_expires(self):
+        import totp
+        users = self.store.all()
+        users['bs.an']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        auth = Auth(self.store)
+        _, first = auth.login('bs.an', 'mat-khau-bs.an')
+        auth.pending[auth._key(first['pending'])]['created'] -= 301
+        with self.assertRaisesRegex(PermissionError, 'hết hạn'):
+            auth.login_totp(first['pending'], totp.code(users['bs.an']['totp']['secret']))
+
+    def test_doctor_without_2fa_logs_in_as_before_and_may_enable(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            doctor = self.login(srv, 'bs.an')
+            self.assertIn('token', doctor)
+            self.assertFalse(doctor['user']['needs_2fa'])
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=doctor['token'])[0], 200)
+            secret, _ = self.enable(srv, doctor['token'])
+            self.assertEqual(srv.call('/api/totp/setup', {}, doctor['token'])[0], 422)  # already on
+            first = self.login(srv, 'bs.an')
+            self.assertTrue(first['second_factor'])
+            later = time.time() + 30  # the next step: the code used to enable it was spent
+            code, ok = srv.call('/api/login/totp', {'pending': first['pending'], 'code': totp.code(secret, later)})
+            self.assertEqual(code, 200, ok)
+
+    def test_admin_resets_another_users_2fa(self):
+        import totp
+        users = self.store.all()
+        for name in ('quan.tri', 'bs.an'):
+            users[name]['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        auth = Auth(self.store)
+        with LiveServer(AUTH=auth, AUDIT=self.audit) as srv:
+            first = self.login(srv, 'quan.tri')
+            admin = srv.call('/api/login/totp', {'pending': first['pending'],
+                                                 'code': totp.code(users['quan.tri']['totp']['secret'])})[1]['token']
+            self.assertEqual(srv.call('/api/admin/users/totp_reset', {'username': 'quan.tri'}, admin)[0], 422)  # not self
+            self.assertEqual(srv.call('/api/admin/users/totp_reset', {'username': 'bs.an'}, admin)[0], 200)
+            self.assertNotIn('totp', self.store.all()['bs.an'])
+            self.assertIn('token', self.login(srv, 'bs.an'))  # back to password only
+            self.assertEqual(srv.call('/api/admin/users/totp_reset', {'username': 'bs.an'}, admin)[0], 422)
+        self.assertIn(('totp_reset', 'bs.an'), [(e['event'], e.get('target')) for e in self.audit.tail()])
+
+    def test_policy_off_for_local_use(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertEqual(srv.call('/api/admin/users', token=admin['token'])[0], 200)
+        with patch.dict(os.environ, {'WEB_ADMIN_2FA_REQUIRED': '0'}):
+            self.assertFalse(Auth(self.store).admin_2fa)
+        with patch.dict(os.environ, {}):
+            os.environ.pop('WEB_ADMIN_2FA_REQUIRED', None)
+            self.assertTrue(Auth(self.store).admin_2fa)
+
+    def test_manage_users_totp_reset(self):
+        import manage_users
+        import totp
+        users = self.store.all()
+        users['quan.tri']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        with patch('sys.stdout', StringIO()):
+            manage_users.main(['totp-reset', 'quan.tri', '--file', str(self.store.path)])
+        self.assertNotIn('totp', self.store.all()['quan.tri'])
 
 
 class FailClosedTests(unittest.TestCase):

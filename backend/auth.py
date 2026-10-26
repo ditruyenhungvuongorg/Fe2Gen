@@ -20,6 +20,8 @@ import threading
 import time
 from pathlib import Path
 
+import totp
+
 DEFAULT_USERS_FILE = Path.home() / 'prenatal_pubcasefinder/.deployment/users.json'
 USERNAME = re.compile(r'^[a-z0-9._-]{3,32}$')
 ROLES = {'admin': 'Quản trị', 'doctor': 'Bác sĩ', 'lab': 'Phòng Lab'}
@@ -93,10 +95,15 @@ def temporary_password():
     return '-'.join(raw[i:i + 5] for i in range(0, 15, 5))
 
 
+def has_totp(user):
+    return bool(isinstance(user.get('totp'), dict) and user['totp'].get('enabled') and user['totp'].get('secret'))
+
+
 def public_user(username, user):
+    """What may leave the server about an account: never the password hash or the TOTP secret."""
     return {'username': username, 'name': user.get('name') or username, 'role': user.get('role', 'doctor'),
             'disabled': bool(user.get('disabled')), 'must_change': bool(user.get('must_change')),
-            'created': user.get('created', ''), 'last_login': user.get('last_login', '')}
+            'created': user.get('created', ''), 'last_login': user.get('last_login', ''), 'totp': has_totp(user)}
 
 
 class StoreError(ValueError):
@@ -204,11 +211,16 @@ class Auth:
     gives mode 'locked': the service refuses every API request instead of opening up. Only with
     WEB_REQUIRE_ACCOUNTS=0 (local use) does it fall back to the shared WEB_ACCESS_TOKEN, then to no login."""
 
-    def __init__(self, store=None, token=None, session_hours=12, idle_hours=4, require_accounts=None):
+    PENDING_SECONDS, TOTP_TRIES = 300, 5  # second step of a login: 5 minutes, 5 codes
+
+    def __init__(self, store=None, token=None, session_hours=12, idle_hours=4, require_accounts=None, admin_2fa=None):
         self.store = store or UserStore()
         self.token = os.getenv('WEB_ACCESS_TOKEN', '') if token is None else token
         self.require_accounts = (env_flag('WEB_REQUIRE_ACCOUNTS', '1') if require_accounts is None
                                  else bool(require_accounts))
+        # WEB_ADMIN_2FA_REQUIRED (default on): an admin session without a verified second factor can only set one up.
+        self.admin_2fa = env_flag('WEB_ADMIN_2FA_REQUIRED', '1') if admin_2fa is None else bool(admin_2fa)
+        self.pending = {}    # sha256(pending token) -> {"user", "created", "tries"}: password right, code not yet
         self.session_seconds, self.idle_seconds = session_hours * 3600, idle_hours * 3600
         self.lock = threading.Lock()
         self.sessions = {}   # sha256(token) -> {"user", "name", "role", "must_change", "created", "seen"}
@@ -229,35 +241,100 @@ class Auth:
         return hashlib.sha256(token.encode()).hexdigest()
 
     # ------------------------------------------------------------------ login
-    def login(self, username, password):
-        """Returns (session_token, user_info); raises LoginRefused with a message for the user."""
-        username = str(username or '').strip().lower()[:64]
-        password = str(password or '')[:200]
-        now = time.time()
+    def _failed(self, username, now):
+        """Count a wrong password or code toward username's lock; call with self.lock held."""
+        count, _, last = self.failures.get(username, (0, 0, 0))
+        count = 0 if now - last > 3600 else count
+        count += 1
+        self.recent.append(now)
+        lock = min(LOCK_MAX, LOCK_BASE * 2 ** (count - LOCK_AFTER)) if count >= LOCK_AFTER else 0
+        self.failures[username] = (count, now + lock, now)
+
+    def _check_lock(self, username, now):
         with self.lock:
             self.recent = [t for t in self.recent if now - t < GLOBAL_WINDOW]
             if len(self.recent) >= GLOBAL_FAILURES:
                 raise LoginRefused('Hệ thống tạm ngừng nhận đăng nhập 1 phút vì có nhiều lần nhập sai.', 'login_paused')
-            count, until, last = self.failures.get(username, (0, 0, 0))
-            if now - last > 3600:
-                count = 0
+            _, until, _ = self.failures.get(username, (0, 0, 0))
         if until > now:
             raise LoginRefused(f'Đăng nhập sai nhiều lần. Thử lại sau {int(until - now) // 60 + 1} phút.', 'login_locked')
+
+    def login(self, username, password):
+        """Returns (session_token, user_info); raises LoginRefused with a message for the user.
+        When the account has 2FA, returns (None, {"second_factor": True, "pending": <token for login_totp>})."""
+        username = str(username or '').strip().lower()[:64]
+        password = str(password or '')[:200]
+        now = time.time()
+        self._check_lock(username, now)
         user = self.store.get(username) if USERNAME.match(username) else None
         ok = check_password(password, user['password'] if user else self.dummy) and user is not None
+        if not ok:
+            with self.lock:
+                self._failed(username, now)
+            raise LoginRefused('Tên đăng nhập hoặc mật khẩu không đúng.')
+        if has_totp(user):  # the wrong-password count is cleared only once the code is right too
+            pending = secrets.token_urlsafe(32)
+            with self.lock:
+                self.pending = {k: v for k, v in self.pending.items() if now - v['created'] <= self.PENDING_SECONDS}
+                self.pending[self._key(pending)] = {'user': username, 'created': now, 'tries': 0}
+            return None, {'second_factor': True, 'pending': pending}
         with self.lock:
-            if not ok:
-                count += 1
-                self.recent.append(now)
-                lock = min(LOCK_MAX, LOCK_BASE * 2 ** (count - LOCK_AFTER)) if count >= LOCK_AFTER else 0
-                self.failures[username] = (count, now + lock, now)
-                raise LoginRefused('Tên đăng nhập hoặc mật khẩu không đúng.')
             self.failures.pop(username, None)
+        return self._open_session(username, user, now, mfa=False)
+
+    def login_totp(self, pending, given):
+        """Second step: a 6-digit code (or a backup code) for a pending login. Returns (token, info, used_backup)."""
+        now, key = time.time(), self._key(str(pending or ''))
+        with self.lock:
+            p = self.pending.get(key)
+            if p and now - p['created'] > self.PENDING_SECONDS:
+                del self.pending[key]
+                p = None
+        if not p:
+            raise LoginRefused('Bước xác thực đã hết hạn. Vui lòng đăng nhập lại.', 'totp_expired')
+        username = p['user']
+        self._check_lock(username, now)
+        user = self.store.get(username)
+        if not user or not has_totp(user):
+            with self.lock:
+                self.pending.pop(key, None)
+            raise LoginRefused('Bước xác thực đã hết hạn. Vui lòng đăng nhập lại.', 'totp_expired')
+        cfg, given = user['totp'], str(given or '').strip()[:20]
+        step = totp.verify(cfg['secret'], given, t=now, after=cfg.get('last'))
+        backup = None
+        if step is None and len(given.replace('-', '')) == 8:
+            digest = totp.hash_backup(given)
+            backup = next((h for h in cfg.get('backup', []) if hmac.compare_digest(h, digest)), None)
+        if step is None and backup is None:
+            with self.lock:
+                self._failed(username, now)
+                p['tries'] += 1
+                gone = p['tries'] >= self.TOTP_TRIES
+                if gone:
+                    self.pending.pop(key, None)
+            raise LoginRefused('Mã xác thực không đúng.' + (' Vui lòng đăng nhập lại.' if gone else ''), 'totp_fail')
+
+        def spend(users):
+            t = users.get(username, {}).get('totp') or {}
+            if backup is not None:
+                t['backup'] = [h for h in t.get('backup', []) if h != backup]
+            else:
+                t['last'] = step  # the same code cannot log in twice
+        with self.lock:
+            if self.pending.pop(key, None) is None:  # two tabs racing with one pending login
+                raise LoginRefused('Bước xác thực đã hết hạn. Vui lòng đăng nhập lại.', 'totp_expired')
+            self.failures.pop(username, None)
+        self.store.modify(spend)
+        token, info = self._open_session(username, user, now, mfa=True)
+        return token, info, backup is not None
+
+    def _open_session(self, username, user, now, mfa):
         info = public_user(username, user)
         token = secrets.token_urlsafe(32)
         with self.lock:
             self.sessions[self._key(token)] = {'user': username, 'name': info['name'], 'role': info['role'],
-                                               'must_change': info['must_change'], 'created': now, 'seen': now}
+                                               'must_change': info['must_change'], 'created': now, 'seen': now,
+                                               'mfa': mfa, 'totp': info['totp']}
 
         def stamp(users):
             if username in users:
@@ -267,6 +344,64 @@ class Auth:
         except (StoreError, OSError):  # a read-only or broken file must not block a valid login
             pass
         return token, {k: info[k] for k in ('username', 'name', 'role', 'must_change')}
+
+    def needs_2fa(self, s):
+        """An admin session without a verified second factor (WEB_ADMIN_2FA_REQUIRED)."""
+        return bool(s and self.admin_2fa and s['role'] == 'admin' and not s.get('mfa'))
+
+    def describe(self, s):
+        """The session as the page sees it."""
+        return {'username': s['user'], 'name': s['name'], 'role': s['role'], 'must_change': s['must_change'],
+                'totp': bool(s.get('totp')), 'needs_2fa': self.needs_2fa(s)}
+
+    # ------------------------------------------------------------------ second factor (TOTP)
+    def totp_setup(self, token):
+        """A new secret for the logged-in user, kept in the session until a code from the app confirms it."""
+        s = self.session(token)
+        if not s:
+            raise PermissionError('Phiên đăng nhập đã hết hạn.')
+        if s.get('totp'):
+            raise ValueError('Xác thực 2 lớp đã bật. Đổi điện thoại: nhờ quản trị viên đặt lại 2FA.')
+        s['totp_pending'] = totp.generate_secret()
+        return s['totp_pending'], totp.uri(s['user'], s['totp_pending'])
+
+    def totp_enable(self, token, given):
+        """Confirm the pending secret with a code; returns the 8 backup codes (shown once)."""
+        s = self.session(token)
+        if not s:
+            raise PermissionError('Phiên đăng nhập đã hết hạn.')
+        secret = s.get('totp_pending')
+        if not secret:
+            raise ValueError('Bấm "Bật xác thực 2 lớp" để tạo khóa mới trước.')
+        step = totp.verify(secret, given)
+        if step is None:
+            raise ValueError('Mã chưa đúng. Kiểm tra giờ trên điện thoại và nhập mã đang hiện.')
+        codes = totp.backup_codes()
+
+        def apply(users):
+            if has_totp(users[s['user']]):
+                raise ValueError('Xác thực 2 lớp đã bật.')
+            users[s['user']]['totp'] = {'secret': secret, 'enabled': True, 'last': step,
+                                        'backup': [totp.hash_backup(c) for c in codes],
+                                        'since': time.strftime('%Y-%m-%d %H:%M')}
+        self.store.modify(apply)
+        s.pop('totp_pending', None)
+        s.update(mfa=True, totp=True)
+        self.end_sessions(s['user'], keep=token)  # other devices log in again, now with a code
+        return codes
+
+    def totp_reset(self, actor, username):
+        """Admin: remove username's second factor (lost phone); the user is logged out everywhere."""
+        if username == actor:
+            raise ValueError('Không tự đặt lại 2FA của chính mình; nhờ quản trị viên khác hoặc dùng manage_users.py.')
+
+        def apply(users):
+            if username not in users:
+                raise ValueError('Không có tài khoản ' + str(username))
+            if not users[username].pop('totp', None):
+                raise ValueError(f'{username} chưa bật xác thực 2 lớp.')
+        self.store.modify(apply)
+        self.end_sessions(username)
 
     def session(self, token):
         """The session for a bearer token, refreshed from users.json (role and name changes apply at once);
@@ -286,7 +421,7 @@ class Auth:
             self.logout(token)
             return None
         s.update(name=user.get('name') or s['user'], role=user.get('role', 'doctor'),
-                 must_change=bool(user.get('must_change')), seen=now)
+                 must_change=bool(user.get('must_change')), totp=has_totp(user), seen=now)
         return s
 
     def locked_seconds(self, username):
