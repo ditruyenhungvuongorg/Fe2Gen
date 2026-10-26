@@ -53,7 +53,8 @@ function showModel(data) {
   clearTimeout(modelPoll);
   if (modelState === 'loading') modelPoll = setTimeout(pollModel, 3000);
 }
-async function pollModel() { try { showModel(await api('/api/status', null, 15000)); } catch {} }
+// Model state comes with the session: /api/status only says whether the server is online and how to sign in.
+async function pollModel() { if (authMode !== 'none' && !access) return; try { showModel(await api('/api/session', null, 15000)); } catch {} }
 // Text extraction is about to be used: ask the server to load Model 1 on the GPU in the background.
 async function warmup() {
   if (authMode !== 'none' && !access || user?.role === 'lab' || user?.must_change) return;
@@ -456,11 +457,13 @@ async function checkConnection(){
   const seq=connectionVersion;
   try{const status=await api('/api/status',null,15000);if(seq!==connectionVersion)return;
     authMode=status.auth_mode||(status.auth_required?'token':'none');
-    $('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';showModel(status);showUser();
+    $('connection').textContent='● Máy chủ trực tuyến';$('connection').style.color='#286340';showUser();
     if(authMode==='accounts'&&!access){showGate('login');return;}
     showGate(null);
-    if(authMode==='token'&&!access)notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');
-    else if(!status.model_configured)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');
+    if(authMode==='token'&&!access){notice('Máy chủ yêu cầu mã truy cập. Mở Kết nối để nhập mã.');return;}
+    const session=await api('/api/session',null,15000);if(seq!==connectionVersion)return;
+    showModel(session);
+    if(!session.model_configured)notice('Tra cứu và đối chiếu sẵn sàng. Model trích văn bản chưa được cấu hình.');
     else notice('');}
   catch(e){if(seq!==connectionVersion)return;$('connection').textContent='○ Chưa kết nối Ubuntu';
     // The generic network error mentions the access code; the sign-in card says it more simply.

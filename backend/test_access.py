@@ -362,7 +362,9 @@ class HttpTests(unittest.TestCase):
 
     def test_flow(self):
         code, status = self.call('/api/status')
-        self.assertEqual((code, status['auth_mode'], status['model_state']), (200, 'accounts', 'stopped'))
+        # B10: without a login only online + sign-in mode; model state, errors and counts moved to /api/session
+        self.assertEqual((code, status), (200, {'status': 'online', 'auth_required': True, 'auth_mode': 'accounts'}))
+        self.assertEqual(self.runner.status()['model_state'], 'stopped')
         self.assertIsNone(self.runner.proc)  # no VRAM before anyone logs in
         self.assertEqual(self.call('/api/hpo_search?q=a')[0], 401)
         self.assertEqual(self.call('/api/login', {'username': 'bs.an', 'password': 'sai'})[0], 401)
@@ -370,7 +372,10 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn(login['model_state'], ('loading', 'ready'))  # login starts loading Model 1
         token = login['token']
-        self.assertEqual(self.call('/api/session', token=token)[1]['user']['name'], 'BS. An')
+        session = self.call('/api/session', token=token)[1]
+        self.assertEqual(session['user']['name'], 'BS. An')
+        self.assertIn(session['model_state'], ('loading', 'ready'))
+        self.assertEqual(session['profiles_count'], 2)
         self.assertEqual(self.call('/api/hpo_search?q=a', token=token)[1][0]['q'], 'a')
         code, out = self.call('/api/extract_hpo', {'text': 'Thai đầu nhỏ.'}, token)
         self.assertEqual((code, out['echo']), (200, 'Thai đầu nhỏ.'))
@@ -1038,6 +1043,25 @@ class SessionPolicyTests(unittest.TestCase):
                                          headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
             with urllib.request.urlopen(req, timeout=30) as r:
                 self.assertEqual(r.headers['Clear-Site-Data'], '"cache"')
+
+
+class ModelStateFileTests(unittest.TestCase):
+    """B10: gpu.sh reads the model state from a local file, not from the public /api/status."""
+
+    def test_state_file_follows_the_process(self):
+        with tempfile.TemporaryDirectory() as d, redirect_stderr(StringIO()):
+            state = Path(d, 'model1_state.json')
+            m = model(state_file=state)
+            try:
+                m.extract('a')
+                self.assertEqual(json.loads(state.read_text(encoding='utf-8'))['model_state'], 'ready')
+                m.stop('test')
+                data = json.loads(state.read_text(encoding='utf-8'))
+                self.assertEqual((data['model_state'], data['paused']), ('stopped', False))
+                if os.name == 'posix':
+                    self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+            finally:
+                m.stop()
 
 
 class FailClosedTests(unittest.TestCase):

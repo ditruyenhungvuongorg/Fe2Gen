@@ -248,17 +248,16 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path)
         if path.path.startswith('/api/') and self.locked():
             return
-        if path.path == '/api/status':
+        if path.path == '/api/status':  # public: only what the sign-in page needs; details in /api/session
             mode = AUTH.mode
-            return self.send_json({'status': 'online', 'profiles_count': len(SYSTEM.matcher.profiles),
-                'hpo_terms_count': len(SYSTEM.canonical), 'auth_required': mode != 'none', 'auth_mode': mode,
-                **self.model_status()})
+            return self.send_json({'status': 'online', 'auth_required': mode != 'none', 'auth_mode': mode})
         if path.path.startswith('/api/'):
             if not self.authorized(path.path):
                 return
             if path.path == '/api/session':
                 user = AUTH.describe(self.session) if self.session else None
-                return self.send_json({'user': user, 'role': self.role, **self.model_status()})
+                return self.send_json({'user': user, 'role': self.role, 'profiles_count': len(SYSTEM.matcher.profiles),
+                                       'hpo_terms_count': len(SYSTEM.canonical), **self.model_status()})
             if path.path == '/api/hpo_search':
                 if self.limited('hpo_search'):
                     return

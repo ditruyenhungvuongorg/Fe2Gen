@@ -22,6 +22,8 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_PAUSE_FILE = Path.home() / 'prenatal_pubcasefinder/.deployment/gpu_pause'
+# The model state for `gpu.sh status` on the server, since /api/status no longer shows it without a login.
+DEFAULT_STATE_FILE = Path.home() / 'prenatal_pubcasefinder/.deployment/model1_state.json'
 
 
 class ModelUnavailable(RuntimeError):
@@ -52,7 +54,7 @@ def free_vram_mib():
 
 class Model1Process:
     def __init__(self, kind, adapter_path, idle_seconds=3600, load_wait=120, request_seconds=300,
-                 min_free_mib=13000, pause_file=None, command=None, free_mib=free_vram_mib):
+                 min_free_mib=13000, pause_file=None, command=None, free_mib=free_vram_mib, state_file=None):
         self.kind = kind                    # 'v6' (v6/v7 bundle) or 'v38'
         self.adapter_path = adapter_path    # configured bundle/adapter, for /api/status
         self.idle_seconds = idle_seconds
@@ -60,6 +62,7 @@ class Model1Process:
         self.request_seconds = request_seconds
         self.min_free_mib = min_free_mib
         self.pause_file = Path(pause_file) if pause_file else None
+        self.state_file = Path(state_file) if state_file else None
         self.command = command or [sys.executable, '-m', 'model1_process']
         self.free_mib = free_mib
         self.cond = threading.Condition()
@@ -80,7 +83,8 @@ class Model1Process:
                    idle_seconds=env_number('MODEL1_IDLE_MINUTES', 60) * 60,
                    load_wait=env_number('MODEL1_LOAD_WAIT_SECONDS', 120),
                    min_free_mib=env_number('MODEL1_MIN_FREE_MIB', 13000),
-                   pause_file=os.getenv('MODEL1_PAUSE_FILE') or DEFAULT_PAUSE_FILE)
+                   pause_file=os.getenv('MODEL1_PAUSE_FILE') or DEFAULT_PAUSE_FILE,
+                   state_file=os.getenv('MODEL1_STATE_FILE') or DEFAULT_STATE_FILE)
 
     # ------------------------------------------------------------------ state
     @property
@@ -100,8 +104,28 @@ class Model1Process:
             return {'model_state': state, 'model_ready': state == 'ready', 'model_error': self.error if state == 'failed' else '',
                     'model_load_seconds': self.load_seconds, 'idle_minutes': round(self.idle_seconds / 60)}
 
+    def publish(self):
+        """Write the current state to state_file (mode 600) for gpu.sh; never raises."""
+        if not self.state_file:
+            return
+        try:
+            data = {**self.status(), 'paused': self.paused(), 'updated': time.strftime('%Y-%m-%d %H:%M:%S')}
+            tmp = self.state_file.with_suffix('.tmp')
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
+
     def start(self):
         """Start loading in the background unless already loading/ready; returns the state."""
+        state = self._start()
+        self.publish()
+        return state
+
+    def _start(self):
         self.touch()
         with self.cond:
             if self.state in ('loading', 'ready'):
@@ -159,6 +183,7 @@ class Model1Process:
             if self.state in ('loading', 'ready'):
                 self.state = 'stopped'
             self.cond.notify_all()
+        self.publish()
         if not proc:
             return
         print('[Model 1] Giải phóng GPU' + (f' ({reason})' if reason else ''), file=sys.stderr, flush=True)
@@ -236,6 +261,7 @@ class Model1Process:
                         elif event == 'failed':
                             self.state, self.error = 'failed', msg.get('message') or 'Model không nạp được.'
                         self.cond.notify_all()
+                self.publish()
             else:
                 responses.put(msg)
         code = proc.wait()
@@ -247,6 +273,7 @@ class Model1Process:
                     self.state, self.error = 'failed', f'Tiến trình model dừng bất thường (mã {code}).'
                 print('[Model 1]', self.error, file=sys.stderr, flush=True)
             self.cond.notify_all()
+        self.publish()
 
     def _watch(self, every=10):
         while True:

@@ -5,6 +5,7 @@
 #   bash gpu.sh status  - pause flag, model state and GPU processes
 set -euo pipefail
 PAUSE="${MODEL1_PAUSE_FILE:-$HOME/prenatal_pubcasefinder/.deployment/gpu_pause}"
+STATE="${MODEL1_STATE_FILE:-$HOME/prenatal_pubcasefinder/.deployment/model1_state.json}"
 PORT="${PORT:-8000}"
 case "${1:-status}" in
   pause)
@@ -15,10 +16,19 @@ case "${1:-status}" in
     echo "Web được dùng GPU lại; Model 1 chỉ nạp khi bác sĩ đăng nhập hoặc tách đoạn văn." ;;
   status)
     if [ -e "$PAUSE" ]; then echo "Cờ tạm dừng: CÓ ($PAUSE)"; else echo "Cờ tạm dừng: không"; fi
+    # /api/status only says online without a login; the service writes the model state to $STATE.
     curl -s -m 5 "http://127.0.0.1:$PORT/api/status" | python3 -c 'import json, sys
-d = json.load(sys.stdin)
-print("Model 1:", d.get("model_state"), "| nạp lần gần nhất:", d.get("model_load_seconds"), "giây |", d.get("model_error") or "")' \
-      || echo "Không gọi được web ở cổng $PORT"
+print("Web:", json.load(sys.stdin).get("status"))' || echo "Không gọi được web ở cổng $PORT"
+    if [ -r "$STATE" ]; then
+      python3 - "$STATE" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+print("Model 1:", d.get("model_state"), "| nạp lần gần nhất:", d.get("model_load_seconds"), "giây |",
+      d.get("model_error") or "", "| cập nhật", d.get("updated"))
+PY
+    else
+      echo "Model 1: chưa có $STATE (dịch vụ chưa đổi trạng thái model từ lúc khởi động)"
+    fi
     nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || true ;;
   *) echo "Dùng: bash gpu.sh pause|resume|status"; exit 2 ;;
 esac
