@@ -1,0 +1,31 @@
+# Install once:  pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.3
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+
+  - repo: local
+    hooks:
+      - id: no-spreadsheets
+        name: block *.xlsx (clinical data must not be committed)
+        language: fail
+        entry: 'Spreadsheets are not committed to this repository'
+        files: '\.xlsx$'
+      - id: no-jsonl-outside-resources
+        name: block *.jsonl outside backend/resources/
+        language: fail
+        entry: '*.jsonl may only be committed under backend/resources/'
+        files: '\.jsonl$'
+        exclude: '^backend/resources/'
+      - id: no-credentials-files
+        name: block users.json, *.env and audit logs
+        language: fail
+        entry: 'Accounts, environment files and audit logs stay on the server'
+        files: '(^|/)(users\.json|[^/]*\.env|\.env|audit[^/]*\.jsonl)$'
