@@ -79,6 +79,7 @@ class Model1ProcessTests(unittest.TestCase):
         m = self.make(idle_seconds=0)
         m.extract('a')
         proc = m.proc
+        m.last_used -= 1  # Windows' monotonic clock ticks every ~16 ms
         m.check_idle()
         self.assertIsNotNone(proc.poll())  # the process exited: the driver frees all of its VRAM
         self.assertEqual(m.status()['model_state'], 'stopped')
@@ -183,7 +184,8 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(Auth(self.store, token='abc').mode, 'token')
         self.add()
         self.assertEqual(Auth(self.store, token='abc').mode, 'accounts')
-        self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
+        if os.name == 'posix':
+            self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
 
     def test_shared_token_mode(self):
         a = Auth(self.store, token='abc')
@@ -286,7 +288,8 @@ class AuthTests(unittest.TestCase):
         log.write('login_fail', 'khach')
         self.assertEqual([e['event'] for e in log.tail()], ['login_fail', 'extract', 'login_ok'])
         self.assertEqual([e['event'] for e in log.tail(user='bs.an', event='extract')], ['extract'])
-        self.assertEqual(os.stat(log.path).st_mode & 0o777, 0o600)
+        if os.name == 'posix':
+            self.assertEqual(os.stat(log.path).st_mode & 0o777, 0o600)
 
     def test_manage_users_cli(self):
         import manage_users
@@ -366,9 +369,6 @@ class HttpTests(unittest.TestCase):
         proc.wait(timeout=30)  # the last doctor logged out: the model process exits
         self.assertEqual(self.call('/api/session', token=token)[0], 401)
 
-
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
 
 
 class AdminHttpTests(unittest.TestCase):
@@ -463,3 +463,7 @@ class AdminHttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + '/api/status', timeout=30) as r:
             self.assertIn("script-src 'self'", r.headers['Content-Security-Policy'])
             self.assertEqual(r.headers['X-Frame-Options'], 'DENY')
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
