@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: backend tests (no GPU, no data)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements-ci.txt
+      - run: python -m pip install -r requirements-ci.txt
+      - name: Access, accounts and Model 1 process tests
+        run: python test_access.py
+      - name: Model 1 bundle integrity, error filter and state file tests
+        run: python test_model_integrity.py
+      # backend/data/ (licensed HPO files) is not in the repository: test_web.py skips the tests that need it
+      # and runs the rest (alignment, contract, category table, re-ranker file, preload failure).
+      - name: Web tests (data-free subset)
+        run: python test_web.py
+
+  node-tests:
+    name: node tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '22'
+      - run: node test_case_state.cjs
+      - run: node test_frontend_logic.cjs
+      - name: Syntax of the page scripts
+        run: for f in docs/*.js; do node --check "$f"; done
+
+  secrets-scan:
+    name: gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # gitleaks/gitleaks-action@v2 needs a paid GITLEAKS_LICENSE on organisation repositories
+      # (this repository belongs to an organisation), so run the open-source image, pinned to a tag.
+      - name: Scan history
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.24.3 \
+            detect --source /repo --redact --verbose --no-banner
+
+  pip-audit:
+    name: pip-audit (fail-soft)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+      # The lock file is created on the Ubuntu host (backend/ops/freeze_lock.sh) and may not be committed yet.
+      # It can hold CUDA/local wheels that PyPI does not know, so a failure is reported as a warning only.
+      - name: Audit backend/requirements.lock.txt
+        run: |
+          if [ ! -f backend/requirements.lock.txt ]; then
+            echo "::notice::backend/requirements.lock.txt not found - nothing to audit (run backend/ops/freeze_lock.sh)"
+            exit 0
+          fi
+          python -m pip install pip-audit==2.9.0
+          if pip-audit --requirement backend/requirements.lock.txt --no-deps --disable-pip; then
+            echo "pip-audit: no known vulnerabilities"
+          else
+            echo "::warning::pip-audit reported problems or could not resolve some packages (fail-soft, see log)"
+          fi
+
+  docs-allowlist:
+    name: docs/ allowlist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      # docs/ is published by GitHub Pages: only site files may live there, never data.
+      - name: Check file types in docs/
+        run: |
+          bad=0
+          while IFS= read -r -d '' f; do
+            name="${f##*/}"
+            case "$name" in
+              .nojekyll) continue ;;
+              *.html|*.css|*.js|*.txt) continue ;;
+              *.woff2|*.ttf) case "$f" in docs/fonts/*) continue ;; esac ;;
+            esac
+            echo "::error file=$f::not allowed in docs/ (allowed: html css js txt, .nojekyll, woff2/ttf under docs/fonts/)"
+            bad=1
+          done < <(find docs \( -type f -o -type l \) -print0)
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+          echo "docs/ holds only allowed files"
