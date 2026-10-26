@@ -27,9 +27,18 @@ GPU_ROLES = ('admin', 'doctor')  # roles that use text extraction (Model 1 on th
                                  # an admin's only when they open text extraction
 MIN_PASSWORD = 10
 SCRYPT = dict(n=2 ** 14, r=8, p=1, dklen=32)
-# A username is locked for 1, 2, 4 ... up to 15 minutes from its 5th wrong password in a row; more than 30 wrong
-# passwords in a minute over all usernames (password spraying) pause every login for that minute.
-LOCK_AFTER, LOCK_BASE, LOCK_MAX = 5, 60, 900
+# A username is locked for 1, 2, 4 ... up to WEB_LOCK_MAX_SECONDS (default 5 minutes) from its 5th wrong password
+# in a row; more than 30 wrong passwords in a minute over all usernames (password spraying) pause every login for
+# that minute. The lock is kept short because anyone can trigger it for a known username (serve_web also limits
+# login attempts per connection source and per username); an admin can lift it on the admin page.
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return int(default)
+
+
+LOCK_AFTER, LOCK_BASE, LOCK_MAX = 5, 60, _env_int('WEB_LOCK_MAX_SECONDS', 300)
 GLOBAL_FAILURES, GLOBAL_WINDOW = 30, 60
 COMMON_PASSWORDS = {
     '1234567890', '0123456789', '12345678910', '1234512345', '1111111111', '0000000000', '1122334455', '9876543210',
@@ -279,6 +288,19 @@ class Auth:
         s.update(name=user.get('name') or s['user'], role=user.get('role', 'doctor'),
                  must_change=bool(user.get('must_change')), seen=now)
         return s
+
+    def locked_seconds(self, username):
+        """Seconds left on username's lock after wrong passwords (0 when not locked)."""
+        with self.lock:
+            _, until, _ = self.failures.get(username, (0, 0, 0))
+        return max(0, int(until - time.time()))
+
+    def unlock(self, username):
+        """Forget username's wrong passwords (admin page); True when it was locked."""
+        was = self.locked_seconds(username) > 0
+        with self.lock:
+            self.failures.pop(username, None)
+        return was
 
     def logout(self, token):
         with self.lock:

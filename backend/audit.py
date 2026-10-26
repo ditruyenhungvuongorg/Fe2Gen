@@ -18,6 +18,7 @@ EVENTS = {
     'user_created': 'Tạo tài khoản', 'user_updated': 'Sửa tài khoản', 'password_reset': 'Đặt lại mật khẩu',
     'user_deleted': 'Xóa tài khoản', 'sessions_ended': 'Buộc đăng xuất', 'gpu': 'Điều khiển GPU',
     'extract': 'Tách đoạn văn', 'match': 'Đối chiếu bệnh', 'auth_store_error': 'Lỗi đọc danh sách tài khoản',
+    'rate_limited': 'Vượt giới hạn tốc độ', 'login_unlocked': 'Gỡ khóa đăng nhập',
 }
 
 

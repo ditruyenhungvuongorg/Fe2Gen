@@ -477,6 +477,20 @@ class AdminHttpTests(unittest.TestCase):
             self.assertEqual(r.headers['X-Frame-Options'], 'DENY')
 
 
+def fresh_rates(per_minute=1000, **override):
+    from ratelimit import RateLimiter
+    groups = ('hpo_search', 'match_diseases', 'extract_hpo', 'login', 'login_user', 'admin')
+    return {g: RateLimiter(override.get(g, per_minute)) for g in groups}
+
+
+def accounts(d, **users):
+    """A users.json in d with these username=role accounts; each password is 'mat-khau-' + username."""
+    store = UserStore(Path(d, 'users.json'))
+    store.save({name: {'name': name, 'role': role, 'password': hash_password('mat-khau-' + name)}
+                for name, role in users.items()})
+    return store
+
+
 class LiveServer:
     """serve_web.Handler on a free port with patched module globals; use as a context manager."""
 
@@ -487,6 +501,7 @@ class LiveServer:
             matcher=types.SimpleNamespace(profiles=[1]), canonical={'HP:1': {}}, runner=model(),
             search_hpo=lambda q: [], extract=lambda text: {'mentions': [], 'seconds': 0.0}, match=lambda p: {'ok': True}))
         self.system = globals_['SYSTEM']
+        globals_.setdefault('RATES', fresh_rates())  # each test starts with full budgets
         self.patches = [patch.object(serve_web, k, v) for k, v in globals_.items()]
 
     def __enter__(self):
@@ -634,6 +649,151 @@ class AccessLogTests(unittest.TestCase):
                 broken.write('GET', '/', 200)
             self.assertIsNone(AccessLog('off').path)
             self.assertEqual(AccessLog.clean_path('/ab cạ?q=x'), '/a_b_c_')
+
+
+class LimitTests(unittest.TestCase):
+    """B6/B7: per-key request budgets (429 + Retry-After), bounded queue, connection cap, header deadline, unlock."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data['token']
+
+    def test_search_budget_per_session(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(hpo_search=3)) as srv:
+            token = self.login(srv, 'bs.an')
+            other = self.login(srv, 'quan.tri')
+            self.assertEqual([srv.call('/api/hpo_search?q=a', token=token)[0] for _ in range(3)], [200] * 3)
+            req = urllib.request.Request(srv.base + '/api/hpo_search?q=a', headers={'Authorization': 'Bearer ' + token})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=30)
+            self.assertEqual(caught.exception.code, 429)
+            self.assertGreaterEqual(int(caught.exception.headers['Retry-After']), 1)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=token)[0], 429)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=other)[0], 200)  # another session, own budget
+        limited = [e for e in self.audit.tail() if e['event'] == 'rate_limited']
+        self.assertEqual([(e['user'], e['group']) for e in limited], [('bs.an', 'hpo_search')])  # one line, not two
+
+    def test_login_budget_per_source_counts_failures_only(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(login=3)) as srv:
+            for _ in range(5):
+                self.login(srv, 'bs.an')  # successful logins are refunded
+            for name in ('khach1', 'khach2', 'khach3'):
+                self.assertEqual(srv.call('/api/login', {'username': name, 'password': 'sai-mat-khau'})[0], 401)
+            code, data = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})
+            self.assertEqual(code, 429)
+            self.assertIn('thử lại sau', data['error'])
+
+    def test_login_budget_per_username(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(login_user=2)) as srv:
+            for _ in range(2):
+                self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})[0], 401)
+            self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})[0], 429)
+            self.assertEqual(srv.call('/api/login', {'username': 'quan.tri', 'password': 'sai-mat-khau'})[0], 401)
+
+    def test_queue_of_six_refuses_one(self):
+        import serve_web
+        from ratelimit import WorkQueue
+        gate = threading.Event()
+        system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={}, runner=model(),
+                                       search_hpo=lambda q: [], extract=lambda t: {},
+                                       match=lambda p: (gate.wait(30), {'ok': True})[1])
+        work = WorkQueue(5)
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, SYSTEM=system, WORK=work) as srv:
+            token = self.login(srv, 'bs.an')
+            results = []
+            hpos = {'hpos': [{'id': 'HP:0000252', 'status': 'CÓ'}]}
+            send = lambda: results.append(srv.call('/api/match_diseases', hpos, token)[0])
+            first = threading.Thread(target=send)
+            first.start()
+            deadline = time.monotonic() + 10
+            while work.slot._value and time.monotonic() < deadline:  # the first request holds the slot
+                time.sleep(0.01)
+            waiters = [threading.Thread(target=send) for _ in range(6)]
+            for t in waiters:
+                t.start()
+            while (work.waiting < 5 or not results) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(results, [503])  # the sixth waiter is refused at once; five wait
+            gate.set()
+            for t in [first] + waiters:
+                t.join(30)
+            self.assertEqual(sorted(results), [200] * 6 + [503])
+        self.assertGreaterEqual(serve_web.QUEUE_SECONDS, 30)
+
+    def test_connection_cap_and_header_deadline(self):
+        import socket
+        import serve_web
+        system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={}, runner=model())
+        with patch.object(serve_web, 'HEADER_SECONDS', 1), patch.object(serve_web, 'AUTH', Auth(self.store)), \
+             patch.object(serve_web, 'SYSTEM', system), patch.object(serve_web, 'AUDIT', self.audit), \
+             patch.object(serve_web, 'ACCESS', AccessLog('off')), redirect_stderr(StringIO()):
+            server = serve_web.Server(('127.0.0.1', 0), serve_web.Handler, max_connections=2)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            port = server.server_address[1]
+            try:
+                idle = [socket.create_connection(('127.0.0.1', port), timeout=10) for _ in range(2)]
+                time.sleep(0.2)
+                with socket.create_connection(('127.0.0.1', port), timeout=10) as third:
+                    self.assertTrue(third.recv(4096).startswith(b'HTTP/1.0 503'))  # over the cap: short 503
+                # slowloris: the request line arrives, then one header byte every 0.3 s; dropped after 1 s
+                started = time.monotonic()
+                idle[0].sendall(b'GET / HTTP/1.0\r\n')
+                closed = False
+                while time.monotonic() - started < 5:
+                    try:
+                        idle[0].sendall(b'X')
+                        idle[0].settimeout(0.3)
+                        if idle[0].recv(1) == b'':
+                            closed = True
+                            break
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        closed = True
+                        break
+                self.assertTrue(closed)
+                self.assertLess(time.monotonic() - started, 4)
+                for s in idle:
+                    s.close()
+                time.sleep(1.5)  # the other idle connection times out as well and frees its slot
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/status', timeout=10) as r:
+                    self.assertEqual(r.status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_admin_unlocks_a_locked_login(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            for _ in range(5):
+                srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})
+            self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})[0], 429)
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin)[1]['users']}
+            self.assertTrue(users['bs.an']['login_locked'])
+            self.assertFalse(users['quan.tri']['login_locked'])
+            code, out = srv.call('/api/admin/users/unlock', {'username': 'bs.an'}, admin)
+            self.assertEqual((code, out['was_locked']), (200, True))
+            self.login(srv, 'bs.an')
+            self.assertEqual(srv.call('/api/admin/users/unlock', {'username': 'khong.co'}, admin)[0], 422)
+        events = [(e['event'], e.get('target')) for e in self.audit.tail()]
+        self.assertIn(('login_unlocked', 'bs.an'), events)
+
+    def test_limiter_refills(self):
+        from ratelimit import RateLimiter
+        r = RateLimiter(60, burst=2)
+        self.assertEqual([r.take('k', now=0), r.take('k', now=0)], [0, 0])
+        self.assertEqual(r.take('k', now=0), 1)
+        self.assertEqual(r.take('k', now=1.01), 0)  # one per second comes back
+        self.assertEqual(RateLimiter(0).take('k'), 0)  # 0 = off
 
 
 class FailClosedTests(unittest.TestCase):

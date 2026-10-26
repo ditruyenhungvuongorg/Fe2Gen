@@ -1,16 +1,19 @@
 """HTTP web entrypoint; exposes static UI and reviewed APIs only."""
+import hashlib
 import json
 import os
+import socket
 import sys
 import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from threading import BoundedSemaphore, Thread
+from threading import BoundedSemaphore, Thread, Timer
 from urllib.parse import urlparse, parse_qs
 from accesslog import AccessLog
 from audit import EVENTS, AuditLog
 from auth import GPU_ROLES, LOCKED_MESSAGE, ROLES, USERNAME, Auth, LoginRefused, public_user
 from model1_process import ModelUnavailable, free_vram_mib
+from ratelimit import RateLimiter, WorkQueue, env_int
 from web_service import WebSystem
 
 ROOT = Path(__file__).resolve().parent
@@ -23,8 +26,23 @@ AUTH = Auth()
 AUDIT = AuditLog()
 ACCESS = AccessLog()
 AUTH.store.on_problem = lambda kind: AUDIT.write('auth_store_error', '', kind=kind)
-WORK = BoundedSemaphore(1)
 QUEUE_SECONDS = 90
+# One request at a time on the GPU/CPU; at most WEB_QUEUE_MAX more wait (up to QUEUE_SECONDS), the next gets 503.
+WORK = WorkQueue(env_int('WEB_QUEUE_MAX', 5))
+# Requests per minute (token bucket, burst = one minute's worth); 0 turns a limit off. Keys: the session token's
+# hash; for login the connection source and, separately, the username.
+RATES = {'hpo_search': RateLimiter(env_int('WEB_RATE_HPO_SEARCH', 60)),
+         'match_diseases': RateLimiter(env_int('WEB_RATE_MATCH', 10)),
+         'extract_hpo': RateLimiter(env_int('WEB_RATE_EXTRACT', 10)),
+         'login': RateLimiter(env_int('WEB_RATE_LOGIN', 10)),
+         'login_user': RateLimiter(env_int('WEB_RATE_LOGIN', 10)),
+         'admin': RateLimiter(env_int('WEB_RATE_ADMIN', 60))}
+# Behind Tailscale Funnel every connection comes from 127.0.0.1. Only with WEB_TRUST_PROXY=1 is the last
+# X-Forwarded-For entry (the one the local proxy appended) used as the source; never trust it otherwise.
+TRUST_PROXY = os.getenv('WEB_TRUST_PROXY', '0') == '1'
+MAX_CONNECTIONS = env_int('WEB_MAX_CONNECTIONS', 64)
+HEADER_SECONDS = env_int('WEB_HEADER_TIMEOUT', 15)   # whole request line + headers, against slowloris
+REQUEST_SECONDS = 180                                 # each socket read/write once the headers are in
 # On logout Model 1 stays loaded while another doctor was active in the last 10 minutes; otherwise it is released.
 LOGOUT_GRACE_SECONDS = 600
 # Only the page's own files run; inline style attributes are used by the lab sheet.
@@ -37,7 +55,7 @@ FIRST_LOGIN_PATHS = ('/api/session', '/api/change_password', '/api/logout')
 
 class Handler(SimpleHTTPRequestHandler):
     extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.woff2': 'font/woff2'}
-    session = status_sent = None
+    session = status_sent = deadline = None
     bytes_sent = 0
 
     def __init__(self, *args, **kwargs):
@@ -45,14 +63,35 @@ class Handler(SimpleHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        self.connection.settimeout(180)
+        self.connection.settimeout(HEADER_SECONDS)
+
+    def header_deadline(self):
+        """The request line and headers did not arrive within HEADER_SECONDS (slowloris): drop the connection."""
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def parse_request(self):
+        ok = super().parse_request()  # reads the request line and headers
+        if self.deadline:
+            self.deadline.cancel()
+        self.connection.settimeout(REQUEST_SECONDS)
+        return ok
 
     def log_message(self, *args):
         pass  # stderr stays quiet; one line per request goes to ACCESS (no query, body or token)
 
     def handle_one_request(self):
         self.session, self.status_sent, self.bytes_sent, started = None, None, 0, time.monotonic()
-        super().handle_one_request()
+        self.connection.settimeout(HEADER_SECONDS)
+        self.deadline = Timer(HEADER_SECONDS, self.header_deadline)
+        self.deadline.daemon = True
+        self.deadline.start()
+        try:
+            super().handle_one_request()
+        finally:
+            self.deadline.cancel()
         if self.status_sent is not None:
             ACCESS.write(self.command, self.path, self.status_sent, self.session['user'] if self.session else '-',
                          (time.monotonic() - started) * 1000, self.bytes_sent)
@@ -136,6 +175,30 @@ class Handler(SimpleHTTPRequestHandler):
             SYSTEM.runner.touch()  # a doctor is working: postpone releasing the GPU
         return True
 
+    def source(self):
+        """Where the connection comes from, for login limits (see TRUST_PROXY)."""
+        if TRUST_PROXY:
+            forwarded = self.headers.get('X-Forwarded-For', '').split(',')[-1].strip()
+            if forwarded:
+                return forwarded[:64]
+        return self.client_address[0]
+
+    def rate_key(self):
+        token = self.token()
+        return 'session:' + hashlib.sha256(token.encode()).hexdigest() if token else 'source:' + self.source()
+
+    def limited(self, group, key=None, who=None):
+        """Answer 429 with Retry-After when key used up group's budget; True when refused."""
+        limiter, key = RATES[group], key or self.rate_key()
+        wait = limiter.take(key)
+        if not wait:
+            return False
+        if limiter.should_report(key):
+            AUDIT.write('rate_limited', who or self.user, group=group)
+        self.send_json({'error': f'Quá nhiều yêu cầu. Vui lòng thử lại sau {wait} giây.', 'retry_after': wait}, 429,
+                       {'Retry-After': str(wait)})
+        return True
+
     def read_json(self):
         """The request body as a dict, or None after an error reply."""
         try:
@@ -188,9 +251,13 @@ class Handler(SimpleHTTPRequestHandler):
                          'must_change': self.session['must_change']} if self.session else None)
                 return self.send_json({'user': user, 'role': self.role, **self.model_status()})
             if path.path == '/api/hpo_search':
+                if self.limited('hpo_search'):
+                    return
                 return self.send_json(SYSTEM.search_hpo(parse_qs(path.query).get('q', [''])[0][:200]))
             if path.path.startswith('/api/admin/'):
                 if not self.admin_only():  # admin_only already answered 403; a second reply would desync HTTP
+                    return
+                if self.limited('admin'):
                     return
                 return self.admin_get(path.path, parse_qs(path.query))
             return self.send_json({'error': 'Không có endpoint này.'}, 404)
@@ -219,22 +286,27 @@ class Handler(SimpleHTTPRequestHandler):
         if path == '/api/change_password':
             return self.change_password(payload)
         if path.startswith('/api/admin/'):
-            if self.admin_only():
+            if self.admin_only() and not self.limited('admin'):
                 self.admin_post(path, payload)
             return
         if path not in ('/api/extract_hpo', '/api/match_diseases'):
             return self.send_json({'error': 'Không có endpoint này.'}, 404)
         extract = path.endswith('extract_hpo')
+        if extract and self.role not in GPU_ROLES:
+            return self.send_json({'error': 'Tài khoản Phòng Lab không dùng tách đoạn văn.'}, 403)
+        if self.limited(path[5:]):
+            return
         if extract:
-            if self.role not in GPU_ROLES:
-                return self.send_json({'error': 'Tài khoản Phòng Lab không dùng tách đoạn văn.'}, 403)
             try:  # wait for a released model to load before queueing on the GPU
                 SYSTEM.runner.ensure_ready()
             except ModelUnavailable as exc:
                 return self.send_json({'error': str(exc), **self.model_status()}, 503)
         # One request at a time on the GPU; later requests queue instead of failing at once.
-        if not WORK.acquire(timeout=QUEUE_SECONDS):
-            return self.send_json({'error': 'Hệ thống đang xử lý ca khác. Vui lòng thử lại.'}, 503)
+        waited = WORK.acquire(QUEUE_SECONDS)
+        if waited != 'ok':
+            return self.send_json({'error': 'Hệ thống đang xử lý ca khác. Vui lòng thử lại.' if waited == 'timeout'
+                                   else 'Đang có nhiều ca chờ xử lý. Vui lòng thử lại sau ít phút.'}, 503,
+                                  {'Retry-After': '30'})
         try:
             data = SYSTEM.extract(payload.get('text')) if extract else SYSTEM.match(payload)
             self.send_json(data)
@@ -265,11 +337,17 @@ class Handler(SimpleHTTPRequestHandler):
         if payload is None:
             return
         name = str(payload.get('username') or '').strip().lower()
+        who = name if USERNAME.match(name) else '(tên không hợp lệ)'
+        source_key, user_key = 'source:' + self.source(), 'user:' + name[:64]
+        if self.limited('login', source_key, who) or self.limited('login_user', user_key, who):
+            return
         try:
             token, user = AUTH.login(name, payload.get('password'))
         except LoginRefused as exc:
-            AUDIT.write(exc.event, name if USERNAME.match(name) else '(tên không hợp lệ)')
+            AUDIT.write(exc.event, who)
             return self.send_json({'error': str(exc)}, 429 if exc.event != 'login_fail' else 401)
+        RATES['login'].give_back(source_key)  # only failed attempts use up the source's budget
+        RATES['login_user'].give_back(user_key)
         AUDIT.write('login_ok', user['username'], role=user['role'])
         if user['role'] == 'doctor' and not user['must_change']:
             SYSTEM.runner.start()  # a doctor is working now: load Model 1 while they enter the case
@@ -310,7 +388,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def admin_get(self, path, query):
         if path == '/api/admin/users':
-            users = [public_user(name, u) for name, u in sorted(AUTH.store.all().items())]
+            users = [{**public_user(name, u), 'login_locked': AUTH.locked_seconds(name) > 0}
+                     for name, u in sorted(AUTH.store.all().items())]
             return self.send_json({'users': users, 'roles': ROLES})
         if path == '/api/admin/sessions':
             return self.send_json({'sessions': AUTH.list_sessions()})
@@ -347,6 +426,13 @@ class Handler(SimpleHTTPRequestHandler):
                 AUTH.delete_user(self.user, target)
                 AUDIT.write('user_deleted', self.user, target=target)
                 return self.send_json({'ok': True})
+            if path == '/api/admin/users/unlock':
+                if target not in AUTH.store.all():
+                    raise ValueError('Không có tài khoản ' + target)
+                was = AUTH.unlock(target)
+                RATES['login_user'].reset('user:' + target)
+                AUDIT.write('login_unlocked', self.user, target=target, was_locked=was)
+                return self.send_json({'ok': True, 'was_locked': was})
             if path == '/api/admin/sessions/end':
                 ended = AUTH.end_sessions(target, keep=self.token())
                 AUDIT.write('sessions_ended', self.user, target=target, count=ended)
@@ -374,6 +460,41 @@ class Handler(SimpleHTTPRequestHandler):
         AUDIT.write('gpu', self.user, action=action)
         self.send_json(self.gpu_status())
 
+class Server(ThreadingHTTPServer):
+    """At most max_connections connections are served at once; the next ones get a short 503 and are closed,
+    so a flood cannot start an unbounded number of threads."""
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, address, handler, max_connections=None):
+        self.slots = BoundedSemaphore(max_connections or MAX_CONNECTIONS)
+        body = json.dumps({'error': 'Máy chủ đang quá tải. Vui lòng thử lại sau ít giây.'}, ensure_ascii=False).encode()
+        self.busy = (b'HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\n'
+                     b'Retry-After: 5\r\nConnection: close\r\nContent-Length: %d\r\n\r\n' % len(body)) + body
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.settimeout(2)
+                request.sendall(self.busy)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def preload_model1():
     """Load Model 1 at startup (MODEL1_PRELOAD=1; it is still released after MODEL1_IDLE_MINUTES unused).
     HPO search and disease matching need no GPU, so a failure (e.g. no NVIDIA driver after a reboot) must not
@@ -391,4 +512,4 @@ if __name__ == '__main__':
         preload_model1()
     port = int(os.getenv('PORT', '8000'))
     print(f'Web ready on 127.0.0.1:{port}', flush=True)
-    ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
+    Server(('127.0.0.1', port), Handler).serve_forever()
