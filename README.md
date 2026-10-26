@@ -19,6 +19,16 @@ Unrecorded features include postnatal findings and require clinician interpretat
 Gene associations are displayed as associations, not proof of causality.
 This is a research/clinical-review tool, not a validated diagnostic device.
 
+## Cases sent to the lab
+After matching, a doctor can send the case to the lab ("Gửi sang Lab"): ultrasound description, reviewed HPO with
+status, the diseases chosen for the lab sheet and the WES genes. Lab accounts and admins see every sent case, set its
+status (Mới gửi / Lab đã nhận / Đang xét nghiệm / Có kết quả) and a note the doctor sees; a doctor sees the cases they
+sent and may withdraw them. The lab can open a case in its workspace to run the matching again, or print the sheet.
+Cases stay in `~/prenatal_pubcasefinder/.deployment/lab_cases.json` (mode 600, `WEB_LAB_CASES_FILE`) until a lab
+account, an admin or the sender deletes them; deleting the doctor's account keeps them. This is the only case content
+the server stores, and it is not encrypted at rest: use case codes, never patient names. The audit log records who
+sent, updated or deleted which case id, never the content.
+
 ## Layout
 - `docs/`: dependency-free HTML/CSS/JavaScript published by GitHub Pages.
 - `backend/`: Python HTTP boundary, existing matching engine, assertion rules and strict Model 1 runner.
