@@ -63,7 +63,8 @@
       parts.push(el('h3', {class:'account-sub'}, data.users.length + ' tài khoản · ' + online.size + ' đang online'));
       for (const u of data.users) {
         const self = u.username === user?.username;
-        const state = u.disabled ? ['Đã khóa', 'locked'] : u.must_change ? ['Chờ đặt mật khẩu', 'pending'] : ['Hoạt động', 'active'];
+        const state = u.disabled ? ['Đã khóa', 'locked'] : u.temp_expired ? ['Mật khẩu tạm hết hạn', 'locked']
+          : u.must_change ? ['Chờ đặt mật khẩu', 'pending'] : ['Hoạt động', 'active'];
         const role = roleSelect(u.role, {'aria-label':'Vai trò của ' + u.username});
         role.onchange = () => {
           if (!confirm('Đổi vai trò của ' + u.username + ' thành ' + data.roles[role.value] + '?')) { role.value = u.role; return; }
@@ -113,7 +114,7 @@
           if (!confirm('Buộc ' + s.username + ' đăng xuất trên mọi thiết bị' + (s.username === user?.username ? ' khác' : '') + '?')) return;
           act(() => api('/api/admin/sessions/end', {username:s.username}, 20000), r => 'Đã đăng xuất ' + r.ended + ' phiên của ' + s.username + '.');
         }}, 'Buộc đăng xuất')));
-      return el('div', {}, el('p', {class:'hint'}, data.sessions.length + ' phiên đang mở. Phiên tự hết sau 4 giờ không thao tác hoặc 12 giờ kể từ khi đăng nhập; khởi động lại dịch vụ thì mọi người đăng nhập lại.'), rows);
+      return el('div', {}, el('p', {class:'hint'}, data.sessions.length + ' phiên đang mở. Phiên tự hết sau ' + (data.idle_minutes || 60) + ' phút không thao tác hoặc ' + (data.session_hours || 12) + ' giờ kể từ khi đăng nhập; khởi động lại dịch vụ thì mọi người đăng nhập lại.'), rows);
     },
 
     async audit() {

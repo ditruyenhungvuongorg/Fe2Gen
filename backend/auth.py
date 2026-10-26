@@ -40,6 +40,14 @@ def _env_int(name, default):
         return int(default)
 
 
+def _env_float(name, default):
+    try:
+        value = float(os.getenv(name, default))
+        return value if value > 0 else float(default)
+    except ValueError:
+        return float(default)
+
+
 LOCK_AFTER, LOCK_BASE, LOCK_MAX = 5, 60, _env_int('WEB_LOCK_MAX_SECONDS', 300)
 GLOBAL_FAILURES, GLOBAL_WINDOW = 30, 60
 COMMON_PASSWORDS = {
@@ -103,7 +111,14 @@ def public_user(username, user):
     """What may leave the server about an account: never the password hash or the TOTP secret."""
     return {'username': username, 'name': user.get('name') or username, 'role': user.get('role', 'doctor'),
             'disabled': bool(user.get('disabled')), 'must_change': bool(user.get('must_change')),
-            'created': user.get('created', ''), 'last_login': user.get('last_login', ''), 'totp': has_totp(user)}
+            'created': user.get('created', ''), 'last_login': user.get('last_login', ''), 'totp': has_totp(user),
+            'temp_expired': temp_expired(user)}
+
+
+def temp_expired(user, now=None):
+    """A temporary password past its 'temp_until' (accounts made before this field never expire)."""
+    until = user.get('temp_until') if user.get('must_change') else None
+    return bool(until) and (time.time() if now is None else now) > until
 
 
 class StoreError(ValueError):
@@ -213,7 +228,7 @@ class Auth:
 
     PENDING_SECONDS, TOTP_TRIES = 300, 5  # second step of a login: 5 minutes, 5 codes
 
-    def __init__(self, store=None, token=None, session_hours=12, idle_hours=4, require_accounts=None, admin_2fa=None):
+    def __init__(self, store=None, token=None, session_hours=None, idle_hours=None, require_accounts=None, admin_2fa=None):
         self.store = store or UserStore()
         self.token = os.getenv('WEB_ACCESS_TOKEN', '') if token is None else token
         self.require_accounts = (env_flag('WEB_REQUIRE_ACCOUNTS', '1') if require_accounts is None
@@ -221,7 +236,12 @@ class Auth:
         # WEB_ADMIN_2FA_REQUIRED (default on): an admin session without a verified second factor can only set one up.
         self.admin_2fa = env_flag('WEB_ADMIN_2FA_REQUIRED', '1') if admin_2fa is None else bool(admin_2fa)
         self.pending = {}    # sha256(pending token) -> {"user", "created", "tries"}: password right, code not yet
+        # WEB_SESSION_HOURS (12) from login; WEB_IDLE_MINUTES (60) without a request; the page logs out by itself
+        # at the same idle limit. WEB_TEMP_PASSWORD_HOURS (72): a one-time password not used by then stops working.
+        session_hours = _env_float('WEB_SESSION_HOURS', 12) if session_hours is None else session_hours
+        idle_hours = _env_float('WEB_IDLE_MINUTES', 60) / 60 if idle_hours is None else idle_hours
         self.session_seconds, self.idle_seconds = session_hours * 3600, idle_hours * 3600
+        self.temp_seconds = _env_float('WEB_TEMP_PASSWORD_HOURS', 72) * 3600
         self.lock = threading.Lock()
         self.sessions = {}   # sha256(token) -> {"user", "name", "role", "must_change", "created", "seen"}
         self.failures = {}   # username -> (count, locked_until, last_failure)
@@ -272,6 +292,8 @@ class Auth:
             with self.lock:
                 self._failed(username, now)
             raise LoginRefused('Tên đăng nhập hoặc mật khẩu không đúng.')
+        if temp_expired(user, now):
+            raise LoginRefused('Mật khẩu tạm đã hết hạn; nhờ quản trị viên đặt lại.', 'temp_password_expired')
         if has_totp(user):  # the wrong-password count is cleared only once the code is right too
             pending = secrets.token_urlsafe(32)
             with self.lock:
@@ -352,7 +374,8 @@ class Auth:
     def describe(self, s):
         """The session as the page sees it."""
         return {'username': s['user'], 'name': s['name'], 'role': s['role'], 'must_change': s['must_change'],
-                'totp': bool(s.get('totp')), 'needs_2fa': self.needs_2fa(s)}
+                'totp': bool(s.get('totp')), 'needs_2fa': self.needs_2fa(s),
+                'session_idle_minutes': round(self.idle_seconds / 60)}
 
     # ------------------------------------------------------------------ second factor (TOTP)
     def totp_setup(self, token):
@@ -496,6 +519,7 @@ class Auth:
 
         def apply(users):
             users[s['user']].update(password=digest, must_change=False)
+            users[s['user']].pop('temp_until', None)
         self.store.modify(apply)
         s['must_change'] = False
         self.end_sessions(s['user'], keep=token)  # other devices log in again with the new password
@@ -515,6 +539,7 @@ class Auth:
             if username in users:
                 raise ValueError('Tên đăng nhập đã có.')
             users[username] = {'name': name, 'role': role, 'password': hash_password(temp), 'disabled': False,
+                               'temp_until': int(time.time() + self.temp_seconds),
                                'must_change': True, 'created': time.strftime('%Y-%m-%d %H:%M')}
         self.store.modify(add)
         return temp
@@ -550,7 +575,8 @@ class Auth:
         def apply(users):
             if username not in users:
                 raise ValueError('Không có tài khoản ' + str(username))
-            users[username].update(password=hash_password(temp), must_change=True)
+            users[username].update(password=hash_password(temp), must_change=True,
+                                   temp_until=int(time.time() + self.temp_seconds))
         self.store.modify(apply)
         self.end_sessions(username)
         with self.lock:

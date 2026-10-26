@@ -18,7 +18,7 @@ from web_service import WebSystem
 
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT.parent / 'docs'
-STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/config.js', '/case-state.js',
+STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/config.js', '/case-state.js', '/security-state.js',
                 '/fonts/BeVietnamPro-Regular.ttf', '/fonts/BeVietnamPro-SemiBold.ttf', '/fonts/OFL.txt',
                 '/fonts/Inter-vietnamese.woff2', '/fonts/Inter-latin-ext.woff2', '/fonts/Inter-latin.woff2', '/fonts/OFL-Inter.txt')
 SYSTEM = WebSystem()
@@ -366,7 +366,8 @@ class Handler(SimpleHTTPRequestHandler):
                 token, user = AUTH.login(name, payload.get('password'))
         except LoginRefused as exc:
             AUDIT.write(exc.event, who)
-            return self.send_json({'error': str(exc)}, 401 if exc.event in ('login_fail', 'totp_fail', 'totp_expired') else 429)
+            code = 401 if exc.event in ('login_fail', 'totp_fail', 'totp_expired') else 403 if exc.event == 'temp_password_expired' else 429
+            return self.send_json({'error': str(exc)}, code)
         RATES['login'].give_back(source_key)  # only failed attempts use up the source's budget
         RATES['login_user'].give_back(user_key)
         if token is None:  # password right; the code comes next
@@ -399,7 +400,9 @@ class Handler(SimpleHTTPRequestHandler):
             AUDIT.write('logout', self.user)
         if AUTH.mode == 'accounts' and not AUTH.active(LOGOUT_GRACE_SECONDS, GPU_ROLES):
             Thread(target=SYSTEM.runner.stop, args=('không còn bác sĩ đăng nhập',), daemon=True).start()
-        self.send_json({'ok': True})
+        # Shared hospital computers: drop anything the browser cached from this origin ("storage" would also
+        # erase the saved server address, so only the cache).
+        self.send_json({'ok': True}, headers={'Clear-Site-Data': '"cache"'})
 
     def change_password(self, payload):
         if not self.session:
@@ -431,7 +434,8 @@ class Handler(SimpleHTTPRequestHandler):
                      for name, u in sorted(AUTH.store.all().items())]
             return self.send_json({'users': users, 'roles': ROLES})
         if path == '/api/admin/sessions':
-            return self.send_json({'sessions': AUTH.list_sessions()})
+            return self.send_json({'sessions': AUTH.list_sessions(), 'idle_minutes': round(AUTH.idle_seconds / 60),
+                                   'session_hours': round(AUTH.session_seconds / 3600, 1)})
         if path == '/api/admin/audit':
             first = lambda key: query.get(key, [''])[0]
             try:

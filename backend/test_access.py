@@ -28,7 +28,7 @@ if 'FE2GEN_TEST_DIR' not in os.environ:
 
 from accesslog import AccessLog
 from audit import AuditLog
-from auth import Auth, UserStore, check_password, hash_password, password_problem, temporary_password
+from auth import Auth, UserStore, check_password, hash_password, password_problem, public_user, temporary_password
 from model1_process import Model1Process, ModelProcessError, ModelUnavailable
 
 FAKE = [sys.executable, '-c', 'import sys, model1_process, test_access; '
@@ -967,6 +967,77 @@ class TotpTests(unittest.TestCase):
         with patch('sys.stdout', StringIO()):
             manage_users.main(['totp-reset', 'quan.tri', '--file', str(self.store.path)])
         self.assertNotIn('totp', self.store.all()['quan.tri'])
+
+
+class SessionPolicyTests(unittest.TestCase):
+    """B12/B13/B16: configurable idle and session limits, temporary passwords expire, logout clears the cache."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_idle_and_session_limits_from_environment(self):
+        with patch.dict(os.environ, {'WEB_IDLE_MINUTES': '30', 'WEB_SESSION_HOURS': '8'}):
+            a = Auth(self.store)
+        self.assertEqual((a.idle_seconds, a.session_seconds), (1800, 8 * 3600))
+        with patch.dict(os.environ, {}):
+            for k in ('WEB_IDLE_MINUTES', 'WEB_SESSION_HOURS'):
+                os.environ.pop(k, None)
+            a = Auth(self.store)
+        self.assertEqual((a.idle_seconds, a.session_seconds), (3600, 12 * 3600))  # defaults: 60 min, 12 h
+        token, _ = a.login('bs.an', 'mat-khau-bs.an')
+        self.assertEqual(a.describe(a.session(token))['session_idle_minutes'], 60)
+        a.sessions[a._key(token)]['seen'] -= 3601
+        self.assertFalse(a.check('Bearer ' + token)[0])
+
+    def test_temporary_password_expires(self):
+        with patch.dict(os.environ, {'WEB_TEMP_PASSWORD_HOURS': '72'}):
+            a = Auth(self.store)
+        temp = a.create_user('lab.mot', 'Lab 1', 'lab')
+        until = self.store.all()['lab.mot']['temp_until']
+        self.assertAlmostEqual(until, time.time() + 72 * 3600, delta=60)
+        self.assertTrue(a.login('lab.mot', temp)[1]['must_change'])          # still valid
+        self.store.modify(lambda u: u['lab.mot'].update(temp_until=int(time.time()) - 1))
+        with self.assertRaisesRegex(PermissionError, 'hết hạn') as caught:
+            a.login('lab.mot', temp)
+        self.assertEqual(caught.exception.event, 'temp_password_expired')
+        with self.assertRaisesRegex(PermissionError, 'không đúng'):           # a wrong password says nothing more
+            a.login('lab.mot', 'sai-mat-khau-tam')
+        new_temp = a.reset_password('lab.mot')                               # the admin issues a new one
+        token, _ = a.login('lab.mot', new_temp)
+        a.change_password(token, new_temp, 'mây trắng bay qua đồi')
+        self.assertNotIn('temp_until', self.store.all()['lab.mot'])
+        self.assertFalse(public_user('lab.mot', self.store.all()['lab.mot'])['temp_expired'])
+        legacy = {'name': 'x', 'password': hash_password('mat-khau-legacy'), 'must_change': True}  # made before the field
+        self.store.modify(lambda u: u.update({'cu.ma': legacy}))
+        self.assertTrue(a.login('cu.ma', 'mat-khau-legacy')[1]['must_change'])
+
+    def test_expired_temporary_password_over_http(self):
+        audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+        auth = Auth(self.store, admin_2fa=False)
+        temp = auth.create_user('bs.binh', 'BS. Bình', 'doctor')
+        self.store.modify(lambda u: u['bs.binh'].update(temp_until=1))
+        with LiveServer(AUTH=auth, AUDIT=audit) as srv:
+            code, data = srv.call('/api/login', {'username': 'bs.binh', 'password': temp})
+            self.assertEqual(code, 403)
+            self.assertIn('nhờ quản trị viên đặt lại', data['error'])
+            admin = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})[1]['token']
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin)[1]['users']}
+            self.assertTrue(users['bs.binh']['temp_expired'])
+            sessions = srv.call('/api/admin/sessions', token=admin)[1]
+            self.assertEqual((sessions['idle_minutes'], sessions['session_hours']), (60, 12))
+        self.assertIn('temp_password_expired', [e['event'] for e in audit.tail()])
+
+    def test_logout_clears_site_cache(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=AuditLog(Path(self.dir.name, 'audit.jsonl'))) as srv:
+            token = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})[1]['token']
+            req = urllib.request.Request(srv.base + '/api/logout', data=b'{}', method='POST',
+                                         headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.headers['Clear-Site-Data'], '"cache"')
 
 
 class FailClosedTests(unittest.TestCase):

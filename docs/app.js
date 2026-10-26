@@ -27,7 +27,7 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
     let data;
     try { data = await response.json(); } catch { throw Error('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.'); }
     if (!response.ok) {
-      if (response.status === 401 && authMode === 'accounts' && access && path !== '/api/login') sessionEnded();
+      if (response.status === 401 && authMode === 'accounts' && access && user && !path.startsWith('/api/login')) sessionEnded();
       if (response.status === 403 && data.must_change && user) { user.must_change = true; openAccount(); }
       if (response.status === 403 && data.needs_2fa && user) { user.needs_2fa = true; openAccount(); }
       showModel(data);
@@ -475,7 +475,7 @@ $('login-form').onsubmit=async e=>{
   try{
     const data=pendingLogin?await api('/api/login/totp',{pending:pendingLogin,code},30000):await api('/api/login',{username,password},30000);
     if(data.second_factor){pendingLogin=data.pending;showGate('code');return;}
-    pendingLogin='';access=data.token;user=data.user;lastModel=data;
+    pendingLogin='';access=data.token;user=data.user;lastModel=data;lastActivity=Date.now();
     showUser();showGate(null);notice('');
     if(user.must_change||user.needs_2fa)openAccount();
   }catch(err){
@@ -486,6 +486,32 @@ $('login-form').onsubmit=async e=>{
   finally{$('login-submit').disabled=false;$('login-password').value='';$('login-code').value='';}
 };
 $('login-retry').onclick=()=>{showGate('checking');checkConnection();};
+// Idle logout (B27): after WEB_IDLE_MINUTES without a click, key or scroll (and no request in flight) the page
+// logs out and clears the case, with a 60-second warning. Timers slow down in hidden tabs, so the check also runs
+// when the tab becomes visible again; it compares wall-clock times, not ticks.
+let lastActivity=Date.now();
+for(const ev of ['pointerdown','keydown','input','wheel','touchstart'])
+  document.addEventListener(ev,()=>{lastActivity=Date.now();if(!$('idle-warning').hidden)$('idle-warning').hidden=true;},{capture:true,passive:true});
+function idleTick(){
+  if(!user||!access){$('idle-warning').hidden=true;return;}
+  const minutes=user.session_idle_minutes||60;
+  const step=SecurityState.idleStep({now:Date.now(),lastActivity,idleMs:minutes*60000,busy:requests.size>0});
+  lastActivity=step.lastActivity;
+  if(step.state==='expired')return autoLogout(minutes);
+  $('idle-warning').hidden=step.state!=='warn';
+  if(step.state==='warn')$('idle-warning').textContent='Không thao tác: tự đăng xuất và xóa ca sau '+Math.ceil(step.remainingMs/1000)+' giây. Bấm hoặc gõ phím bất kỳ để tiếp tục.';
+}
+async function autoLogout(minutes){
+  user=null;showUser();$('idle-warning').hidden=true;
+  for(const d of ['account','admin','settings','lab'])if($(d).open)$(d).close();
+  resetCase();
+  showGate('login','Đã tự đăng xuất sau '+minutes+' phút không thao tác; nội dung ca đã được xóa khỏi tab này.');
+  const token=access;
+  try{await api('/api/logout',{},15000);}catch{}
+  if(access===token)access='';
+}
+setInterval(idleTick,1000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)idleTick();});
 $('login-server').onclick=()=>openSettings();
 renderSelected();showGate('checking');checkConnection();
 

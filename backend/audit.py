@@ -21,6 +21,7 @@ EVENTS = {
     'rate_limited': 'Vượt giới hạn tốc độ', 'login_unlocked': 'Gỡ khóa đăng nhập',
     'totp_enabled': 'Bật xác thực 2 lớp', 'totp_fail': 'Nhập sai mã 2 lớp', 'totp_expired': 'Hết hạn bước mã 2 lớp',
     'totp_backup_used': 'Dùng mã dự phòng 2 lớp', 'totp_reset': 'Đặt lại xác thực 2 lớp',
+    'temp_password_expired': 'Mật khẩu tạm đã hết hạn',
 }
 
 
