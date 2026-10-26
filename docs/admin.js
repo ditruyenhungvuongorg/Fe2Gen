@@ -99,7 +99,7 @@
               if (!confirm('Đặt lại mật khẩu của ' + u.username + '? Người này bị đăng xuất và nhận mật khẩu tạm mới.')) return;
               act(async () => { temp = await api('/api/admin/users/reset', {username:u.username}, 20000); }, () => 'Đã đặt lại mật khẩu ' + u.username + '.');
             }}, 'Đặt lại mật khẩu'),
-            u.totp_enabled === false ? null : el('button', {type:'button', class:'quiet', onclick:() => {
+            u.totp_enabled === false || self ? null : el('button', {type:'button', class:'quiet', onclick:() => {  // the server refuses resetting one's own 2FA
               if (!confirm('Đặt lại xác thực 2 lớp của ' + u.username + '? Ứng dụng trên điện thoại cũ và các mã dự phòng hết hiệu lực; ' +
                 (u.role === 'admin' ? 'tài khoản quản trị phải bật lại 2FA ngay khi đăng nhập.' : 'người này đăng nhập chỉ bằng mật khẩu cho đến khi tự bật lại.'))) return;
               act(async () => {

@@ -44,7 +44,7 @@ def code(secret, t=None, step=STEP, digits=DIGITS):
 def verify(secret, given, t=None, window=1, after=None):
     """The time step that given matches within +/- window steps, or None. Every candidate is compared in
     constant time and none is skipped early. after: the last step already used, so a code cannot be replayed."""
-    given = ''.join(str(given or '').split())
+    given = ''.join(str(given or '').split()).replace('-', '')
     if len(given) != DIGITS or not given.isdigit():
         return None
     now = counter(t)
@@ -66,5 +66,15 @@ def backup_codes(n=8):
     return [c[:4] + '-' + c[4:] for c in raw]
 
 
+def normalize_backup(given):
+    """A backup code as stored: no spaces or dashes, lower case ("K7MQ-X2RF" -> "k7mqx2rf")."""
+    return ''.join(str(given or '').split()).replace('-', '').lower()
+
+
+def is_backup_shape(given):
+    code = normalize_backup(given)
+    return len(code) == 8 and code.isascii() and code.isalnum()
+
+
 def hash_backup(given):
-    return hashlib.sha256(''.join(str(given or '').lower().split()).replace('-', '').encode()).hexdigest()
+    return hashlib.sha256(normalize_backup(given).encode()).hexdigest()

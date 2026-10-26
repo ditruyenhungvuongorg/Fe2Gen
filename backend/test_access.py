@@ -858,7 +858,8 @@ class TotpTests(unittest.TestCase):
             token = admin['token']
             code, data = srv.call('/api/admin/users', token=token)
             self.assertEqual((code, data.get('totp_required')), (403, True))
-            self.assertEqual(srv.call('/api/change_password', {'old_password': 'x', 'new_password': 'y'}, token)[0], 403)
+            # changing the password is allowed before 2FA is on (here refused only because the old one is wrong)
+            self.assertEqual(srv.call('/api/change_password', {'old_password': 'x', 'new_password': 'y'}, token)[0], 422)
             session = srv.call('/api/session', token=token)[1]
             self.assertEqual((session['totp_required'], session['idle_minutes']), (True, 60))
             self.assertEqual(srv.call('/api/admin/users/create', {'username': 'x.y', 'role': 'lab'}, token)[0], 403)
@@ -1234,7 +1235,7 @@ class ApiContractTests(unittest.TestCase):
             for _ in range(5):
                 srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})
             users = {u['username']: u for u in srv.call('/api/admin/users', token=admin['token'])[1]['users']}
-            self.assertRegex(users['bs.an']['locked_until'], r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$')
+            self.assertRegex(users['bs.an']['locked_until'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$')
             self.assertEqual(users['quan.tri']['locked_until'], '')
             self.assertEqual(srv.call('/api/admin/users/unlock', {'username': 'bs.an'}, admin['token'])[1]['ok'], True)
             session = srv.call('/api/session', token=admin['token'])[1]
@@ -1243,6 +1244,91 @@ class ApiContractTests(unittest.TestCase):
                 self.assertIn(key, session)
             gpu = srv.call('/api/admin/gpu', token=admin['token'])[1]
             self.assertEqual(gpu['idle_minutes'], 60)  # admin.js reads the GPU idle time under this name
+
+
+class ContractAlignmentTests(unittest.TestCase):
+    """What docs/app.js, twofactor.js and admin.js read from the API after merging the front-end branch."""
+
+    ORIGIN = 'https://ditruyenhungvuongorg.github.io'
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def login(self, srv, name, password=None):
+        code, data = srv.call('/api/login', {'username': name, 'password': password or 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data
+
+    def enable(self, srv, token):
+        import totp
+        secret = srv.call('/api/totp/setup', {}, token)[1]['secret']
+        return secret, srv.call('/api/totp/enable', {'code': totp.code(secret)}, token)[1]['backup_codes']
+
+    def test_cross_origin_page_can_read_retry_after(self):
+        with patch.dict(os.environ, {'WEB_ALLOWED_ORIGINS': self.ORIGIN}), \
+                LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(hpo_search=1)) as srv:
+            token = self.login(srv, 'bs.an')['token']
+            headers = {'Origin': self.ORIGIN, 'Authorization': 'Bearer ' + token}
+            urllib.request.urlopen(urllib.request.Request(srv.base + '/api/hpo_search?q=a', headers=headers), timeout=30).close()
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(urllib.request.Request(srv.base + '/api/hpo_search?q=a', headers=headers), timeout=30)
+            e = caught.exception
+            self.assertEqual(e.code, 429)
+            self.assertIn('Retry-After', [h.strip() for h in e.headers['Access-Control-Expose-Headers'].split(',')])
+            self.assertEqual(int(e.headers['Retry-After']), json.loads(e.read())['retry_after'])
+
+    def test_admin_without_2fa_changes_password_then_sets_up_2fa(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            token = self.login(srv, 'quan.tri')['token']
+            code, out = srv.call('/api/change_password', {'old_password': 'mat-khau-quan.tri',
+                                                          'new_password': 'gió nam thổi qua sông'}, token)
+            self.assertEqual(code, 200, out)
+            self.assertTrue(out['user']['totp_required'])                     # still asked to turn 2FA on
+            self.assertEqual(srv.call('/api/admin/users', token=token)[0], 403)
+            self.assertEqual(srv.call('/api/totp/setup', {}, token)[0], 200)
+
+    def test_admin_users_and_session_fields(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertEqual((admin['session_hours'], admin['idle_minutes']), (12, 60))
+            session = srv.call('/api/session', token=admin['token'])[1]
+            self.assertEqual((session['session_hours'], session['idle_minutes']), (12, 60))
+            self.enable(srv, self.login(srv, 'bs.an')['token'])
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin['token'])[1]['users']}
+            self.assertIs(users['bs.an']['totp_enabled'], True)
+            self.assertIs(users['quan.tri']['totp_enabled'], False)
+            self.assertTrue(all('locked_until' in u for u in users.values()))
+
+    def test_cancelled_or_unknown_pending_says_so(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            self.enable(srv, self.login(srv, 'bs.an')['token'])
+            pending = self.login(srv, 'bs.an')['pending']
+            answers = [srv.call('/api/login/totp', {'pending': pending, 'code': '000000'}) for _ in range(5)]
+            self.assertEqual([c for c, _ in answers], [401] * 5)
+            self.assertEqual([bool(d.get('pending_invalid')) for _, d in answers], [False] * 4 + [True])
+            code, again = srv.call('/api/login/totp', {'pending': pending, 'code': '000000'})
+            self.assertEqual((code, again.get('pending_invalid')), (401, True))
+            code, unknown = srv.call('/api/login/totp', {'pending': 'khong-co', 'code': '123456'})
+            self.assertEqual((code, unknown.get('pending_invalid')), (401, True))
+
+    def test_backup_code_ignores_case_spaces_and_dashes(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            secret, backup = self.enable(srv, self.login(srv, 'bs.an')['token'])
+            for typed in (' ' + backup[0].upper().replace('-', ' ') + ' ', backup[1].replace('-', ''), backup[2]):
+                pending = self.login(srv, 'bs.an')['pending']
+                code, out = srv.call('/api/login/totp', {'pending': pending, 'code': typed})
+                self.assertEqual(code, 200, (typed, out))
+            pending = self.login(srv, 'bs.an')['pending']
+            self.assertEqual(srv.call('/api/login/totp', {'pending': pending, 'code': backup[0]})[0], 401)  # used once
+            later = totp.code(secret, time.time() + 30)  # the next step: the enabling code's step is already used
+            code, out = srv.call('/api/login/totp', {'pending': pending, 'code': later[:3] + ' ' + later[3:]})
+            self.assertEqual(code, 200, out)                                   # "123 456" from the app also works
 
 
 class FailClosedTests(unittest.TestCase):

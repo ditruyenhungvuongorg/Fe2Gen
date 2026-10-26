@@ -62,9 +62,11 @@ TEMP_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'  # no 0/o, 1/l/i
 
 
 class LoginRefused(PermissionError):
-    def __init__(self, message, event='login_fail'):
+    def __init__(self, message, event='login_fail', pending_invalid=None):
         super().__init__(message)
         self.event = event
+        # The pending second step no longer exists (expired, cancelled after 5 wrong codes, raced by another tab).
+        self.pending_invalid = event == 'totp_expired' if pending_invalid is None else pending_invalid
 
 
 def hash_password(password, salt=None):
@@ -361,10 +363,10 @@ class Auth:
             with self.lock:
                 self.pending.pop(key, None)
             raise LoginRefused('Bước xác thực đã hết hạn. Vui lòng đăng nhập lại.', 'totp_expired')
-        cfg, given = user['totp'], str(given or '').strip()[:20]
+        cfg, given = user['totp'], str(given or '').strip()[:40]
         step = totp.verify(cfg['secret'], given, t=now, after=cfg.get('last'))
         backup = None
-        if step is None and len(given.replace('-', '')) == 8:
+        if step is None and totp.is_backup_shape(given):  # "K7MQ-X2RF", "k7mq x2rf", "k7mqx2rf" are the same code
             digest = totp.hash_backup(given)
             backup = next((h for h in cfg.get('backup', []) if hmac.compare_digest(h, digest)), None)
         if step is None and backup is None:
@@ -374,7 +376,8 @@ class Auth:
                 gone = p['tries'] >= self.TOTP_TRIES
                 if gone:
                     self.pending.pop(key, None)
-            raise LoginRefused('Mã xác thực không đúng.' + (' Vui lòng đăng nhập lại.' if gone else ''), 'totp_fail')
+            raise LoginRefused('Mã xác thực không đúng.' + (' Vui lòng đăng nhập lại.' if gone else ''), 'totp_fail',
+                               pending_invalid=gone)
 
         def spend(users):
             t = users.get(username, {}).get('totp') or {}
@@ -423,7 +426,7 @@ class Auth:
     def session_fields(self, s):
         """Top-level fields of /api/session and the login answer (also without a personal session)."""
         return {'totp_enabled': bool(s and s.get('totp')), 'totp_required': self.needs_2fa(s),
-                'idle_minutes': round(self.idle_seconds / 60)}
+                'idle_minutes': round(self.idle_seconds / 60), 'session_hours': round(self.session_seconds / 3600, 1)}
 
     # ------------------------------------------------------------------ second factor (TOTP)
     def totp_setup(self, token):
@@ -479,7 +482,7 @@ class Auth:
             raise ValueError('Tài khoản quản trị phải giữ xác thực 2 lớp. Đổi điện thoại: nhờ quản trị viên khác đặt lại.')
         if not check_password(str(password or '')[:200], user['password']):
             raise ValueError('Mật khẩu hiện tại không đúng.')
-        cfg, given = user['totp'], str(given or '').strip()[:20]
+        cfg, given = user['totp'], str(given or '').strip()[:40]
         if totp.verify(cfg['secret'], given, after=cfg.get('last')) is None and not any(
                 hmac.compare_digest(h, totp.hash_backup(given)) for h in cfg.get('backup', [])):
             raise ValueError('Mã xác thực không đúng.')

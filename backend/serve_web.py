@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 import time
+from datetime import datetime
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import BoundedSemaphore, Thread, Timer
@@ -52,9 +53,9 @@ PERMISSIONS_POLICY = 'camera=(), microphone=(), geolocation=(), payment=(), usb=
 HSTS = os.getenv('WEB_HSTS', '1') != '0'
 # With a temporary password, only these work until the user sets a new one.
 FIRST_LOGIN_PATHS = ('/api/session', '/api/change_password', '/api/logout')
-# An admin without a verified second factor (WEB_ADMIN_2FA_REQUIRED=1) can only set one up. A temporary password
-# is changed first (FIRST_LOGIN_PATHS), then this applies.
-SECOND_FACTOR_PATHS = ('/api/session', '/api/totp/setup', '/api/totp/enable', '/api/logout')
+# An admin without a verified second factor (WEB_ADMIN_2FA_REQUIRED=1) can only set one up (or change the password).
+# A temporary password is changed first (FIRST_LOGIN_PATHS), then this applies.
+SECOND_FACTOR_PATHS = ('/api/session', '/api/totp/setup', '/api/totp/enable', '/api/change_password', '/api/logout')
 
 class Handler(SimpleHTTPRequestHandler):
     extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.woff2': 'font/woff2'}
@@ -121,6 +122,7 @@ class Handler(SimpleHTTPRequestHandler):
         origin = self.headers.get('Origin')
         if origin and self.allowed_origin():
             self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Access-Control-Expose-Headers', 'Retry-After')  # the page says how long to wait on 429
             self.send_header('Vary', 'Origin')
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
@@ -370,7 +372,8 @@ class Handler(SimpleHTTPRequestHandler):
         except LoginRefused as exc:
             AUDIT.write(exc.event, who)
             code = 401 if exc.event in ('login_fail', 'totp_fail', 'totp_expired') else 403 if exc.event == 'temp_password_expired' else 429
-            return self.send_json({'error': str(exc)}, code)
+            # pending_invalid: the second step was cancelled (5 wrong codes) or expired; the page starts from the password
+            return self.send_json({'error': str(exc), **({'pending_invalid': True} if exc.pending_invalid else {})}, code)
         RATES['login'].give_back(source_key)  # only failed attempts use up the source's budget
         RATES['login_user'].give_back(user_key)
         if token is None:  # password right; the code comes next
@@ -442,8 +445,8 @@ class Handler(SimpleHTTPRequestHandler):
         if path == '/api/admin/users':
             def lock(name):
                 until = AUTH.locked_until(name)
-                return {'login_locked': bool(until),
-                        'locked_until': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(until)) if until else ''}
+                return {'login_locked': bool(until),  # ISO 8601 with the offset: Date.parse reads it in every browser
+                        'locked_until': datetime.fromtimestamp(until).astimezone().isoformat(timespec='seconds') if until else ''}
             users = [{**public_user(name, u), **lock(name)} for name, u in sorted(AUTH.store.all().items())]
             return self.send_json({'users': users, 'roles': ROLES})
         if path == '/api/admin/sessions':
