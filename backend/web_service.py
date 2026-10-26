@@ -7,7 +7,7 @@ from collections import defaultdict
 from server import Fe2genSystem, normalize_text, BASE_DIR
 from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy, load_disease_xref
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
-from model1_process import Model1Process
+from model1_process import Model1Process, safe_input_error
 from model1_v6.runner import Model1V6Runner
 from model2_reranker import POOL, Reranker, candidate_features, load_validity
 
@@ -150,8 +150,12 @@ class WebSystem(Fe2genSystem):
             raise ValueError('Nhập đoạn mô tả từ 1 đến 6.000 ký tự.')
         if isinstance(self.runner, Model1V6Runner) or getattr(self.runner, 'kind', None) == 'v6':
             return self.extract_v6(text)
+        try:  # an in-process runner raises its own messages; only known fixed ones reach the doctor
+            spans = self.runner.extract_spans(text)
+        except ValueError as exc:
+            raise ValueError(safe_input_error(str(exc))) from None
         mentions = []
-        for span in self.runner.extract_spans(text):
+        for span in spans:
             phrase = span['mention_text']
             state, reason = self.assertion_engine.predict(text, span['span_start'], span['span_end'], phrase)
             context = re.split(r'[.;,\n]', text[:span['span_start']])[-1]
@@ -165,7 +169,10 @@ class WebSystem(Fe2genSystem):
 
     def extract_v6(self, text):
         """Findings + assertion from the v6 ensemble; HPO candidates in reranked order (ranking scores, not probabilities)."""
-        result = self.runner.extract(text)
+        try:
+            result = self.runner.extract(text)
+        except ValueError as exc:
+            raise ValueError(safe_input_error(str(exc))) from None
         labels = {'present': 'CÓ', 'suspected': 'NGHI NGỜ'}
         # v7 bundles run on this v6 runner and name their version in the manifest; earlier bundles carry none.
         version = getattr(self.runner, 'manifest', {}).get('model_version', 'v6')
@@ -191,7 +198,7 @@ class WebSystem(Fe2genSystem):
                              'mapping': 'doctor_reviewed_phrase' if reviewed else 'model1_v6_retriever_reranker' if choices else 'search_suggestion',
                              'approved': False})
         return {'mentions': mentions, 'engine': 'model1_v6_ensemble', 'model_version': version, 'review_required': True,
-                'warnings': result.get('errors', []), 'seconds': result.get('seconds')}
+                'warnings': [safe_input_error(e) for e in result.get('errors', [])], 'seconds': result.get('seconds')}
 
     def merge_equivalents(self, ranked):
         """Keep the best-ranked ID of each MONDO disease; the same choice as rank() with a resolver,

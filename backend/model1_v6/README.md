@@ -23,4 +23,26 @@ python -m model1_v6.build_bundle --source prod --research ~/model1_improve_ubunt
 ```
 
 Bật trên web bằng biến môi trường `MODEL1_V6_BUNDLE=<thư mục bundle>`; không đặt biến này thì web dùng extractor v3.8 như cũ.
+
+### Kiểm toàn vẹn bundle (SHA-256)
+
+`build_bundle.py` ghi `"sha256": {đường_dẫn_tương_đối: hex}` cho mọi file trong bundle (trừ `manifest.json`).
+Trước khi nạp trọng số, `runner.py` gọi `integrity.verify_bundle`: file thiếu hoặc lệch hash → Model 1 chuyển `failed`
+với lỗi `Bundle không khớp manifest: <tên file>` (xem `bash gpu.sh status` hoặc nhật ký dịch vụ). Kiểm mất vài giây mỗi lần nạp.
+
+| `MODEL1_REQUIRE_HASH` | Manifest thiếu `sha256` / file thiếu / lệch hash | File có trong thư mục nhưng không có trong manifest |
+|---|---|---|
+| `1` (mặc định) | dừng nạp | cảnh báo stderr |
+| `strict` | dừng nạp | dừng nạp |
+| `0` | chỉ cảnh báo stderr | cảnh báo stderr |
+
+Bundle dựng trước 26/10/2026 (ví dụ `model1_v7_prod`) chưa có hash. Kiểm lại nội dung bundle (so với máy train) rồi thêm hash:
+
+```
+python -m model1_v6.build_bundle --rehash ~/fe2gen_bundles/model1_v7_prod
+```
+
+Lệnh in `MODEL1_MANIFEST_SHA256`; đặt biến này (tùy chọn) trong môi trường dịch vụ để phát hiện cả việc sửa `manifest.json`.
+Trong lúc chưa rehash, có thể tạm đặt `MODEL1_REQUIRE_HASH=0`. Thư mục base model (`base_model_dir`, cache Hugging Face) nằm
+ngoài bundle nên không được kiểm ở đây.
 Kiểm chứng runner tái lập đúng số đã báo cáo (bundle `--source eval`): `python -m model1_v6.verify_on_test ...`.
