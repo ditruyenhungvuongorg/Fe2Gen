@@ -5,17 +5,19 @@
   python manage_users.py passwd bs.an
   python manage_users.py role bs.an --role lab
   python manage_users.py disable bs.an | enable bs.an | remove bs.an
+  python manage_users.py totp-reset quan.tri                          # lost phone: remove the second factor
   python manage_users.py list
 
 Passwords are asked interactively and stored as scrypt hashes. The running service rereads the file:
 no restart is needed, and a disabled or removed account is logged out at its next request.
-While the file lists no account, the service keeps using WEB_ACCESS_TOKEN.
+While the file lists no account (or cannot be read), the service refuses every API request (503) unless
+WEB_REQUIRE_ACCOUNTS=0 (local use), which falls back to WEB_ACCESS_TOKEN, then to no login.
 """
 import argparse
 import getpass
 import sys
 import time
-from auth import ROLES, USERNAME, UserStore, hash_password, password_problem
+from auth import ROLES, USERNAME, UserStore, has_totp, hash_password, password_problem
 
 
 def ask_password(username):
@@ -32,7 +34,7 @@ def ask_password(username):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Quản lý tài khoản web Fe2Gen.')
-    parser.add_argument('action', choices=['add', 'passwd', 'role', 'disable', 'enable', 'remove', 'list'])
+    parser.add_argument('action', choices=['add', 'passwd', 'role', 'disable', 'enable', 'remove', 'list', 'totp-reset'])
     parser.add_argument('username', nargs='?')
     parser.add_argument('--name', help='Tên hiển thị, ví dụ "BS. Nguyễn Văn An"')
     parser.add_argument('--role', choices=sorted(ROLES), help='admin (quản trị), doctor (bác sĩ, mặc định), lab (phòng Lab)')
@@ -44,7 +46,8 @@ def main(argv=None):
         print(f'{store.path}: {len(users)} tài khoản')
         for name, u in sorted(users.items()):
             state = 'ĐÃ KHÓA' if u.get('disabled') else 'chờ đổi mật khẩu' if u.get('must_change') else 'hoạt động'
-            print(f"  {name:<20} {u.get('name', ''):<28} {ROLES.get(u.get('role', 'doctor'), '?'):<10} {state}")
+            second = '2FA' if has_totp(u) else '-'
+            print(f"  {name:<20} {u.get('name', ''):<28} {ROLES.get(u.get('role', 'doctor'), '?'):<10} {second:<4} {state}")
         return 0
     username = (args.username or '').strip().lower()
     if not USERNAME.match(username):
@@ -67,6 +70,11 @@ def main(argv=None):
         users[username]['disabled'] = args.action == 'disable'
     elif args.action == 'remove':
         del users[username]
+    elif args.action == 'totp-reset':
+        if not users[username].pop('totp', None):
+            parser.error(username + ' chưa bật xác thực 2 lớp.')
+        print('Đã gỡ xác thực 2 lớp; các phiên đang mở của tài khoản này hết hiệu lực ở lần khởi động lại dịch vụ,'
+              ' hoặc dùng Trang quản trị → Buộc đăng xuất.')
     if args.name and args.action != 'add' and username in users:
         users[username]['name'] = args.name
     store.save(users)

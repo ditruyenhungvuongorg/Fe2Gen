@@ -1,0 +1,6 @@
+# Changes to the published site and to the authentication/serving code need the repository owner's review.
+/docs/                  @ditruyenhungvuongorg
+/backend/auth.py        @ditruyenhungvuongorg
+/backend/serve_web.py   @ditruyenhungvuongorg
+# CI and supply-chain files decide what is checked, so they are reviewed too.
+/.github/               @ditruyenhungvuongorg

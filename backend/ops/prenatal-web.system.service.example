@@ -1,0 +1,98 @@
+# prenatal-web as a SYSTEM service under the dedicated account fe2gen (no sudo; groups video, render).
+# Use it only after backend/ops/separate_user.md (option B). Install:
+#   sudo cp prenatal-web.system.service.example /etc/systemd/system/prenatal-web.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now prenatal-web
+#   sudo systemd-analyze security prenatal-web
+# Paths assume /home/fe2gen and a symlink .../prenatal_pubcasefinder/current -> the release being served.
+# %h is NOT used: in a system unit it is root's home, whatever User= says.
+#
+# Which hardening directive works where (systemd 255, Ubuntu 24.04):
+#   directive                                         --user unit (deploy_ubuntu.sh)        system unit (this file)
+#   NoNewPrivileges, RestrictSUIDSGID, RestrictRealtime,
+#   LockPersonality, RestrictNamespaces,
+#   SystemCallArchitectures, SystemCallFilter,
+#   RestrictAddressFamilies                           yes (seccomp/prctl, unprivileged)     yes
+#   LimitNOFILE                                       yes (rlimit)                          yes
+#   MemoryMax                                         yes if user@.service delegates the     yes
+#                                                     memory controller (Ubuntu default)
+#   ProtectSystem, ProtectHome, ReadWritePaths,
+#   PrivateTmp, ProtectKernelTunables/Modules/Logs,
+#   ProtectControlGroups                              only through an implied PrivateUsers=yes yes
+#                                                     (unprivileged user namespace); AppArmor
+#                                                     userns restriction may refuse it ->
+#                                                     226/NAMESPACE (deploy falls back to basic)
+#   DevicePolicy, DeviceAllow                         ignored (needs a cgroup BPF program)  yes
+#   IPAddressDeny/IPAddressAllow                      ignored (BPF)                         yes
+#   CapabilityBoundingSet, ProtectClock,
+#   ProtectHostname, ProtectProc                      no effect / not available             yes
+# Not used anywhere: MemoryDenyWriteExecute (breaks the CUDA/triton JIT), PrivateDevices (hides /dev/nvidia*),
+# ProcSubset=pid (hides /proc/driver/nvidia used by CUDA and nvidia-smi).
+# The /dev/nvidia-uvm* nodes must exist before the service starts (nvidia-persistenced, or once:
+# sudo nvidia-modprobe -u -c=0); with DevicePolicy=closed a node created later is not allowed until a restart.
+
+[Unit]
+Description=Prenatal phenotype web service (system service, user fe2gen)
+Wants=network-online.target
+After=network-online.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=fe2gen
+Group=fe2gen
+SupplementaryGroups=video render
+WorkingDirectory=/home/fe2gen/prenatal_pubcasefinder/current/backend
+Environment=UNSLOTH_COMPILE_LOCATION=/home/fe2gen/prenatal_pubcasefinder/cache/unsloth_compiled_cache
+Environment=TRITON_CACHE_DIR=/home/fe2gen/prenatal_pubcasefinder/cache/triton
+Environment=TORCHINDUCTOR_CACHE_DIR=/home/fe2gen/prenatal_pubcasefinder/cache/torchinductor
+Environment=CUDA_CACHE_PATH=/home/fe2gen/prenatal_pubcasefinder/cache/nv
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+EnvironmentFile=/home/fe2gen/prenatal_pubcasefinder/.deployment/web.env
+ExecStart=/home/fe2gen/venvs/nckh-model1-span-v1/bin/python /home/fe2gen/prenatal_pubcasefinder/current/backend/serve_web.py
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=60
+UMask=0077
+
+# Same as the --user unit
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LimitNOFILE=4096
+# 75% of RAM as a start; tune with: systemctl show prenatal-web -p MemoryPeak (about 1.5x the peak, >= 6G).
+MemoryMax=24G
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/fe2gen/prenatal_pubcasefinder/.deployment /home/fe2gen/prenatal_pubcasefinder/cache
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+
+# Effective only in a system unit
+DevicePolicy=closed
+DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=/dev/nvidia-uvm-tools rw
+DeviceAllow=/dev/nvidia-modeset rw
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RemoveIPC=yes
+KeyringMode=private
+# Tailscale Funnel/serve reaches the service on 127.0.0.1; Model 1 is loaded offline. Nothing else is needed.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,7 @@
 """Model 1 on demand (child process, idle release, pause file, free-VRAM check) and doctor accounts.
 Runs without GPU or HPO data: a fake runner stands in for Model 1."""
 import json
+import re
 import os
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.parse
 import urllib.request
 from contextlib import redirect_stderr
 from http.server import ThreadingHTTPServer
@@ -15,8 +17,18 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+# Tests also run on the production host (deployment step 3): keep serve_web's module-level stores away from the
+# real users.json, audit log, access log and model state file (the lockout file sits next to users.json).
+# Child processes inherit these variables.
+if 'FE2GEN_TEST_DIR' not in os.environ:
+    os.environ['FE2GEN_TEST_DIR'] = tempfile.mkdtemp(prefix='fe2gen-test-')
+    for _name, _file in (('WEB_USERS_FILE', 'users.json'), ('WEB_AUDIT_FILE', 'audit.jsonl'),
+                         ('WEB_ACCESS_LOG', 'access.log'), ('MODEL1_STATE_FILE', 'model1_state.json')):
+        os.environ[_name] = str(Path(os.environ['FE2GEN_TEST_DIR'], _file))
+
+from accesslog import AccessLog
 from audit import AuditLog
-from auth import Auth, UserStore, check_password, hash_password, password_problem, temporary_password
+from auth import Auth, UserStore, check_password, hash_password, password_problem, public_user, temporary_password
 from model1_process import Model1Process, ModelProcessError, ModelUnavailable
 
 FAKE = [sys.executable, '-c', 'import sys, model1_process, test_access; '
@@ -79,6 +91,7 @@ class Model1ProcessTests(unittest.TestCase):
         m = self.make(idle_seconds=0)
         m.extract('a')
         proc = m.proc
+        m.last_used -= 1  # Windows' monotonic clock ticks every ~16 ms
         m.check_idle()
         self.assertIsNotNone(proc.poll())  # the process exited: the driver frees all of its VRAM
         self.assertEqual(m.status()['model_state'], 'stopped')
@@ -178,15 +191,16 @@ class AuthTests(unittest.TestCase):
         self.assertFalse(check_password('sai', stored))
         self.assertFalse(check_password('x', 'hỏng'))
 
-    def test_mode_follows_users_file(self):
-        self.assertEqual(Auth(self.store, token='').mode, 'none')
-        self.assertEqual(Auth(self.store, token='abc').mode, 'token')
+    def test_mode_follows_users_file(self):  # WEB_REQUIRE_ACCOUNTS=0: local use only
+        self.assertEqual(Auth(self.store, token='', require_accounts=False).mode, 'none')
+        self.assertEqual(Auth(self.store, token='abc', require_accounts=False).mode, 'token')
         self.add()
         self.assertEqual(Auth(self.store, token='abc').mode, 'accounts')
-        self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
+        if os.name == 'posix':
+            self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
 
     def test_shared_token_mode(self):
-        a = Auth(self.store, token='abc')
+        a = Auth(self.store, token='abc', require_accounts=False)
         self.assertEqual(a.check('Bearer abc'), (True, None))
         self.assertFalse(a.check('Bearer abd')[0])
         self.assertFalse(a.check('Bearer ábc')[0])  # non-ASCII header: refused, no TypeError
@@ -286,7 +300,8 @@ class AuthTests(unittest.TestCase):
         log.write('login_fail', 'khach')
         self.assertEqual([e['event'] for e in log.tail()], ['login_fail', 'extract', 'login_ok'])
         self.assertEqual([e['event'] for e in log.tail(user='bs.an', event='extract')], ['extract'])
-        self.assertEqual(os.stat(log.path).st_mode & 0o777, 0o600)
+        if os.name == 'posix':
+            self.assertEqual(os.stat(log.path).st_mode & 0o777, 0o600)
 
     def test_manage_users_cli(self):
         import manage_users
@@ -335,9 +350,9 @@ class HttpTests(unittest.TestCase):
         cls.quiet.__exit__(None, None, None)
         cls.dir.cleanup()
 
-    def call(self, path, payload=None, token=None):
+    def call(self, path, payload=None, token=None, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(payload).encode() if payload is not None else None,
-                                     headers={'Content-Type': 'application/json',
+                                     headers={'Content-Type': 'application/json', **(headers or {}),
                                               **({'Authorization': 'Bearer ' + token} if token else {})})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
@@ -347,7 +362,9 @@ class HttpTests(unittest.TestCase):
 
     def test_flow(self):
         code, status = self.call('/api/status')
-        self.assertEqual((code, status['auth_mode'], status['model_state']), (200, 'accounts', 'stopped'))
+        # B10: without a login only online + sign-in mode; model state, errors and counts moved to /api/session
+        self.assertEqual((code, status), (200, {'status': 'online', 'auth_mode': 'accounts'}))
+        self.assertEqual(self.runner.status()['model_state'], 'stopped')
         self.assertIsNone(self.runner.proc)  # no VRAM before anyone logs in
         self.assertEqual(self.call('/api/hpo_search?q=a')[0], 401)
         self.assertEqual(self.call('/api/login', {'username': 'bs.an', 'password': 'sai'})[0], 401)
@@ -355,7 +372,10 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn(login['model_state'], ('loading', 'ready'))  # login starts loading Model 1
         token = login['token']
-        self.assertEqual(self.call('/api/session', token=token)[1]['user']['name'], 'BS. An')
+        session = self.call('/api/session', token=token)[1]
+        self.assertEqual(session['user']['name'], 'BS. An')
+        self.assertIn(session['model_state'], ('loading', 'ready'))
+        self.assertEqual(session['profiles_count'], 2)
         self.assertEqual(self.call('/api/hpo_search?q=a', token=token)[1][0]['q'], 'a')
         code, out = self.call('/api/extract_hpo', {'text': 'Thai đầu nhỏ.'}, token)
         self.assertEqual((code, out['echo']), (200, 'Thai đầu nhỏ.'))
@@ -366,9 +386,6 @@ class HttpTests(unittest.TestCase):
         proc.wait(timeout=30)  # the last doctor logged out: the model process exits
         self.assertEqual(self.call('/api/session', token=token)[0], 401)
 
-
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
 
 
 class AdminHttpTests(unittest.TestCase):
@@ -388,7 +405,7 @@ class AdminHttpTests(unittest.TestCase):
         system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={'HP:1': {}}, runner=cls.runner,
                                        search_hpo=lambda q: [], extract=lambda text: {'mentions': [1, 2], 'seconds': 0.1},
                                        match=lambda p: {'ok': True})
-        cls.patches = [patch.object(serve_web, 'SYSTEM', system), patch.object(serve_web, 'AUTH', Auth(cls.store)),
+        cls.patches = [patch.object(serve_web, 'SYSTEM', system), patch.object(serve_web, 'AUTH', Auth(cls.store, admin_2fa=False)),
                        patch.object(serve_web, 'AUDIT', cls.audit), patch.object(serve_web, 'free_vram_mib', lambda: 20000)]
         for p in cls.patches:
             p.start()
@@ -463,3 +480,934 @@ class AdminHttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + '/api/status', timeout=30) as r:
             self.assertIn("script-src 'self'", r.headers['Content-Security-Policy'])
             self.assertEqual(r.headers['X-Frame-Options'], 'DENY')
+
+
+def fresh_rates(per_minute=1000, **override):
+    from ratelimit import RateLimiter
+    groups = ('hpo_search', 'match_diseases', 'extract_hpo', 'login', 'login_user', 'admin')
+    return {g: RateLimiter(override.get(g, per_minute)) for g in groups}
+
+
+def accounts(d, **users):
+    """A users.json in d with these username=role accounts; each password is 'mat-khau-' + username."""
+    store = UserStore(Path(d, 'users.json'))
+    store.save({name: {'name': name, 'role': role, 'password': hash_password('mat-khau-' + name)}
+                for name, role in users.items()})
+    return store
+
+
+class LiveServer:
+    """serve_web.Handler on a free port with patched module globals; use as a context manager."""
+
+    def __init__(self, **globals_):
+        import serve_web
+        self.serve_web = serve_web
+        globals_.setdefault('SYSTEM', types.SimpleNamespace(
+            matcher=types.SimpleNamespace(profiles=[1]), canonical={'HP:1': {}}, runner=model(),
+            search_hpo=lambda q: [], extract=lambda text: {'mentions': [], 'seconds': 0.0}, match=lambda p: {'ok': True}))
+        self.system = globals_['SYSTEM']
+        globals_.setdefault('RATES', fresh_rates())  # each test starts with full budgets
+        self.patches = [patch.object(serve_web, k, v) for k, v in globals_.items()]
+
+    def __enter__(self):
+        self.quiet = redirect_stderr(StringIO())
+        self.stderr = self.quiet.__enter__()
+        for p in self.patches:
+            p.start()
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), self.serve_web.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = 'http://127.0.0.1:%d' % self.server.server_address[1]
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.system.runner.stop()
+        for p in self.patches:
+            p.stop()
+        self.quiet.__exit__(None, None, None)
+
+    def call(self, path, payload=None, token=None, headers=None):
+        return HttpTests.call(self, path, payload, token, headers)
+
+
+def raw_get(base, path, token):
+    """Send one GET on a raw socket and read until the server closes: every byte it wrote."""
+    import socket
+    host, port = base.rsplit('/', 1)[1].split(':')
+    with socket.create_connection((host, int(port)), timeout=30) as s:
+        s.sendall(f'GET {path} HTTP/1.0\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n\r\n'.encode())
+        out = b''
+        while chunk := s.recv(65536):
+            out += chunk
+    return out
+
+
+class SingleResponseTests(unittest.TestCase):
+    """B11: a doctor on /api/admin/* gets exactly one 403, not a 403 followed by a 404 on the same connection."""
+
+    def test_admin_get_denied_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'role': 'doctor', 'password': hash_password('mat-khau-1')}})
+            auth = Auth(store)
+            with LiveServer(AUTH=auth, AUDIT=AuditLog(Path(d, 'audit.jsonl'))) as srv:
+                token, _ = auth.login('bs.an', 'mat-khau-1')
+                for path in ('/api/admin/users', '/api/admin/audit?limit=5', '/api/admin/nothing'):
+                    raw = raw_get(srv.base, path, token)
+                    # a second reply follows the first body directly, so count status lines anywhere
+                    self.assertEqual(len(re.findall(rb'HTTP/1\.[01] \d{3} ', raw)), 1, raw[:600])
+                    self.assertTrue(raw.startswith(b'HTTP/1.0 403'), raw[:80])
+
+
+class HeaderTests(unittest.TestCase):
+    """B9: hardening headers on API and static responses; CORS from the GitHub Pages origin still works."""
+
+    ORIGIN = 'https://ditruyenhungvuongorg.github.io'
+
+    def test_headers_and_cors(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'WEB_ALLOWED_ORIGINS': self.ORIGIN}):
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+            with LiveServer(AUTH=Auth(store), AUDIT=AuditLog(Path(d, 'audit.jsonl'))) as srv:
+                for path in ('/api/status', '/', '/app.js'):
+                    req = urllib.request.Request(srv.base + path, headers={'Origin': self.ORIGIN})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        h = r.headers
+                    self.assertEqual(h['Strict-Transport-Security'], 'max-age=31536000; includeSubDomains')
+                    self.assertIn('camera=()', h['Permissions-Policy'])
+                    self.assertIn('microphone=()', h['Permissions-Policy'])
+                    self.assertEqual(h['Cross-Origin-Opener-Policy'], 'same-origin')
+                    self.assertEqual(h['Cross-Origin-Resource-Policy'], 'same-site')
+                    self.assertEqual(h['Access-Control-Allow-Origin'], self.ORIGIN)
+                    self.assertEqual(h['X-Content-Type-Options'], 'nosniff')
+                    self.assertEqual(h['Referrer-Policy'], 'no-referrer')
+                    self.assertIn("frame-ancestors 'none'", h['Content-Security-Policy'])
+                req = urllib.request.Request(srv.base + '/api/login', method='OPTIONS', headers={
+                    'Origin': self.ORIGIN, 'Access-Control-Request-Method': 'POST',
+                    'Access-Control-Request-Headers': 'content-type,authorization'})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual((r.status, r.headers['Access-Control-Allow-Origin']), (204, self.ORIGIN))
+                evil = {'Origin': 'https://evil.example'}
+                with urllib.request.urlopen(urllib.request.Request(srv.base + '/api/status', headers=evil), timeout=30) as r:
+                    self.assertIsNone(r.headers['Access-Control-Allow-Origin'])  # a foreign page cannot read it
+                code, _ = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-1'}, headers=evil)
+                self.assertEqual(code, 403)
+
+    def test_hsts_can_be_turned_off_for_plain_http(self):
+        import serve_web
+        with patch.object(serve_web, 'HSTS', False), tempfile.TemporaryDirectory() as d:
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+            with LiveServer(AUTH=Auth(store), AUDIT=AuditLog(Path(d, 'audit.jsonl'))) as srv:
+                with urllib.request.urlopen(srv.base + '/api/status', timeout=30) as r:
+                    self.assertIsNone(r.headers['Strict-Transport-Security'])
+
+    def test_page_csp_allows_only_the_configured_api(self):
+        docs = Path(__file__).resolve().parent.parent / 'docs'
+        html = (docs / 'index.html').read_text(encoding='utf-8')
+        csp = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', html).group(1)
+        connect = next(d.split()[1:] for d in csp.split(';') if d.strip().startswith('connect-src'))
+        api = re.search(r"apiBase:\s*'([^']*)'", (docs / 'config.js').read_text(encoding='utf-8')).group(1)
+        self.assertEqual(sorted(connect), sorted(["'self'", api.rstrip('/')]))  # no https:, no localhost
+        self.assertIn("script-src 'self';", csp)
+
+
+class AccessLogTests(unittest.TestCase):
+    """B8: one line per request with method, path without query, status, user, ms, bytes; nothing else."""
+
+    def test_lines_without_query_body_or_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+            log = AccessLog(Path(d, 'access.log'))
+            with LiveServer(AUTH=Auth(store), AUDIT=AuditLog(Path(d, 'audit.jsonl')), ACCESS=log) as srv:
+                code, login = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-1'})
+                token = login['token']
+                srv.call('/api/hpo_search?q=' + urllib.parse.quote('não úng thủy BÍ-MẬT'), token=token)
+                srv.call('/api/extract_hpo', {'text': 'Thai đầu nhỏ BÍ-MẬT-456.'}, token=token)
+                srv.call('/api/nope%01', token=token)
+                urllib.request.urlopen(srv.base + '/app.js', timeout=30).read()
+            text = log.path.read_text(encoding='utf-8')
+            lines = [json.loads(x) for x in text.splitlines()]
+            # a line is written after its response, so the client may already be on the next request: no order
+            self.assertEqual(sorted((e['method'], e['path'], e['status'], e['user']) for e in lines), sorted([
+                ('POST', '/api/login', 200, '-'), ('GET', '/api/hpo_search', 200, 'bs.an'),
+                ('POST', '/api/extract_hpo', 200, 'bs.an'), ('GET', '/api/nope%01', 404, 'bs.an'), ('GET', '/app.js', 200, '-')]))
+            self.assertEqual(set(lines[0]), {'time', 'method', 'path', 'status', 'user', 'ms', 'bytes'})
+            self.assertGreater(next(e for e in lines if e['path'] == '/app.js')['bytes'], 1000)
+            for secret in (token, 'mat-khau-1', 'BÍ-MẬT', 'B\\u00cd', 'não', 'Thai'):
+                self.assertNotIn(secret, text)
+            if os.name == 'posix':
+                self.assertEqual(os.stat(log.path).st_mode & 0o777, 0o600)
+
+    def test_rotation_and_failures_do_not_break_requests(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = AccessLog(Path(d, 'access.log'), max_bytes=200, keep=3)
+            for i in range(40):
+                log.write('GET', '/api/status', 200)
+            names = sorted(p.name for p in Path(d).iterdir())
+            self.assertEqual(names, ['access.log', 'access.log.1', 'access.log.2', 'access.log.3'])
+            Path(d, 'blocker').write_text('x')
+            broken = AccessLog(Path(d, 'blocker', 'access.log'))  # parent is a file: every write fails
+            with redirect_stderr(StringIO()):
+                broken.write('GET', '/', 200)
+            self.assertIsNone(AccessLog('off').path)
+            self.assertEqual(AccessLog.clean_path('/ab cạ?q=x'), '/a_b_c_')
+
+
+class LimitTests(unittest.TestCase):
+    """B6/B7: per-key request budgets (429 + Retry-After), bounded queue, connection cap, header deadline, unlock."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data['token']
+
+    def test_search_budget_per_session(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit, RATES=fresh_rates(hpo_search=3)) as srv:
+            token = self.login(srv, 'bs.an')
+            other = self.login(srv, 'quan.tri')
+            self.assertEqual([srv.call('/api/hpo_search?q=a', token=token)[0] for _ in range(3)], [200] * 3)
+            req = urllib.request.Request(srv.base + '/api/hpo_search?q=a', headers={'Authorization': 'Bearer ' + token})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=30)
+            self.assertEqual(caught.exception.code, 429)
+            self.assertGreaterEqual(int(caught.exception.headers['Retry-After']), 1)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=token)[0], 429)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=other)[0], 200)  # another session, own budget
+        limited = [e for e in self.audit.tail() if e['event'] == 'rate_limited']
+        self.assertEqual([(e['user'], e['group']) for e in limited], [('bs.an', 'hpo_search')])  # one line, not two
+
+    def test_login_budget_per_source_counts_failures_only(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(login=3)) as srv:
+            for _ in range(5):
+                self.login(srv, 'bs.an')  # successful logins are refunded
+            for name in ('khach1', 'khach2', 'khach3'):
+                self.assertEqual(srv.call('/api/login', {'username': name, 'password': 'sai-mat-khau'})[0], 401)
+            code, data = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})
+            self.assertEqual(code, 429)
+            self.assertIn('thử lại sau', data['error'])
+
+    def test_login_budget_per_username(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(login_user=2)) as srv:
+            for _ in range(2):
+                self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})[0], 401)
+            self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})[0], 429)
+            self.assertEqual(srv.call('/api/login', {'username': 'quan.tri', 'password': 'sai-mat-khau'})[0], 401)
+
+    def test_queue_of_six_refuses_one(self):
+        import serve_web
+        from ratelimit import WorkQueue
+        gate = threading.Event()
+        system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={}, runner=model(),
+                                       search_hpo=lambda q: [], extract=lambda t: {},
+                                       match=lambda p: (gate.wait(30), {'ok': True})[1])
+        work = WorkQueue(5)
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, SYSTEM=system, WORK=work) as srv:
+            token = self.login(srv, 'bs.an')
+            results = []
+            hpos = {'hpos': [{'id': 'HP:0000252', 'status': 'CÓ'}]}
+            send = lambda: results.append(srv.call('/api/match_diseases', hpos, token)[0])
+            first = threading.Thread(target=send)
+            first.start()
+            deadline = time.monotonic() + 10
+            while work.slot._value and time.monotonic() < deadline:  # the first request holds the slot
+                time.sleep(0.01)
+            waiters = [threading.Thread(target=send) for _ in range(6)]
+            for t in waiters:
+                t.start()
+            while (work.waiting < 5 or not results) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(results, [503])  # the sixth waiter is refused at once; five wait
+            gate.set()
+            for t in [first] + waiters:
+                t.join(30)
+            self.assertEqual(sorted(results), [200] * 6 + [503])
+        self.assertGreaterEqual(serve_web.QUEUE_SECONDS, 30)
+
+    def test_connection_cap_and_header_deadline(self):
+        import socket
+        import serve_web
+        system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={}, runner=model())
+        with patch.object(serve_web, 'HEADER_SECONDS', 1), patch.object(serve_web, 'AUTH', Auth(self.store)), \
+             patch.object(serve_web, 'SYSTEM', system), patch.object(serve_web, 'AUDIT', self.audit), \
+             patch.object(serve_web, 'ACCESS', AccessLog('off')), redirect_stderr(StringIO()):
+            server = serve_web.Server(('127.0.0.1', 0), serve_web.Handler, max_connections=2)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            port = server.server_address[1]
+            try:
+                idle = [socket.create_connection(('127.0.0.1', port), timeout=10) for _ in range(2)]
+                time.sleep(0.2)
+                with socket.create_connection(('127.0.0.1', port), timeout=10) as third:
+                    self.assertTrue(third.recv(4096).startswith(b'HTTP/1.0 503'))  # over the cap: short 503
+                # slowloris: the request line arrives, then one header byte every 0.3 s; dropped after 1 s
+                started = time.monotonic()
+                idle[0].sendall(b'GET / HTTP/1.0\r\n')
+                closed = False
+                while time.monotonic() - started < 5:
+                    try:
+                        idle[0].sendall(b'X')
+                        idle[0].settimeout(0.3)
+                        if idle[0].recv(1) == b'':
+                            closed = True
+                            break
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        closed = True
+                        break
+                self.assertTrue(closed)
+                self.assertLess(time.monotonic() - started, 4)
+                for s in idle:
+                    s.close()
+                time.sleep(1.5)  # the other idle connection times out as well and frees its slot
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/status', timeout=10) as r:
+                    self.assertEqual(r.status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_admin_unlocks_a_locked_login(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            for _ in range(5):
+                srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})
+            self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})[0], 429)
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin)[1]['users']}
+            self.assertTrue(users['bs.an']['login_locked'])
+            self.assertFalse(users['quan.tri']['login_locked'])
+            code, out = srv.call('/api/admin/users/unlock', {'username': 'bs.an'}, admin)
+            self.assertEqual((code, out['was_locked']), (200, True))
+            self.login(srv, 'bs.an')
+            self.assertEqual(srv.call('/api/admin/users/unlock', {'username': 'khong.co'}, admin)[0], 422)
+        events = [(e['event'], e.get('target')) for e in self.audit.tail()]
+        self.assertIn(('login_unlocked', 'bs.an'), events)
+
+    def test_limiter_refills(self):
+        from ratelimit import RateLimiter
+        r = RateLimiter(60, burst=2)
+        self.assertEqual([r.take('k', now=0), r.take('k', now=0)], [0, 0])
+        self.assertEqual(r.take('k', now=0), 1)
+        self.assertEqual(r.take('k', now=1.01), 0)  # one per second comes back
+        self.assertEqual(RateLimiter(0).take('k'), 0)  # 0 = off
+
+
+class TotpTests(unittest.TestCase):
+    """B5: TOTP (RFC 6238) for admins (required) and doctors (optional); backup codes; reset."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin', 'quan.tri2': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_rfc6238_vectors_and_window(self):
+        import base64
+        import totp
+        secret = base64.b32encode(b'12345678901234567890').decode()  # RFC 6238 appendix B, SHA-1
+        for t, expected in ((59, '94287082'), (1111111109, '07081804'), (1234567890, '89005924')):
+            self.assertEqual(totp.code(secret, t, digits=8), expected)
+        self.assertEqual(totp.code(secret, 59), '287082')
+        now = 1_700_000_000
+        self.assertIsNotNone(totp.verify(secret, totp.code(secret, now), t=now))
+        self.assertIsNotNone(totp.verify(secret, totp.code(secret, now - 30), t=now))   # one step late: accepted
+        self.assertIsNotNone(totp.verify(secret, totp.code(secret, now + 30), t=now))   # one step early: accepted
+        self.assertIsNone(totp.verify(secret, totp.code(secret, now - 60), t=now))      # two steps: refused
+        self.assertIsNone(totp.verify(secret, totp.code(secret, now + 60), t=now))
+        step = totp.verify(secret, totp.code(secret, now), t=now)
+        self.assertIsNone(totp.verify(secret, totp.code(secret, now), t=now, after=step))  # no replay
+        self.assertIsNone(totp.verify(secret, 'abcdef', t=now))
+        self.assertEqual(len(totp.generate_secret()), 32)
+        self.assertTrue(totp.uri('bs.an', 'ABC').startswith('otpauth://totp/Fe2Gen:bs.an?secret=ABC&issuer=Fe2Gen'))
+        codes = totp.backup_codes()
+        self.assertEqual((len(codes), len(set(codes))), (8, 8))
+        self.assertRegex(codes[0], r'^[a-z2-9]{4}-[a-z2-9]{4}$')
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data
+
+    def enable(self, srv, token):
+        import totp
+        code, setup = srv.call('/api/totp/setup', {}, token)
+        self.assertEqual(code, 200, setup)
+        self.assertTrue(setup['uri'].startswith('otpauth://totp/'))
+        self.assertEqual(srv.call('/api/totp/enable', {'code': '000000'}, token)[0], 422)
+        code, done = srv.call('/api/totp/enable', {'code': totp.code(setup['secret'])}, token)
+        self.assertEqual(code, 200, done)
+        self.assertEqual(len(done['backup_codes']), 8)
+        return setup['secret'], done['backup_codes']
+
+    def test_admin_must_enable_before_admin_pages(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertEqual((admin['totp_required'], admin['totp_enabled']), (True, False))
+            token = admin['token']
+            code, data = srv.call('/api/admin/users', token=token)
+            self.assertEqual((code, data.get('totp_required')), (403, True))
+            # changing the password is allowed before 2FA is on (here refused only because the old one is wrong)
+            self.assertEqual(srv.call('/api/change_password', {'old_password': 'x', 'new_password': 'y'}, token)[0], 422)
+            session = srv.call('/api/session', token=token)[1]
+            self.assertEqual((session['totp_required'], session['idle_minutes']), (True, 60))
+            self.assertEqual(srv.call('/api/admin/users/create', {'username': 'x.y', 'role': 'lab'}, token)[0], 403)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=token)[0], 403)
+            self.assertEqual(srv.call('/api/session', token=token)[0], 200)
+            secret, backup = self.enable(srv, token)
+            self.assertFalse(srv.call('/api/session', token=token)[1]['totp_required'])
+            code, users = srv.call('/api/admin/users', token=token)  # the same session is now verified
+            self.assertEqual(code, 200)
+            self.assertNotIn(secret, json.dumps(users))                   # the secret never leaves again
+            self.assertNotIn('backup', json.dumps(users))
+            self.assertTrue(next(u for u in users['users'] if u['username'] == 'quan.tri')['totp_enabled'])
+            # next login: password, then code
+            code, first = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})
+            self.assertEqual((code, first['second_factor'], first['user']), (200, True, {'username': 'quan.tri', 'name': 'quan.tri'}))
+            self.assertNotIn('token', first)
+            self.assertEqual(srv.call('/api/admin/users', token=first['pending'])[0], 401)  # pending is no session
+            code, bad = srv.call('/api/login/totp', {'pending': first['pending'], 'code': '000000'})
+            self.assertEqual(code, 401)
+            # the code used to enable cannot be replayed; wait for the next step is too slow, use a backup code
+            code, ok = srv.call('/api/login/totp', {'pending': first['pending'], 'code': backup[0]})
+            self.assertEqual(code, 200, ok)
+            self.assertEqual((ok['totp_required'], ok['totp_enabled']), (False, True))
+            self.assertEqual(srv.call('/api/admin/users', token=ok['token'])[0], 200)
+            # a backup code works once
+            first = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})[1]
+            self.assertEqual(srv.call('/api/login/totp', {'pending': first['pending'], 'code': backup[0]})[0], 401)
+            self.assertEqual(srv.call('/api/login/totp', {'pending': first['pending'], 'code': backup[1]})[0], 200)
+        stored = self.store.all()['quan.tri']['totp']
+        self.assertEqual(len(stored['backup']), 6)
+        self.assertNotIn(backup[2], json.dumps(stored))  # only hashes are kept
+        events = [e['event'] for e in self.audit.tail()]
+        for event in ('totp_enabled', 'totp_fail', 'totp_backup_used', 'login_ok'):
+            self.assertIn(event, events)
+
+    def test_five_wrong_codes_end_the_pending_login(self):
+        import totp
+        auth = Auth(self.store)
+        users = self.store.all()
+        users['bs.an']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        with LiveServer(AUTH=auth, AUDIT=self.audit) as srv:
+            first = self.login(srv, 'bs.an')
+            for _ in range(4):
+                self.assertEqual(srv.call('/api/login/totp', {'pending': first['pending'], 'code': '000000'})[0], 401)
+            code, data = srv.call('/api/login/totp', {'pending': first['pending'], 'code': '000000'})
+            self.assertIn('đăng nhập lại', data['error'])
+            secret = self.store.all()['bs.an']['totp']['secret']
+            code, data = srv.call('/api/login/totp', {'pending': first['pending'], 'code': totp.code(secret)})
+            self.assertEqual(code, 401)  # the pending login is gone, even with the right code
+            # wrong codes count toward the username lock like wrong passwords
+            self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})[0], 429)
+        self.assertEqual(sum(e['event'] == 'totp_fail' for e in self.audit.tail()), 5)
+
+    def test_pending_login_expires(self):
+        import totp
+        users = self.store.all()
+        users['bs.an']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        auth = Auth(self.store)
+        _, first = auth.login('bs.an', 'mat-khau-bs.an')
+        auth.pending[auth._key(first['pending'])]['created'] -= 301
+        with self.assertRaisesRegex(PermissionError, 'hết hạn'):
+            auth.login_totp(first['pending'], totp.code(users['bs.an']['totp']['secret']))
+
+    def test_doctor_without_2fa_logs_in_as_before_and_may_enable(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            doctor = self.login(srv, 'bs.an')
+            self.assertIn('token', doctor)
+            self.assertFalse(doctor['totp_required'])
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=doctor['token'])[0], 200)
+            secret, _ = self.enable(srv, doctor['token'])
+            self.assertEqual(srv.call('/api/totp/setup', {}, doctor['token'])[0], 422)  # already on
+            first = self.login(srv, 'bs.an')
+            self.assertTrue(first['second_factor'])
+            later = time.time() + 30  # the next step: the code used to enable it was spent
+            code, ok = srv.call('/api/login/totp', {'pending': first['pending'], 'code': totp.code(secret, later)})
+            self.assertEqual(code, 200, ok)
+
+    def test_admin_resets_another_users_2fa(self):
+        import totp
+        users = self.store.all()
+        for name in ('quan.tri', 'bs.an'):
+            users[name]['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        auth = Auth(self.store)
+        with LiveServer(AUTH=auth, AUDIT=self.audit) as srv:
+            first = self.login(srv, 'quan.tri')
+            admin = srv.call('/api/login/totp', {'pending': first['pending'],
+                                                 'code': totp.code(users['quan.tri']['totp']['secret'])})[1]['token']
+            self.assertEqual(srv.call('/api/admin/users/totp_reset', {'username': 'quan.tri'}, admin)[0], 422)  # not self
+            self.assertEqual(srv.call('/api/admin/users/totp_reset', {'username': 'bs.an'}, admin)[0], 200)
+            self.assertNotIn('totp', self.store.all()['bs.an'])
+            self.assertIn('token', self.login(srv, 'bs.an'))  # back to password only
+            self.assertEqual(srv.call('/api/admin/users/totp_reset', {'username': 'bs.an'}, admin)[0], 422)
+        self.assertIn(('totp_reset', 'bs.an'), [(e['event'], e.get('target')) for e in self.audit.tail()])
+
+    def test_policy_off_for_local_use(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertEqual(srv.call('/api/admin/users', token=admin['token'])[0], 200)
+        with patch.dict(os.environ, {'WEB_ADMIN_2FA_REQUIRED': '0'}):
+            self.assertFalse(Auth(self.store).admin_2fa)
+        with patch.dict(os.environ, {}):
+            os.environ.pop('WEB_ADMIN_2FA_REQUIRED', None)
+            self.assertTrue(Auth(self.store).admin_2fa)
+
+    def test_manage_users_totp_reset(self):
+        import manage_users
+        import totp
+        users = self.store.all()
+        users['quan.tri']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+        self.store.save(users)
+        with patch('sys.stdout', StringIO()):
+            manage_users.main(['totp-reset', 'quan.tri', '--file', str(self.store.path)])
+        self.assertNotIn('totp', self.store.all()['quan.tri'])
+
+
+class SessionPolicyTests(unittest.TestCase):
+    """B12/B13/B16: configurable idle and session limits, temporary passwords expire, logout clears the cache."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_idle_and_session_limits_from_environment(self):
+        with patch.dict(os.environ, {'WEB_IDLE_MINUTES': '30', 'WEB_SESSION_HOURS': '8'}):
+            a = Auth(self.store)
+        self.assertEqual((a.idle_seconds, a.session_seconds), (1800, 8 * 3600))
+        with patch.dict(os.environ, {}):
+            for k in ('WEB_IDLE_MINUTES', 'WEB_SESSION_HOURS'):
+                os.environ.pop(k, None)
+            a = Auth(self.store)
+        self.assertEqual((a.idle_seconds, a.session_seconds), (3600, 12 * 3600))  # defaults: 60 min, 12 h
+        token, _ = a.login('bs.an', 'mat-khau-bs.an')
+        self.assertEqual(a.describe(a.session(token))['session_idle_minutes'], 60)
+        a.sessions[a._key(token)]['seen'] -= 3601
+        self.assertFalse(a.check('Bearer ' + token)[0])
+
+    def test_temporary_password_expires(self):
+        with patch.dict(os.environ, {'WEB_TEMP_PASSWORD_HOURS': '72'}):
+            a = Auth(self.store)
+        temp = a.create_user('lab.mot', 'Lab 1', 'lab')
+        until = self.store.all()['lab.mot']['temp_until']
+        self.assertAlmostEqual(until, time.time() + 72 * 3600, delta=60)
+        self.assertTrue(a.login('lab.mot', temp)[1]['must_change'])          # still valid
+        self.store.modify(lambda u: u['lab.mot'].update(temp_until=int(time.time()) - 1))
+        with self.assertRaisesRegex(PermissionError, 'hết hạn') as caught:
+            a.login('lab.mot', temp)
+        self.assertEqual(caught.exception.event, 'temp_password_expired')
+        with self.assertRaisesRegex(PermissionError, 'không đúng'):           # a wrong password says nothing more
+            a.login('lab.mot', 'sai-mat-khau-tam')
+        new_temp = a.reset_password('lab.mot')                               # the admin issues a new one
+        token, _ = a.login('lab.mot', new_temp)
+        a.change_password(token, new_temp, 'mây trắng bay qua đồi')
+        self.assertNotIn('temp_until', self.store.all()['lab.mot'])
+        self.assertFalse(public_user('lab.mot', self.store.all()['lab.mot'])['temp_expired'])
+        legacy = {'name': 'x', 'password': hash_password('mat-khau-legacy'), 'must_change': True}  # made before the field
+        self.store.modify(lambda u: u.update({'cu.ma': legacy}))
+        self.assertTrue(a.login('cu.ma', 'mat-khau-legacy')[1]['must_change'])
+
+    def test_expired_temporary_password_over_http(self):
+        audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+        auth = Auth(self.store, admin_2fa=False)
+        temp = auth.create_user('bs.binh', 'BS. Bình', 'doctor')
+        self.store.modify(lambda u: u['bs.binh'].update(temp_until=1))
+        with LiveServer(AUTH=auth, AUDIT=audit) as srv:
+            code, data = srv.call('/api/login', {'username': 'bs.binh', 'password': temp})
+            self.assertEqual(code, 403)
+            self.assertIn('nhờ quản trị viên đặt lại', data['error'])
+            admin = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})[1]['token']
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin)[1]['users']}
+            self.assertTrue(users['bs.binh']['temp_expired'])
+            sessions = srv.call('/api/admin/sessions', token=admin)[1]
+            self.assertEqual((sessions['idle_minutes'], sessions['session_hours']), (60, 12))
+        self.assertIn('temp_password_expired', [e['event'] for e in audit.tail()])
+
+    def test_logout_clears_site_cache(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=AuditLog(Path(self.dir.name, 'audit.jsonl'))) as srv:
+            token = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})[1]['token']
+            req = urllib.request.Request(srv.base + '/api/logout', data=b'{}', method='POST',
+                                         headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.headers['Clear-Site-Data'], '"cache"')
+
+
+class ModelStateFileTests(unittest.TestCase):
+    """B10: gpu.sh reads the model state from a local file, not from the public /api/status."""
+
+    def test_state_file_follows_the_process(self):
+        with tempfile.TemporaryDirectory() as d, redirect_stderr(StringIO()):
+            state = Path(d, 'model1_state.json')
+            m = model(state_file=state)
+            try:
+                m.extract('a')
+                self.assertEqual(json.loads(state.read_text(encoding='utf-8'))['model_state'], 'ready')
+                m.stop('test')
+                data = json.loads(state.read_text(encoding='utf-8'))
+                self.assertEqual((data['model_state'], data['paused']), ('stopped', False))
+                if os.name == 'posix':
+                    self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+            finally:
+                m.stop()
+
+
+class DurableLockAndAuditChainTests(unittest.TestCase):
+    """B14: the login lock survives a restart; the audit log is hash-chained, verifiable and copied to stderr."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor'})
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_lock_survives_restart(self):
+        a = Auth(self.store)
+        for _ in range(5):
+            with self.assertRaises(PermissionError):
+                a.login('bs.an', 'sai-mat-khau')
+        failures = Path(self.dir.name, 'login_failures.json')
+        self.assertTrue(failures.exists())                      # next to users.json
+        if os.name == 'posix':
+            self.assertEqual(os.stat(failures).st_mode & 0o777, 0o600)
+        restarted = Auth(self.store)                            # the service restarted
+        self.assertGreater(restarted.locked_seconds('bs.an'), 0)
+        with self.assertRaisesRegex(PermissionError, 'nhiều lần'):
+            restarted.login('bs.an', 'mat-khau-bs.an')
+        restarted.unlock('bs.an')
+        self.assertEqual(Auth(self.store).locked_seconds('bs.an'), 0)  # the unlock is saved too
+        Auth(self.store).login('bs.an', 'mat-khau-bs.an')
+
+    def test_sprayed_names_do_not_grow_the_file_without_bound(self):
+        a = Auth(self.store)
+        a.MAX_FAILURE_KEYS = 50
+        for i in range(80):
+            with self.assertRaises(PermissionError):
+                a.login(f'khach{i:03d}', 'sai')
+            a.recent.clear()  # keep the global spraying pause out of the way
+        self.assertLessEqual(len(json.loads(Path(self.dir.name, 'login_failures.json').read_text())), 50)
+
+    def test_broken_failures_file_is_ignored(self):
+        Path(self.dir.name, 'login_failures.json').write_text('{oops', encoding='utf-8')
+        with redirect_stderr(StringIO()) as err:
+            a = Auth(self.store)
+        self.assertEqual(a.failures, {})
+        self.assertIn('login_failures.json', err.getvalue())
+
+    def test_audit_chain_detects_edits_and_deletions(self):
+        import audit
+        log = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+        with redirect_stderr(StringIO()) as err:
+            for i in range(5):
+                log.write('match', 'bs.an', hpo_count=i)
+        self.assertEqual(err.getvalue().count('[audit] '), 5)  # second copy for journald
+        lines = log.path.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(json.loads(lines[0])['prev'], '0' * 64)
+        self.assertNotIn('prev', log.tail()[0])                 # the admin page does not show the hashes
+        ok, report = audit.verify([log.path])
+        self.assertTrue(ok, report)
+        self.assertIn('OK: 5', report[-1])
+        edited = lines[:2] + [lines[2].replace('"hpo_count": 2', '"hpo_count": 9')] + lines[3:]
+        log.path.write_text('\n'.join(edited) + '\n', encoding='utf-8')
+        ok, report = audit.verify([log.path])
+        self.assertFalse(ok)
+        self.assertIn(':4:', report[-1])                        # the line after the edited one no longer matches
+        log.path.write_text('\n'.join(lines[:1] + lines[2:]) + '\n', encoding='utf-8')  # a line deleted
+        self.assertFalse(audit.verify([log.path])[0])
+        log.path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        with patch('sys.stdout', StringIO()) as out:
+            self.assertEqual(audit.main(['verify', str(log.path)]), 0)
+        self.assertIn('OK', out.getvalue())
+
+    def test_chain_continues_across_rotation_and_after_legacy_lines(self):
+        import audit
+        path = Path(self.dir.name, 'audit.jsonl')
+        path.write_text('{"time": "2026-10-01 08:00:00", "event": "login_ok", "user": "cu"}\n', encoding='utf-8')
+        log = AuditLog(path)
+        with redirect_stderr(StringIO()), patch.object(audit, 'MAX_BYTES', 300):
+            for i in range(8):
+                log.write('match', 'bs.an', hpo_count=i)
+        older = path.with_name('audit.jsonl.1')
+        self.assertTrue(older.exists())
+        ok, report = audit.verify([older, path])
+        self.assertTrue(ok, report)
+        ok, report = audit.verify([path])                       # the newest file alone continues an older one
+        self.assertTrue(ok, report)
+        self.assertTrue(any('nối tiếp' in r for r in report))
+
+
+class ApiContractTests(unittest.TestCase):
+    """Field names the page relies on: setup kept in users.json, disable, locked_until, gpu_idle_minutes."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data
+
+    def test_setup_is_pending_in_users_file_until_enabled(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            token = self.login(srv, 'bs.an')['token']
+            setup = srv.call('/api/totp/setup', {}, token)[1]
+            self.assertEqual(len(setup['secret']), 32)
+            self.assertTrue(setup['uri'].startswith('otpauth://totp/Fe2Gen:bs.an?secret=' + setup['secret'] + '&issuer=Fe2Gen'))
+            stored = self.store.all()['bs.an']['totp']
+            self.assertEqual(stored, {'pending_secret': setup['secret']})
+            self.assertIn('token', self.login(srv, 'bs.an'))         # not in force yet
+            again = srv.call('/api/totp/setup', {}, token)[1]          # a new setup replaces the pending secret
+            self.assertEqual(srv.call('/api/totp/enable', {'code': totp.code(setup['secret'])}, token)[0], 422)
+            done = srv.call('/api/totp/enable', {'code': totp.code(again['secret'])}, token)[1]
+            self.assertEqual(len(done['backup_codes']), 8)
+            stored = self.store.all()['bs.an']['totp']
+            self.assertNotIn('pending_secret', stored)
+            self.assertEqual(len(stored['backup']), 8)
+            self.assertTrue(all(len(h) == 64 for h in stored['backup']))
+
+    def test_user_turns_own_2fa_off_but_an_admin_cannot(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            token = self.login(srv, 'bs.an')['token']
+            secret = srv.call('/api/totp/setup', {}, token)[1]['secret']
+            backup = srv.call('/api/totp/enable', {'code': totp.code(secret)}, token)[1]['backup_codes']
+            self.assertEqual(srv.call('/api/totp/disable', {'password': 'sai-mat-khau', 'code': backup[0]}, token)[0], 422)
+            self.assertEqual(srv.call('/api/totp/disable', {'password': 'mat-khau-bs.an', 'code': '000000'}, token)[0], 422)
+            code, out = srv.call('/api/totp/disable', {'password': 'mat-khau-bs.an', 'code': backup[0]}, token)
+            self.assertEqual((code, out['ok'], out['totp_enabled']), (200, True, False))
+            self.assertNotIn('totp', self.store.all()['bs.an'])
+            self.assertIn('token', self.login(srv, 'bs.an'))
+            admin_auth = Auth(self.store)
+            users = self.store.all()
+            users['quan.tri']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+            self.store.save(users)
+            first = self.login(srv, 'quan.tri')
+            admin = srv.call('/api/login/totp', {'pending': first['pending'],
+                                                 'code': totp.code(users['quan.tri']['totp']['secret'])})[1]['token']
+            code, out = srv.call('/api/totp/disable', {'password': 'mat-khau-quan.tri',
+                                                       'code': totp.code(users['quan.tri']['totp']['secret'], time.time() + 30)}, admin)
+            self.assertEqual(code, 422)
+            self.assertIn('quản trị', out['error'])
+        self.assertIn('totp_disabled', [e['event'] for e in self.audit.tail()])
+
+    def test_admin_with_temporary_password_changes_it_first_then_sets_up_2fa(self):
+        auth = Auth(self.store)
+        temp = auth.reset_password('quan.tri')
+        with LiveServer(AUTH=auth, AUDIT=self.audit) as srv:
+            data = srv.call('/api/login', {'username': 'quan.tri', 'password': temp})[1]
+            token = data['token']
+            self.assertTrue(data['user']['must_change'])
+            self.assertEqual(srv.call('/api/totp/setup', {}, token)[0], 403)  # the password comes first
+            code, out = srv.call('/api/change_password', {'old_password': temp, 'new_password': 'mây trắng bay qua đồi'}, token)
+            self.assertEqual(code, 200)
+            self.assertTrue(out['user']['totp_required'])
+            self.assertEqual(srv.call('/api/totp/setup', {}, token)[0], 200)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=token)[0], 403)
+
+    def test_locked_until_and_gpu_idle_minutes(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertEqual((admin['idle_minutes'], admin['gpu_idle_minutes']), (60, 60))
+            for _ in range(5):
+                srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin['token'])[1]['users']}
+            self.assertRegex(users['bs.an']['locked_until'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$')
+            self.assertEqual(users['quan.tri']['locked_until'], '')
+            self.assertEqual(srv.call('/api/admin/users/unlock', {'username': 'bs.an'}, admin['token'])[1]['ok'], True)
+            session = srv.call('/api/session', token=admin['token'])[1]
+            self.assertEqual((session['idle_minutes'], session['gpu_idle_minutes'], session['totp_enabled']), (60, 60, False))
+            for key in ('model_state', 'model_error', 'model_load_seconds', 'model_configured'):
+                self.assertIn(key, session)
+            gpu = srv.call('/api/admin/gpu', token=admin['token'])[1]
+            self.assertEqual(gpu['idle_minutes'], 60)  # admin.js reads the GPU idle time under this name
+
+
+class ContractAlignmentTests(unittest.TestCase):
+    """What docs/app.js, twofactor.js and admin.js read from the API after merging the front-end branch."""
+
+    ORIGIN = 'https://ditruyenhungvuongorg.github.io'
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def login(self, srv, name, password=None):
+        code, data = srv.call('/api/login', {'username': name, 'password': password or 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data
+
+    def enable(self, srv, token):
+        import totp
+        secret = srv.call('/api/totp/setup', {}, token)[1]['secret']
+        return secret, srv.call('/api/totp/enable', {'code': totp.code(secret)}, token)[1]['backup_codes']
+
+    def test_cross_origin_page_can_read_retry_after(self):
+        with patch.dict(os.environ, {'WEB_ALLOWED_ORIGINS': self.ORIGIN}), \
+                LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(hpo_search=1)) as srv:
+            token = self.login(srv, 'bs.an')['token']
+            headers = {'Origin': self.ORIGIN, 'Authorization': 'Bearer ' + token}
+            urllib.request.urlopen(urllib.request.Request(srv.base + '/api/hpo_search?q=a', headers=headers), timeout=30).close()
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(urllib.request.Request(srv.base + '/api/hpo_search?q=a', headers=headers), timeout=30)
+            e = caught.exception
+            self.assertEqual(e.code, 429)
+            self.assertIn('Retry-After', [h.strip() for h in e.headers['Access-Control-Expose-Headers'].split(',')])
+            self.assertEqual(int(e.headers['Retry-After']), json.loads(e.read())['retry_after'])
+
+    def test_admin_without_2fa_changes_password_then_sets_up_2fa(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            token = self.login(srv, 'quan.tri')['token']
+            code, out = srv.call('/api/change_password', {'old_password': 'mat-khau-quan.tri',
+                                                          'new_password': 'gió nam thổi qua sông'}, token)
+            self.assertEqual(code, 200, out)
+            self.assertTrue(out['user']['totp_required'])                     # still asked to turn 2FA on
+            self.assertEqual(srv.call('/api/admin/users', token=token)[0], 403)
+            self.assertEqual(srv.call('/api/totp/setup', {}, token)[0], 200)
+
+    def test_admin_users_and_session_fields(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertEqual((admin['session_hours'], admin['idle_minutes']), (12, 60))
+            session = srv.call('/api/session', token=admin['token'])[1]
+            self.assertEqual((session['session_hours'], session['idle_minutes']), (12, 60))
+            self.enable(srv, self.login(srv, 'bs.an')['token'])
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin['token'])[1]['users']}
+            self.assertIs(users['bs.an']['totp_enabled'], True)
+            self.assertIs(users['quan.tri']['totp_enabled'], False)
+            self.assertTrue(all('locked_until' in u for u in users.values()))
+
+    def test_cancelled_or_unknown_pending_says_so(self):
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            self.enable(srv, self.login(srv, 'bs.an')['token'])
+            pending = self.login(srv, 'bs.an')['pending']
+            answers = [srv.call('/api/login/totp', {'pending': pending, 'code': '000000'}) for _ in range(5)]
+            self.assertEqual([c for c, _ in answers], [401] * 5)
+            self.assertEqual([bool(d.get('pending_invalid')) for _, d in answers], [False] * 4 + [True])
+            code, again = srv.call('/api/login/totp', {'pending': pending, 'code': '000000'})
+            self.assertEqual((code, again.get('pending_invalid')), (401, True))
+            code, unknown = srv.call('/api/login/totp', {'pending': 'khong-co', 'code': '123456'})
+            self.assertEqual((code, unknown.get('pending_invalid')), (401, True))
+
+    def test_backup_code_ignores_case_spaces_and_dashes(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            secret, backup = self.enable(srv, self.login(srv, 'bs.an')['token'])
+            for typed in (' ' + backup[0].upper().replace('-', ' ') + ' ', backup[1].replace('-', ''), backup[2]):
+                pending = self.login(srv, 'bs.an')['pending']
+                code, out = srv.call('/api/login/totp', {'pending': pending, 'code': typed})
+                self.assertEqual(code, 200, (typed, out))
+            pending = self.login(srv, 'bs.an')['pending']
+            self.assertEqual(srv.call('/api/login/totp', {'pending': pending, 'code': backup[0]})[0], 401)  # used once
+            later = totp.code(secret, time.time() + 30)  # the next step: the enabling code's step is already used
+            code, out = srv.call('/api/login/totp', {'pending': pending, 'code': later[:3] + ' ' + later[3:]})
+            self.assertEqual(code, 200, out)                                   # "123 456" from the app also works
+
+
+class FailClosedTests(unittest.TestCase):
+    """B3/B4: a missing, corrupt or empty users.json never opens the API (WEB_REQUIRE_ACCOUNTS=1)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name, 'users.json')
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def cases(self):
+        yield 'missing', lambda: None
+        yield 'corrupt', lambda: self.path.write_text('{"users": {"bs.an": ', encoding='utf-8')
+        yield 'empty', lambda: self.path.write_text('{"users": {}}', encoding='utf-8')
+
+    def test_locked_mode_refuses_every_api_call(self):
+        for kind, make in self.cases():
+            with self.subTest(kind):
+                self.path.unlink(missing_ok=True)
+                make()
+                with redirect_stderr(StringIO()):
+                    auth = Auth(UserStore(self.path), token='shared-code', require_accounts=True)
+                    self.assertEqual(auth.mode, 'locked')
+                    self.assertEqual(auth.check('Bearer shared-code'), (False, None))  # never falls back to the code
+                with LiveServer(AUTH=auth, AUDIT=AuditLog(Path(self.dir.name, 'audit.jsonl'))) as srv:
+                    for path, payload in (('/api/status', None), ('/api/hpo_search?q=a', None),
+                                          ('/api/login', {'username': 'bs.an', 'password': 'mat-khau-1'}),
+                                          ('/api/match_diseases', {'hpos': []})):
+                        code, data = srv.call(path, payload, token='shared-code')
+                        self.assertEqual(code, 503, (kind, path))
+                        self.assertIn('Hệ thống tạm khóa', data['error'])
+                    with urllib.request.urlopen(srv.base + '/', timeout=30) as r:
+                        self.assertEqual(r.status, 200)  # the page still loads and shows the message
+
+    def test_require_off_keeps_the_old_fallback(self):
+        for kind, make in self.cases():
+            with self.subTest(kind), redirect_stderr(StringIO()):
+                self.path.unlink(missing_ok=True)
+                make()
+                self.assertEqual(Auth(UserStore(self.path), token='abc', require_accounts=False).mode, 'token')
+                self.assertEqual(Auth(UserStore(self.path), token='', require_accounts=False).mode, 'none')
+
+    def test_default_is_fail_closed(self):
+        with patch.dict(os.environ, {}), redirect_stderr(StringIO()):
+            os.environ.pop('WEB_REQUIRE_ACCOUNTS', None)
+            self.assertEqual(Auth(UserStore(self.path), token='abc').mode, 'locked')
+            os.environ['WEB_REQUIRE_ACCOUNTS'] = '0'
+            self.assertEqual(Auth(UserStore(self.path), token='abc').mode, 'token')
+
+    def test_corrupt_file_keeps_last_good_copy_and_reports_once(self):
+        problems = []
+        store = UserStore(self.path, on_problem=problems.append)
+        store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+        auth = Auth(store, require_accounts=True)
+        token, _ = auth.login('bs.an', 'mat-khau-1')
+        with redirect_stderr(StringIO()) as err:
+            self.path.write_text('{"users": ', encoding='utf-8')  # half-written by hand
+            os.utime(self.path, ns=(time.time_ns(), time.time_ns() + 10 ** 9))
+            self.assertEqual(auth.mode, 'accounts')               # no 500 and no opening up
+            self.assertTrue(auth.check('Bearer ' + token)[0])     # doctors keep working
+            self.assertEqual(auth.mode, 'accounts')
+            with self.assertRaisesRegex(ValueError, 'Không đọc được'):  # the broken file is not overwritten blindly
+                auth.create_user('bs.binh', 'BS. Bình', 'doctor')
+        self.assertEqual(problems, ['corrupt'])                   # reported once per broken version of the file
+        self.assertIn('corrupt', err.getvalue())
+        store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+        self.assertIsNone(store.problem)
+
+    def test_store_problem_is_audited(self):
+        import serve_web
+        log = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+        with patch.object(serve_web, 'AUDIT', log), redirect_stderr(StringIO()):
+            store = UserStore(self.path, on_problem=serve_web.AUTH.store.on_problem)
+            Auth(store, require_accounts=True).mode
+            Auth(store, require_accounts=True).mode
+        self.assertEqual([(e['event'], e['kind']) for e in log.tail()], [('auth_store_error', 'missing')])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

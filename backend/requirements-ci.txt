@@ -1,0 +1,3 @@
+# Dependencies of the tests that run in CI (no GPU, no torch, no backend/data/).
+# test_access.py needs only the standard library plus what web_service imports (numpy).
+numpy>=1.26,<3

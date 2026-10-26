@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  # backend/requirements.lock.txt is created on the Ubuntu host by backend/ops/freeze_lock.sh.
+  # Dependabot only reads files present in the repository; until it is committed this entry finds nothing.
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

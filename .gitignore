@@ -12,3 +12,13 @@ backend/data/
 nghien_cuu/
 model1_v38_worker/
 CHUYEN_MAY.md
+
+# Secrets and logs of the running service (they live in ~/prenatal_pubcasefinder/.deployment)
+users.json
+users.tmp
+audit*.jsonl
+audit*.jsonl.*
+access.log*
+login_failures.json
+model1_state.json
+*.xlsx
