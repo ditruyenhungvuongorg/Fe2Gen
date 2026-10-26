@@ -36,7 +36,8 @@
 
   const VIEWS = {
     async users() {
-      const data = await api('/api/admin/users', null, 20000);
+      const [data, open] = await Promise.all([api('/api/admin/users', null, 20000), api('/api/admin/sessions', null, 20000)]);
+      const online = new Set(open.sessions.map(s => s.username));
       const roleSelect = (value, attrs = {}) => el('select', attrs, Object.entries(data.roles).map(([k, v]) => el('option', {value:k, selected:k === value}, v)));
       const form = el('form', {class:'admin-create'},
         el('label', {}, 'Tên đăng nhập', el('input', {name:'username', required:true, maxlength:32, autocomplete:'off', autocapitalize:'none', spellcheck:'false', placeholder:'vd: bs.an, lab.hv'})),
@@ -58,7 +59,7 @@
           el('button', {type:'button', class:'quiet', onclick:() => { navigator.clipboard?.writeText(temp.temp_password).then(() => status('Đã chép mật khẩu tạm.'), () => {}); }}, 'Chép'),
           el('button', {type:'button', class:'quiet', onclick:() => { temp = null; show('users'); }}, 'Ẩn')));
       }
-      parts.push(el('h3', {class:'account-sub'}, data.users.length + ' tài khoản'));
+      parts.push(el('h3', {class:'account-sub'}, data.users.length + ' tài khoản · ' + online.size + ' đang online'));
       for (const u of data.users) {
         const self = u.username === user?.username;
         const state = u.disabled ? ['Đã khóa', 'locked'] : u.must_change ? ['Chờ đặt mật khẩu', 'pending'] : ['Hoạt động', 'active'];
@@ -69,8 +70,16 @@
         };
         parts.push(el('div', {class:'admin-row'},
           el('div', {class:'admin-who'}, el('strong', {}, u.name), el('small', {}, u.username + (self ? ' · bạn' : '') + ' · tạo ' + (u.created || '—') + ' · đăng nhập gần nhất ' + (u.last_login || 'chưa'))),
-          el('span', {class:'state-pill ' + state[1]}, state[0]), role,
+          el('span', {class:'state-pill ' + state[1]}, state[0], online.has(u.username) ? ' · online' : null), role,
           el('div', {class:'admin-buttons'},
+            el('button', {type:'button', class:'quiet', onclick:() => {
+              const name = prompt('Tên hiển thị mới của ' + u.username + ':', u.name);
+              if (name == null || !name.trim() || name.trim() === u.name) return;
+              act(async () => {
+                await api('/api/admin/users/update', {username:u.username, name:name.trim()}, 20000);
+                if (self) { user.name = name.trim().slice(0, 80); showUser(); }
+              }, () => 'Đã đổi tên ' + u.username + '.');
+            }}, 'Đổi tên'),
             el('button', {type:'button', class:'quiet', disabled:self, onclick:() => {
               if (!u.disabled && !confirm('Khóa ' + u.username + '? Người này bị đăng xuất ngay.')) return;
               act(() => api('/api/admin/users/update', {username:u.username, disabled:!u.disabled}, 20000), () => (u.disabled ? 'Đã mở khóa ' : 'Đã khóa ') + u.username + '.');
