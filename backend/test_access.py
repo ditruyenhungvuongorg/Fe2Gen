@@ -9,6 +9,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.parse
 import urllib.request
 from contextlib import redirect_stderr
 from http.server import ThreadingHTTPServer
@@ -16,6 +17,16 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+# Tests also run on the production host (deployment step 3): keep serve_web's module-level stores away from the
+# real users.json, audit log, access log and lockout file. Child processes inherit these variables.
+if 'FE2GEN_TEST_DIR' not in os.environ:
+    os.environ['FE2GEN_TEST_DIR'] = tempfile.mkdtemp(prefix='fe2gen-test-')
+    for _name, _file in (('WEB_USERS_FILE', 'users.json'), ('WEB_AUDIT_FILE', 'audit.jsonl'),
+                         ('WEB_ACCESS_LOG', 'access.log'), ('WEB_LOGIN_FAILURES_FILE', 'login_failures.json'),
+                         ('MODEL1_STATE_FILE', 'model1_state.json')):
+        os.environ[_name] = str(Path(os.environ['FE2GEN_TEST_DIR'], _file))
+
+from accesslog import AccessLog
 from audit import AuditLog
 from auth import Auth, UserStore, check_password, hash_password, password_problem, temporary_password
 from model1_process import Model1Process, ModelProcessError, ModelUnavailable
@@ -580,6 +591,49 @@ class HeaderTests(unittest.TestCase):
         api = re.search(r"apiBase:\s*'([^']*)'", (docs / 'config.js').read_text(encoding='utf-8')).group(1)
         self.assertEqual(sorted(connect), sorted(["'self'", api.rstrip('/')]))  # no https:, no localhost
         self.assertIn("script-src 'self';", csp)
+
+
+class AccessLogTests(unittest.TestCase):
+    """B8: one line per request with method, path without query, status, user, ms, bytes; nothing else."""
+
+    def test_lines_without_query_body_or_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+            log = AccessLog(Path(d, 'access.log'))
+            with LiveServer(AUTH=Auth(store), AUDIT=AuditLog(Path(d, 'audit.jsonl')), ACCESS=log) as srv:
+                code, login = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-1'})
+                token = login['token']
+                srv.call('/api/hpo_search?q=' + urllib.parse.quote('não úng thủy BÍ-MẬT'), token=token)
+                srv.call('/api/extract_hpo', {'text': 'Thai đầu nhỏ BÍ-MẬT-456.'}, token=token)
+                srv.call('/api/nope%01', token=token)
+                urllib.request.urlopen(srv.base + '/app.js', timeout=30).read()
+            text = log.path.read_text(encoding='utf-8')
+            lines = [json.loads(x) for x in text.splitlines()]
+            self.assertEqual([(e['method'], e['path'], e['status']) for e in lines],
+                             [('POST', '/api/login', 200), ('GET', '/api/hpo_search', 200),
+                              ('POST', '/api/extract_hpo', 200), ('GET', '/api/nope%01', 404), ('GET', '/app.js', 200)])
+            self.assertEqual([e['user'] for e in lines], ['-', 'bs.an', 'bs.an', 'bs.an', '-'])
+            self.assertEqual(set(lines[0]), {'time', 'method', 'path', 'status', 'user', 'ms', 'bytes'})
+            self.assertGreater(lines[-1]['bytes'], 1000)
+            for secret in (token, 'mat-khau-1', 'BÍ-MẬT', 'B\\u00cd', 'não', 'Thai'):
+                self.assertNotIn(secret, text)
+            if os.name == 'posix':
+                self.assertEqual(os.stat(log.path).st_mode & 0o777, 0o600)
+
+    def test_rotation_and_failures_do_not_break_requests(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = AccessLog(Path(d, 'access.log'), max_bytes=200, keep=3)
+            for i in range(40):
+                log.write('GET', '/api/status', 200)
+            names = sorted(p.name for p in Path(d).iterdir())
+            self.assertEqual(names, ['access.log', 'access.log.1', 'access.log.2', 'access.log.3'])
+            Path(d, 'blocker').write_text('x')
+            broken = AccessLog(Path(d, 'blocker', 'access.log'))  # parent is a file: every write fails
+            with redirect_stderr(StringIO()):
+                broken.write('GET', '/', 200)
+            self.assertIsNone(AccessLog('off').path)
+            self.assertEqual(AccessLog.clean_path('/ab cạ?q=x'), '/a_b_c_')
 
 
 class FailClosedTests(unittest.TestCase):

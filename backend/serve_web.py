@@ -2,10 +2,12 @@
 import json
 import os
 import sys
+import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import BoundedSemaphore, Thread
 from urllib.parse import urlparse, parse_qs
+from accesslog import AccessLog
 from audit import EVENTS, AuditLog
 from auth import GPU_ROLES, LOCKED_MESSAGE, ROLES, USERNAME, Auth, LoginRefused, public_user
 from model1_process import ModelUnavailable, free_vram_mib
@@ -19,6 +21,7 @@ STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/con
 SYSTEM = WebSystem()
 AUTH = Auth()
 AUDIT = AuditLog()
+ACCESS = AccessLog()
 AUTH.store.on_problem = lambda kind: AUDIT.write('auth_store_error', '', kind=kind)
 WORK = BoundedSemaphore(1)
 QUEUE_SECONDS = 90
@@ -34,7 +37,8 @@ FIRST_LOGIN_PATHS = ('/api/session', '/api/change_password', '/api/logout')
 
 class Handler(SimpleHTTPRequestHandler):
     extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.woff2': 'font/woff2'}
-    session = None
+    session = status_sent = None
+    bytes_sent = 0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_ROOT), **kwargs)
@@ -44,7 +48,27 @@ class Handler(SimpleHTTPRequestHandler):
         self.connection.settimeout(180)
 
     def log_message(self, *args):
-        pass
+        pass  # stderr stays quiet; one line per request goes to ACCESS (no query, body or token)
+
+    def handle_one_request(self):
+        self.session, self.status_sent, self.bytes_sent, started = None, None, 0, time.monotonic()
+        super().handle_one_request()
+        if self.status_sent is not None:
+            ACCESS.write(self.command, self.path, self.status_sent, self.session['user'] if self.session else '-',
+                         (time.monotonic() - started) * 1000, self.bytes_sent)
+
+    def send_response(self, code, message=None):
+        if self.status_sent is None:
+            self.status_sent = code
+        super().send_response(code, message)
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == 'content-length':
+            try:
+                self.bytes_sent = int(value)
+            except ValueError:
+                pass
+        super().send_header(keyword, value)
 
     def allowed_origin(self):
         origin = self.headers.get('Origin')
