@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4.2.2
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
       - run: node test_case_state.cjs
