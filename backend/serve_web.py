@@ -154,7 +154,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({'user': user, 'role': self.role, **self.model_status()})
             if path.path == '/api/hpo_search':
                 return self.send_json(SYSTEM.search_hpo(parse_qs(path.query).get('q', [''])[0][:200]))
-            if path.path.startswith('/api/admin/') and self.admin_only():
+            if path.path.startswith('/api/admin/'):
+                if not self.admin_only():  # admin_only already answered 403; a second reply would desync HTTP
+                    return
                 return self.admin_get(path.path, parse_qs(path.query))
             return self.send_json({'error': 'Không có endpoint này.'}, 404)
         if path.path not in STATIC_FILES:

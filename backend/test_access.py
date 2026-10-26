@@ -1,6 +1,7 @@
 """Model 1 on demand (child process, idle release, pause file, free-VRAM check) and doctor accounts.
 Runs without GPU or HPO data: a fake runner stands in for Model 1."""
 import json
+import re
 import os
 import sys
 import tempfile
@@ -497,6 +498,35 @@ class LiveServer:
 
     def call(self, path, payload=None, token=None, headers=None):
         return HttpTests.call(self, path, payload, token, headers)
+
+
+def raw_get(base, path, token):
+    """Send one GET on a raw socket and read until the server closes: every byte it wrote."""
+    import socket
+    host, port = base.rsplit('/', 1)[1].split(':')
+    with socket.create_connection((host, int(port)), timeout=30) as s:
+        s.sendall(f'GET {path} HTTP/1.0\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n\r\n'.encode())
+        out = b''
+        while chunk := s.recv(65536):
+            out += chunk
+    return out
+
+
+class SingleResponseTests(unittest.TestCase):
+    """B11: a doctor on /api/admin/* gets exactly one 403, not a 403 followed by a 404 on the same connection."""
+
+    def test_admin_get_denied_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = UserStore(Path(d, 'users.json'))
+            store.save({'bs.an': {'name': 'BS. An', 'role': 'doctor', 'password': hash_password('mat-khau-1')}})
+            auth = Auth(store)
+            with LiveServer(AUTH=auth, AUDIT=AuditLog(Path(d, 'audit.jsonl'))) as srv:
+                token, _ = auth.login('bs.an', 'mat-khau-1')
+                for path in ('/api/admin/users', '/api/admin/audit?limit=5', '/api/admin/nothing'):
+                    raw = raw_get(srv.base, path, token)
+                    # a second reply follows the first body directly, so count status lines anywhere
+                    self.assertEqual(len(re.findall(rb'HTTP/1\.[01] \d{3} ', raw)), 1, raw[:600])
+                    self.assertTrue(raw.startswith(b'HTTP/1.0 403'), raw[:80])
 
 
 class FailClosedTests(unittest.TestCase):
