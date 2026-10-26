@@ -52,8 +52,9 @@ PERMISSIONS_POLICY = 'camera=(), microphone=(), geolocation=(), payment=(), usb=
 HSTS = os.getenv('WEB_HSTS', '1') != '0'
 # With a temporary password, only these work until the user sets a new one.
 FIRST_LOGIN_PATHS = ('/api/session', '/api/change_password', '/api/logout')
-# An admin without a verified second factor (WEB_ADMIN_2FA_REQUIRED=1) can only set one up.
-SECOND_FACTOR_PATHS = ('/api/session', '/api/totp/setup', '/api/totp/enable', '/api/change_password', '/api/logout')
+# An admin without a verified second factor (WEB_ADMIN_2FA_REQUIRED=1) can only set one up. A temporary password
+# is changed first (FIRST_LOGIN_PATHS), then this applies.
+SECOND_FACTOR_PATHS = ('/api/session', '/api/totp/setup', '/api/totp/enable', '/api/logout')
 
 class Handler(SimpleHTTPRequestHandler):
     extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.woff2': 'font/woff2'}
@@ -173,8 +174,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.session and self.session['must_change'] and path not in FIRST_LOGIN_PATHS:
             self.send_json({'error': 'Đặt mật khẩu mới trước khi tiếp tục.', 'must_change': True}, 403)
             return False
-        if AUTH.needs_2fa(self.session) and path not in SECOND_FACTOR_PATHS:
-            self.send_json({'error': self.second_factor_message(), 'needs_2fa': True}, 403)
+        if self.session and not self.session['must_change'] and AUTH.needs_2fa(self.session) \
+                and path not in SECOND_FACTOR_PATHS:
+            self.send_json({'error': self.second_factor_message(), 'totp_required': True, 'needs_2fa': True}, 403)
             return False
         if self.role in GPU_ROLES:
             SYSTEM.runner.touch()  # a doctor is working: postpone releasing the GPU
@@ -225,7 +227,9 @@ class Handler(SimpleHTTPRequestHandler):
             return None
 
     def model_status(self):
-        return {'model_configured': bool(SYSTEM.runner.adapter_path), **SYSTEM.runner.status()}
+        status = dict(SYSTEM.runner.status())
+        status['gpu_idle_minutes'] = status.pop('idle_minutes', None)  # 'idle_minutes' is the session's limit
+        return {'model_configured': bool(SYSTEM.runner.adapter_path), **status}
 
     def do_OPTIONS(self):
         if not self.allowed_origin():
@@ -249,14 +253,14 @@ class Handler(SimpleHTTPRequestHandler):
         if path.path.startswith('/api/') and self.locked():
             return
         if path.path == '/api/status':  # public: only what the sign-in page needs; details in /api/session
-            mode = AUTH.mode
-            return self.send_json({'status': 'online', 'auth_required': mode != 'none', 'auth_mode': mode})
+            return self.send_json({'status': 'online', 'auth_mode': AUTH.mode})
         if path.path.startswith('/api/'):
             if not self.authorized(path.path):
                 return
             if path.path == '/api/session':
                 user = AUTH.describe(self.session) if self.session else None
-                return self.send_json({'user': user, 'role': self.role, 'profiles_count': len(SYSTEM.matcher.profiles),
+                return self.send_json({'user': user, 'role': self.role, **AUTH.session_fields(self.session),
+                                       'profiles_count': len(SYSTEM.matcher.profiles),
                                        'hpo_terms_count': len(SYSTEM.canonical), **self.model_status()})
             if path.path == '/api/hpo_search':
                 if self.limited('hpo_search'):
@@ -293,7 +297,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == '/api/change_password':
             return self.change_password(payload)
-        if path in ('/api/totp/setup', '/api/totp/enable'):
+        if path in ('/api/totp/setup', '/api/totp/enable', '/api/totp/disable'):
             return self.totp(path, payload)
         if path.startswith('/api/admin/'):
             if self.admin_only() and not self.limited('admin'):
@@ -377,7 +381,8 @@ class Handler(SimpleHTTPRequestHandler):
         session = AUTH.session(token)
         if user['role'] == 'doctor' and not user['must_change']:
             SYSTEM.runner.start()  # a doctor is working now: load Model 1 while they enter the case
-        self.send_json({'token': token, 'user': AUTH.describe(session) if session else user, **self.model_status()})
+        self.send_json({'token': token, 'user': AUTH.describe(session) if session else user,
+                        **AUTH.session_fields(session), **self.model_status()})
 
     def totp(self, path, payload):
         """Turn on the second factor for the logged-in account: setup gives a secret, enable confirms it."""
@@ -387,11 +392,16 @@ class Handler(SimpleHTTPRequestHandler):
             if path.endswith('setup'):
                 secret, uri = AUTH.totp_setup(self.token())
                 return self.send_json({'secret': secret, 'uri': uri})
+            if path.endswith('disable'):
+                AUTH.totp_disable(self.token(), payload.get('password'), payload.get('code'))
+                AUDIT.write('totp_disabled', self.user)
+                return self.send_json({'ok': True, 'user': AUTH.describe(self.session), **AUTH.session_fields(self.session)})
             codes = AUTH.totp_enable(self.token(), payload.get('code'))
         except ValueError as exc:
             return self.send_json({'error': str(exc)}, 422)
         AUDIT.write('totp_enabled', self.user)
-        self.send_json({'ok': True, 'backup_codes': codes, 'user': AUTH.describe(self.session)})
+        self.send_json({'ok': True, 'backup_codes': codes, 'user': AUTH.describe(self.session),
+                        **AUTH.session_fields(self.session)})
 
     def logout(self):
         AUTH.logout(self.token())
@@ -424,13 +434,17 @@ class Handler(SimpleHTTPRequestHandler):
 
     def gpu_status(self):
         runner = SYSTEM.runner
-        return {**self.model_status(), 'paused': runner.paused(), 'free_mib': free_vram_mib(),
+        model = self.model_status()
+        return {**model, 'idle_minutes': model['gpu_idle_minutes'], 'paused': runner.paused(), 'free_mib': free_vram_mib(),
                 'doctors_active': AUTH.active(LOGOUT_GRACE_SECONDS, GPU_ROLES), 'pause_file': str(runner.pause_file or '')}
 
     def admin_get(self, path, query):
         if path == '/api/admin/users':
-            users = [{**public_user(name, u), 'login_locked': AUTH.locked_seconds(name) > 0}
-                     for name, u in sorted(AUTH.store.all().items())]
+            def lock(name):
+                until = AUTH.locked_until(name)
+                return {'login_locked': bool(until),
+                        'locked_until': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(until)) if until else ''}
+            users = [{**public_user(name, u), **lock(name)} for name, u in sorted(AUTH.store.all().items())]
             return self.send_json({'users': users, 'roles': ROLES})
         if path == '/api/admin/sessions':
             return self.send_json({'sessions': AUTH.list_sessions(), 'idle_minutes': round(AUTH.idle_seconds / 60),

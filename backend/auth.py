@@ -111,8 +111,8 @@ def public_user(username, user):
     """What may leave the server about an account: never the password hash or the TOTP secret."""
     return {'username': username, 'name': user.get('name') or username, 'role': user.get('role', 'doctor'),
             'disabled': bool(user.get('disabled')), 'must_change': bool(user.get('must_change')),
-            'created': user.get('created', ''), 'last_login': user.get('last_login', ''), 'totp': has_totp(user),
-            'temp_expired': temp_expired(user)}
+            'created': user.get('created', ''), 'last_login': user.get('last_login', ''),
+            'totp_enabled': has_totp(user), 'totp': has_totp(user), 'temp_expired': temp_expired(user)}
 
 
 def temp_expired(user, now=None):
@@ -338,7 +338,8 @@ class Auth:
             with self.lock:
                 self.pending = {k: v for k, v in self.pending.items() if now - v['created'] <= self.PENDING_SECONDS}
                 self.pending[self._key(pending)] = {'user': username, 'created': now, 'tries': 0}
-            return None, {'second_factor': True, 'pending': pending}
+            return None, {'second_factor': True, 'pending': pending,
+                          'user': {'username': username, 'name': user.get('name') or username}}
         with self.lock:
             self._forget(username)
         return self._open_session(username, user, now, mfa=False)
@@ -411,28 +412,42 @@ class Auth:
         return bool(s and self.admin_2fa and s['role'] == 'admin' and not s.get('mfa'))
 
     def describe(self, s):
-        """The session as the page sees it."""
+        """The session as the page sees it. totp_required: an admin who must turn on 2FA before anything else;
+        idle_minutes: this session's idle limit (the page logs out by itself after it). 'totp', 'needs_2fa' and
+        'session_idle_minutes' are older names of the same fields."""
+        required, idle = self.needs_2fa(s), round(self.idle_seconds / 60)
         return {'username': s['user'], 'name': s['name'], 'role': s['role'], 'must_change': s['must_change'],
-                'totp': bool(s.get('totp')), 'needs_2fa': self.needs_2fa(s),
-                'session_idle_minutes': round(self.idle_seconds / 60)}
+                'totp_enabled': bool(s.get('totp')), 'totp_required': required, 'idle_minutes': idle,
+                'totp': bool(s.get('totp')), 'needs_2fa': required, 'session_idle_minutes': idle}
+
+    def session_fields(self, s):
+        """Top-level fields of /api/session and the login answer (also without a personal session)."""
+        return {'totp_enabled': bool(s and s.get('totp')), 'totp_required': self.needs_2fa(s),
+                'idle_minutes': round(self.idle_seconds / 60)}
 
     # ------------------------------------------------------------------ second factor (TOTP)
     def totp_setup(self, token):
-        """A new secret for the logged-in user, kept in the session until a code from the app confirms it."""
+        """A new secret for the logged-in user, kept as totp.pending_secret in users.json (not yet in force) until
+        a code from the app confirms it."""
         s = self.session(token)
         if not s:
             raise PermissionError('Phiên đăng nhập đã hết hạn.')
-        if s.get('totp'):
-            raise ValueError('Xác thực 2 lớp đã bật. Đổi điện thoại: nhờ quản trị viên đặt lại 2FA.')
-        s['totp_pending'] = totp.generate_secret()
-        return s['totp_pending'], totp.uri(s['user'], s['totp_pending'])
+        secret = totp.generate_secret()
+
+        def apply(users):
+            if has_totp(users[s['user']]):
+                raise ValueError('Xác thực 2 lớp đã bật. Đổi điện thoại: tắt rồi bật lại, hoặc nhờ quản trị viên đặt lại 2FA.')
+            users[s['user']]['totp'] = {'pending_secret': secret}
+        self.store.modify(apply)
+        return secret, totp.uri(s['user'], secret)
 
     def totp_enable(self, token, given):
         """Confirm the pending secret with a code; returns the 8 backup codes (shown once)."""
         s = self.session(token)
         if not s:
             raise PermissionError('Phiên đăng nhập đã hết hạn.')
-        secret = s.get('totp_pending')
+        stored = self.store.get(s['user']) or {}
+        secret = (stored.get('totp') or {}).get('pending_secret') if not has_totp(stored) else None
         if not secret:
             raise ValueError('Bấm "Bật xác thực 2 lớp" để tạo khóa mới trước.')
         step = totp.verify(secret, given)
@@ -441,16 +456,44 @@ class Auth:
         codes = totp.backup_codes()
 
         def apply(users):
-            if has_totp(users[s['user']]):
-                raise ValueError('Xác thực 2 lớp đã bật.')
+            if (users[s['user']].get('totp') or {}).get('pending_secret') != secret:
+                raise ValueError('Khóa 2 lớp vừa đổi ở nơi khác; bấm "Bật xác thực 2 lớp" lại.')
             users[s['user']]['totp'] = {'secret': secret, 'enabled': True, 'last': step,
                                         'backup': [totp.hash_backup(c) for c in codes],
                                         'since': time.strftime('%Y-%m-%d %H:%M')}
         self.store.modify(apply)
-        s.pop('totp_pending', None)
         s.update(mfa=True, totp=True)
         self.end_sessions(s['user'], keep=token)  # other devices log in again, now with a code
         return codes
+
+    def totp_disable(self, token, password, given):
+        """The user turns their own 2FA off with their password and a current code (or a backup code).
+        Refused for admins while WEB_ADMIN_2FA_REQUIRED is on."""
+        s = self.session(token)
+        if not s:
+            raise PermissionError('Phiên đăng nhập đã hết hạn.')
+        user = self.store.get(s['user']) or {}
+        if not has_totp(user):
+            raise ValueError('Xác thực 2 lớp chưa bật.')
+        if self.admin_2fa and s['role'] == 'admin':
+            raise ValueError('Tài khoản quản trị phải giữ xác thực 2 lớp. Đổi điện thoại: nhờ quản trị viên khác đặt lại.')
+        if not check_password(str(password or '')[:200], user['password']):
+            raise ValueError('Mật khẩu hiện tại không đúng.')
+        cfg, given = user['totp'], str(given or '').strip()[:20]
+        if totp.verify(cfg['secret'], given, after=cfg.get('last')) is None and not any(
+                hmac.compare_digest(h, totp.hash_backup(given)) for h in cfg.get('backup', [])):
+            raise ValueError('Mã xác thực không đúng.')
+
+        def apply(users):
+            users[s['user']].pop('totp', None)
+        self.store.modify(apply)
+        s['totp'] = False
+
+    def locked_until(self, username):
+        """When username's lock after wrong passwords ends (epoch seconds), or 0."""
+        with self.lock:
+            _, until, _ = self.failures.get(username, (0, 0, 0))
+        return until if until > time.time() else 0
 
     def totp_reset(self, actor, username):
         """Admin: remove username's second factor (lost phone); the user is logged out everywhere."""

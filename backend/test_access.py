@@ -363,7 +363,7 @@ class HttpTests(unittest.TestCase):
     def test_flow(self):
         code, status = self.call('/api/status')
         # B10: without a login only online + sign-in mode; model state, errors and counts moved to /api/session
-        self.assertEqual((code, status), (200, {'status': 'online', 'auth_required': True, 'auth_mode': 'accounts'}))
+        self.assertEqual((code, status), (200, {'status': 'online', 'auth_mode': 'accounts'}))
         self.assertEqual(self.runner.status()['model_state'], 'stopped')
         self.assertIsNone(self.runner.proc)  # no VRAM before anyone logs in
         self.assertEqual(self.call('/api/hpo_search?q=a')[0], 401)
@@ -829,7 +829,7 @@ class TotpTests(unittest.TestCase):
         self.assertIsNone(totp.verify(secret, totp.code(secret, now), t=now, after=step))  # no replay
         self.assertIsNone(totp.verify(secret, 'abcdef', t=now))
         self.assertEqual(len(totp.generate_secret()), 32)
-        self.assertTrue(totp.uri('bs.an', 'ABC').startswith('otpauth://totp/Fe2Gen%3Abs.an?secret=ABC&issuer=Fe2Gen'))
+        self.assertTrue(totp.uri('bs.an', 'ABC').startswith('otpauth://totp/Fe2Gen:bs.an?secret=ABC&issuer=Fe2Gen'))
         codes = totp.backup_codes()
         self.assertEqual((len(codes), len(set(codes))), (8, 8))
         self.assertRegex(codes[0], r'^[a-z2-9]{4}-[a-z2-9]{4}$')
@@ -854,22 +854,26 @@ class TotpTests(unittest.TestCase):
         import totp
         with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
             admin = self.login(srv, 'quan.tri')
-            self.assertTrue(admin['user']['needs_2fa'])
+            self.assertEqual((admin['totp_required'], admin['totp_enabled']), (True, False))
             token = admin['token']
             code, data = srv.call('/api/admin/users', token=token)
-            self.assertEqual((code, data.get('needs_2fa')), (403, True))
+            self.assertEqual((code, data.get('totp_required')), (403, True))
+            self.assertEqual(srv.call('/api/change_password', {'old_password': 'x', 'new_password': 'y'}, token)[0], 403)
+            session = srv.call('/api/session', token=token)[1]
+            self.assertEqual((session['totp_required'], session['idle_minutes']), (True, 60))
             self.assertEqual(srv.call('/api/admin/users/create', {'username': 'x.y', 'role': 'lab'}, token)[0], 403)
             self.assertEqual(srv.call('/api/hpo_search?q=a', token=token)[0], 403)
             self.assertEqual(srv.call('/api/session', token=token)[0], 200)
             secret, backup = self.enable(srv, token)
+            self.assertFalse(srv.call('/api/session', token=token)[1]['totp_required'])
             code, users = srv.call('/api/admin/users', token=token)  # the same session is now verified
             self.assertEqual(code, 200)
             self.assertNotIn(secret, json.dumps(users))                   # the secret never leaves again
             self.assertNotIn('backup', json.dumps(users))
-            self.assertTrue(next(u for u in users['users'] if u['username'] == 'quan.tri')['totp'])
+            self.assertTrue(next(u for u in users['users'] if u['username'] == 'quan.tri')['totp_enabled'])
             # next login: password, then code
             code, first = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})
-            self.assertEqual((code, first['second_factor']), (200, True))
+            self.assertEqual((code, first['second_factor'], first['user']), (200, True, {'username': 'quan.tri', 'name': 'quan.tri'}))
             self.assertNotIn('token', first)
             self.assertEqual(srv.call('/api/admin/users', token=first['pending'])[0], 401)  # pending is no session
             code, bad = srv.call('/api/login/totp', {'pending': first['pending'], 'code': '000000'})
@@ -877,7 +881,7 @@ class TotpTests(unittest.TestCase):
             # the code used to enable cannot be replayed; wait for the next step is too slow, use a backup code
             code, ok = srv.call('/api/login/totp', {'pending': first['pending'], 'code': backup[0]})
             self.assertEqual(code, 200, ok)
-            self.assertFalse(ok['user']['needs_2fa'])
+            self.assertEqual((ok['totp_required'], ok['totp_enabled']), (False, True))
             self.assertEqual(srv.call('/api/admin/users', token=ok['token'])[0], 200)
             # a backup code works once
             first = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})[1]
@@ -925,7 +929,7 @@ class TotpTests(unittest.TestCase):
         with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
             doctor = self.login(srv, 'bs.an')
             self.assertIn('token', doctor)
-            self.assertFalse(doctor['user']['needs_2fa'])
+            self.assertFalse(doctor['totp_required'])
             self.assertEqual(srv.call('/api/hpo_search?q=a', token=doctor['token'])[0], 200)
             secret, _ = self.enable(srv, doctor['token'])
             self.assertEqual(srv.call('/api/totp/setup', {}, doctor['token'])[0], 422)  # already on
@@ -1147,6 +1151,98 @@ class DurableLockAndAuditChainTests(unittest.TestCase):
         ok, report = audit.verify([path])                       # the newest file alone continues an older one
         self.assertTrue(ok, report)
         self.assertTrue(any('nối tiếp' in r for r in report))
+
+
+class ApiContractTests(unittest.TestCase):
+    """Field names the page relies on: setup kept in users.json, disable, locked_until, gpu_idle_minutes."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data
+
+    def test_setup_is_pending_in_users_file_until_enabled(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            token = self.login(srv, 'bs.an')['token']
+            setup = srv.call('/api/totp/setup', {}, token)[1]
+            self.assertEqual(len(setup['secret']), 32)
+            self.assertTrue(setup['uri'].startswith('otpauth://totp/Fe2Gen:bs.an?secret=' + setup['secret'] + '&issuer=Fe2Gen'))
+            stored = self.store.all()['bs.an']['totp']
+            self.assertEqual(stored, {'pending_secret': setup['secret']})
+            self.assertIn('token', self.login(srv, 'bs.an'))         # not in force yet
+            again = srv.call('/api/totp/setup', {}, token)[1]          # a new setup replaces the pending secret
+            self.assertEqual(srv.call('/api/totp/enable', {'code': totp.code(setup['secret'])}, token)[0], 422)
+            done = srv.call('/api/totp/enable', {'code': totp.code(again['secret'])}, token)[1]
+            self.assertEqual(len(done['backup_codes']), 8)
+            stored = self.store.all()['bs.an']['totp']
+            self.assertNotIn('pending_secret', stored)
+            self.assertEqual(len(stored['backup']), 8)
+            self.assertTrue(all(len(h) == 64 for h in stored['backup']))
+
+    def test_user_turns_own_2fa_off_but_an_admin_cannot(self):
+        import totp
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            token = self.login(srv, 'bs.an')['token']
+            secret = srv.call('/api/totp/setup', {}, token)[1]['secret']
+            backup = srv.call('/api/totp/enable', {'code': totp.code(secret)}, token)[1]['backup_codes']
+            self.assertEqual(srv.call('/api/totp/disable', {'password': 'sai-mat-khau', 'code': backup[0]}, token)[0], 422)
+            self.assertEqual(srv.call('/api/totp/disable', {'password': 'mat-khau-bs.an', 'code': '000000'}, token)[0], 422)
+            code, out = srv.call('/api/totp/disable', {'password': 'mat-khau-bs.an', 'code': backup[0]}, token)
+            self.assertEqual((code, out['ok'], out['totp_enabled']), (200, True, False))
+            self.assertNotIn('totp', self.store.all()['bs.an'])
+            self.assertIn('token', self.login(srv, 'bs.an'))
+            admin_auth = Auth(self.store)
+            users = self.store.all()
+            users['quan.tri']['totp'] = {'secret': totp.generate_secret(), 'enabled': True, 'backup': []}
+            self.store.save(users)
+            first = self.login(srv, 'quan.tri')
+            admin = srv.call('/api/login/totp', {'pending': first['pending'],
+                                                 'code': totp.code(users['quan.tri']['totp']['secret'])})[1]['token']
+            code, out = srv.call('/api/totp/disable', {'password': 'mat-khau-quan.tri',
+                                                       'code': totp.code(users['quan.tri']['totp']['secret'], time.time() + 30)}, admin)
+            self.assertEqual(code, 422)
+            self.assertIn('quản trị', out['error'])
+        self.assertIn('totp_disabled', [e['event'] for e in self.audit.tail()])
+
+    def test_admin_with_temporary_password_changes_it_first_then_sets_up_2fa(self):
+        auth = Auth(self.store)
+        temp = auth.reset_password('quan.tri')
+        with LiveServer(AUTH=auth, AUDIT=self.audit) as srv:
+            data = srv.call('/api/login', {'username': 'quan.tri', 'password': temp})[1]
+            token = data['token']
+            self.assertTrue(data['user']['must_change'])
+            self.assertEqual(srv.call('/api/totp/setup', {}, token)[0], 403)  # the password comes first
+            code, out = srv.call('/api/change_password', {'old_password': temp, 'new_password': 'mây trắng bay qua đồi'}, token)
+            self.assertEqual(code, 200)
+            self.assertTrue(out['user']['totp_required'])
+            self.assertEqual(srv.call('/api/totp/setup', {}, token)[0], 200)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=token)[0], 403)
+
+    def test_locked_until_and_gpu_idle_minutes(self):
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit) as srv:
+            admin = self.login(srv, 'quan.tri')
+            self.assertEqual((admin['idle_minutes'], admin['gpu_idle_minutes']), (60, 60))
+            for _ in range(5):
+                srv.call('/api/login', {'username': 'bs.an', 'password': 'sai-mat-khau'})
+            users = {u['username']: u for u in srv.call('/api/admin/users', token=admin['token'])[1]['users']}
+            self.assertRegex(users['bs.an']['locked_until'], r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$')
+            self.assertEqual(users['quan.tri']['locked_until'], '')
+            self.assertEqual(srv.call('/api/admin/users/unlock', {'username': 'bs.an'}, admin['token'])[1]['ok'], True)
+            session = srv.call('/api/session', token=admin['token'])[1]
+            self.assertEqual((session['idle_minutes'], session['gpu_idle_minutes'], session['totp_enabled']), (60, 60, False))
+            for key in ('model_state', 'model_error', 'model_load_seconds', 'model_configured'):
+                self.assertIn(key, session)
+            gpu = srv.call('/api/admin/gpu', token=admin['token'])[1]
+            self.assertEqual(gpu['idle_minutes'], 60)  # admin.js reads the GPU idle time under this name
 
 
 class FailClosedTests(unittest.TestCase):

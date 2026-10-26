@@ -56,7 +56,7 @@ def verify(secret, given, t=None, window=1, after=None):
 
 
 def uri(username, secret):
-    label = quote(f'{ISSUER}:{username}')
+    label = quote(f'{ISSUER}:{username}', safe=':@')  # the usual form: otpauth://totp/Fe2Gen:user?...
     return f'otpauth://totp/{label}?secret={secret}&issuer={ISSUER}&algorithm=SHA1&digits={DIGITS}&period={STEP}'
 
 
