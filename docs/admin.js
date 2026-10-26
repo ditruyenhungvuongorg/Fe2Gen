@@ -125,7 +125,7 @@
           if (!confirm('Buộc ' + s.username + ' đăng xuất trên mọi thiết bị' + (s.username === user?.username ? ' khác' : '') + '?')) return;
           act(() => api('/api/admin/sessions/end', {username:s.username}, 20000), r => 'Đã đăng xuất ' + r.ended + ' phiên của ' + s.username + '.');
         }}, 'Buộc đăng xuất')));
-      return el('div', {}, el('p', {class:'hint'}, data.sessions.length + ' phiên đang mở. Phiên tự hết sau 4 giờ không thao tác hoặc 12 giờ kể từ khi đăng nhập; khởi động lại dịch vụ thì mọi người đăng nhập lại.'), rows);
+      return el('div', {}, el('p', {class:'hint'}, data.sessions.length + ' phiên đang mở. Phiên tự hết sau ' + FrontLogic.idleMinutesOf(sessionInfo?.idle_minutes) + ' phút không thao tác' + (sessionInfo?.session_hours ? ' hoặc ' + sessionInfo.session_hours + ' giờ kể từ khi đăng nhập' : '') + '; khởi động lại dịch vụ thì mọi người đăng nhập lại.'), rows);
     },
 
     async audit() {

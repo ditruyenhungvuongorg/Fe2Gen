@@ -25,9 +25,12 @@ function localStatus(id, message = '') { $(id).textContent = message; }
 // A 401 from these means a wrong password or code, not an ended session.
 const CREDENTIAL_PATHS = new Set(['/api/login', '/api/login/totp', '/api/totp/enable', '/api/totp/disable', '/api/change_password']);
 const apiError = (message, status = 0, data = {}) => Object.assign(Error(message), {status, data});
+// Polling and keep-alive checks; they do not count as the user being at the computer.
+const BACKGROUND_PATHS = new Set(['/api/status', '/api/session']);
 async function api(path, payload, timeout = 120000, controller = new AbortController()) {
   if (!base && location.hostname.endsWith('github.io')) throw Error('Mở Kết nối để nhập địa chỉ máy chủ Ubuntu.');
   requests.add(controller);
+  if (!BACKGROUND_PATHS.has(path)) markActivity();  // a request the user started counts as activity
   const timeoutId = setTimeout(() => controller.abort('timeout'), timeout);
   try {
     const response = await fetch(base + path, {
@@ -283,7 +286,7 @@ $('extract').onclick = async () => {
   if (busy) return;
   const text = $('clinical-text').value;
   if (!text.trim()) { localStatus('extract-status','Nhập đoạn mô tả siêu âm trước.'); return; }
-  const seq = ++extractVersion; busy = 'extract'; updateActions();
+  const seq = ++extractVersion; busy = 'extract'; idle.busy++; updateActions();
   localStatus('extract-status', modelState === 'ready' ? 'Model 1 đang tách dấu hiệu. Các HPO đã chọn được giữ nguyên.'
     : 'Model 1 đang khởi động trên GPU (thường dưới 1 phút) rồi tách dấu hiệu. Các HPO đã chọn được giữ nguyên.');
   try {
@@ -294,7 +297,7 @@ $('extract').onclick = async () => {
     renderMentions();
     localStatus('extract-status', data.mentions.length ? 'Tìm thấy ' + data.mentions.length + ' cụm. Chọn HPO phù hợp bên dưới; không tự ghi đè danh sách đã duyệt.' : 'Chưa tách được dấu hiệu. Bạn vẫn có thể tìm HPO thủ công.');
   } catch (e) { if (seq === extractVersion) localStatus('extract-status', e.message); }
-  finally { busy = false; updateActions(); }
+  finally { busy = false; idle.busy--; markActivity(); updateActions(); }
 };
 $('clear-hpos').onclick = () => { selection.clear(); invalidate(); renderSelected(); renderSearch(); renderMentions(); notice('Đã xóa danh sách HPO. Đoạn văn và gợi ý vẫn được giữ.'); };
 $('reviewed').onchange = updateActions;
@@ -303,7 +306,7 @@ $('match').onclick = async () => {
   if (busy || selection.conflicts || !$('reviewed').checked) return;
   const seq = revision;
   const snapshot = {hpos:structuredClone([...chosen.values()]), text:$('clinical-text').value, wesText:$('wes-genes').value.trim()};
-  busy = 'match'; updateActions(); notice('Đang đối chiếu hồ sơ bệnh hiếm…');
+  busy = 'match'; idle.busy++; updateActions(); notice('Đang đối chiếu hồ sơ bệnh hiếm…');
   try {
     const data = await api('/api/match_diseases', {hpos:snapshot.hpos.map(h => ({id:h.id,status:h.status})), genes:snapshot.wesText});
     if (seq !== revision) return;
@@ -316,7 +319,7 @@ $('match').onclick = async () => {
     $('inheritance-filter').innerHTML = '<option value="">Tất cả kiểu di truyền</option>' + modes.map(m => '<option>' + escape(m) + '</option>').join('');
     renderResults(); notice('');
   } catch (e) { if (seq === revision) {result = null;labIds.clear();notice(e.message);} }
-  finally { busy = false; updateActions(); }
+  finally { busy = false; idle.busy--; markActivity(); updateActions(); }
 };
 
 const GROUPS=[
@@ -415,8 +418,58 @@ $('logout').onclick=async()=>{
   if(hasCase()&&!confirm('Đăng xuất sẽ xóa nội dung ca đang mở trong tab này. Tiếp tục?'))return;
   try{await api('/api/logout',{},15000);}catch{}
   for(const d of ['account','admin'])if($(d).open)$(d).close();
-  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();showUser();showGate('login');checkConnection();
+  signedOut();showGate('login');checkConnection();
 };
+// After logout: forget the user, the 2FA state and the case. /api/logout sends Clear-Site-Data "cache", which
+// leaves localStorage alone; still reread the saved server instead of assuming it is kept or gone.
+function signedOut(){
+  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();showUser();
+  $('idle-warning').hidden=true;
+  try{const saved=localStorage.getItem('prenatal-api');if(saved)base=saved;}catch{}
+}
+
+// B12/B27: sign out by itself after idle_minutes (from /api/session) without mouse, keyboard, touch or scrolling,
+// with a 60-second warning. Text extraction and matching pause the countdown while they run. A shared hospital
+// computer left signed in must not show the case to the next person.
+const idle={last:Date.now(),busy:0,lastPing:Date.now(),ending:false};
+const idleOn=()=>authMode==='accounts'&&!!access&&!!user;
+function markActivity(){idle.last=Date.now();if(!$('idle-warning').hidden)checkIdle();}
+function placeIdleWarning(){
+  // Modal dialogs make the rest of the page inert: show the warning inside the open one.
+  const host=[...document.querySelectorAll('dialog')].reverse().find(d=>d.open&&d.matches(':modal'))||document.body;
+  if($('idle-warning').parentElement!==host)host.prepend($('idle-warning'));
+}
+function checkIdle(){
+  if(idle.ending)return;
+  if(!idleOn()){$('idle-warning').hidden=true;return;}
+  const now=Date.now();
+  const s=FrontLogic.idleState({now,lastActivity:idle.last,idleMinutes:sessionInfo?.idle_minutes,busy:idle.busy>0});
+  if(s.phase==='expired')return idleLogout();
+  if(s.phase==='warn'){$('idle-seconds').textContent=s.secondsLeft;placeIdleWarning();}
+  $('idle-warning').hidden=s.phase!=='warn';
+  // Typing a long report sends no request: keep the server session alive while the doctor is active.
+  if(FrontLogic.shouldPing({now,lastActivity:idle.last,lastPing:idle.lastPing})){idle.lastPing=now;refreshSession();}
+}
+async function idleLogout(){
+  idle.ending=true;
+  const minutes=FrontLogic.idleMinutesOf(sessionInfo?.idle_minutes);
+  for(const d of ['account','admin','settings','lab'])if($(d).open)$(d).close();
+  resetCase();  // clear the case first, before waiting for the network
+  try{await api('/api/logout',{},15000);}catch{}
+  signedOut();idle.ending=false;
+  showGate('login','Đã tự đăng xuất sau '+minutes+' phút không thao tác; nội dung ca trong tab này đã được xóa.');
+}
+for(const type of ['pointerdown','pointermove','keydown','wheel','scroll','touchstart'])
+  addEventListener(type,markActivity,{capture:true,passive:true});
+$('idle-stay').onclick=()=>{markActivity();idle.lastPing=Date.now();refreshSession();};
+// Back to a hidden tab: timers may have been slowed, so decide at once; then ask the server whether the session
+// still exists (401 → sign-in page).
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState!=='visible'||!idleOn())return;
+  checkIdle();
+  if(idleOn())refreshSession();
+});
+setInterval(checkIdle,1000);
 $('account-open').onclick=()=>openAccount();
 $('account-close').onclick=()=>$('account').close();
 $('account').oncancel=e=>{if(accountLocked())e.preventDefault();};  // Esc cannot skip a temporary password or required 2FA
@@ -480,6 +533,7 @@ const PENDING_MS=5*60000,CODE_TRIES=5;
 const BAD_REPLY='Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.';
 async function signedIn(step,data){
   access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();
+  idle.last=idle.lastPing=Date.now();
   showUser();notice('');
   await refreshSession();  // 2FA requirement and the idle limit
   showGate(null);
