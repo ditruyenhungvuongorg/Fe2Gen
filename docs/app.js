@@ -65,6 +65,9 @@ function showUser() {
   $('account-admin').hidden = user?.role !== 'admin';
   // With accounts the sign-in page logs people in; this button only sets the server for the shared access code.
   $('settings-open').hidden = !!user || authMode === 'accounts';
+  // Doctors (and admins) send cases to the lab; lab accounts receive them (lab.js).
+  $('send-lab').hidden = !user || user.role === 'lab';
+  window.labCases?.onUser();
   // Phòng Lab: HPO search, matching and the lab sheet; no text extraction on the GPU.
   const lab = user?.role === 'lab';
   $('tab-text').hidden = lab;
@@ -121,6 +124,7 @@ function updateActions() {
   $('extract').textContent = busy === 'extract' ? 'Đang tách dấu hiệu…' : 'Tách dấu hiệu từ văn bản';
   $('match').textContent = busy === 'match' ? 'Đang đối chiếu…' : 'Đối chiếu bệnh →';
   $('export').disabled = !result || !labIds.size || !!selection.conflicts || !!busy;
+  $('send-lab').disabled = $('export').disabled;
   $('conflict-summary').hidden = !selection.conflicts;
   $('conflict-summary').textContent = selection.conflicts ? selection.conflicts + ' HPO có trạng thái khác nhau giữa các nguồn. Chọn trạng thái cuối cùng trước khi đối chiếu.' : '';
 }

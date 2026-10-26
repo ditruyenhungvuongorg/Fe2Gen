@@ -3,7 +3,8 @@
 (() => {
   const STATE = {stopped:'Nghỉ (không chiếm GPU)', loading:'Đang khởi động', ready:'Sẵn sàng (đang chiếm GPU)', paused:'Tạm dừng', failed:'Chưa chạy được'};
   const DETAIL = {target:'tài khoản', role:'vai', changes:'thay đổi', chars:'số ký tự', findings:'số cụm', seconds:'giây',
-                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên'};
+                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên',
+                  case:'mã ca gửi Lab', diseases:'số bệnh', status:'trạng thái'};
   const ACTIONS = {pause:'tạm dừng', resume:'cho chạy lại', release:'giải phóng ngay'};
   let tab = 'users', temp = null;
 

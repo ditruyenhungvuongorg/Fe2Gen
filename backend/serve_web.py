@@ -7,18 +7,20 @@ from pathlib import Path
 from threading import BoundedSemaphore, Thread
 from urllib.parse import urlparse, parse_qs
 from audit import EVENTS, AuditLog
+from lab_cases import STATUSES as LAB_STATUSES, LabCases
 from auth import GPU_ROLES, ROLES, USERNAME, Auth, LoginRefused, public_user
 from model1_process import ModelUnavailable, free_vram_mib
 from web_service import WebSystem
 
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT.parent / 'docs'
-STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/config.js', '/case-state.js',
+STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/lab.js', '/config.js', '/case-state.js',
                 '/fonts/BeVietnamPro-Regular.ttf', '/fonts/BeVietnamPro-SemiBold.ttf', '/fonts/OFL.txt',
                 '/fonts/Inter-vietnamese.woff2', '/fonts/Inter-latin-ext.woff2', '/fonts/Inter-latin.woff2', '/fonts/OFL-Inter.txt')
 SYSTEM = WebSystem()
 AUTH = Auth()
 AUDIT = AuditLog()
+LAB = LabCases()
 WORK = BoundedSemaphore(1)
 QUEUE_SECONDS = 90
 # On logout Model 1 stays loaded while another doctor was active in the last 10 minutes; otherwise it is released.
@@ -144,6 +146,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({'user': user, 'role': self.role, **self.model_status()})
             if path.path == '/api/hpo_search':
                 return self.send_json(SYSTEM.search_hpo(parse_qs(path.query).get('q', [''])[0][:200]))
+            if path.path == '/api/lab/cases':
+                return self.send_json({'cases': LAB.visible(self.user, self.role), 'statuses': LAB_STATUSES})
             if path.path.startswith('/api/admin/') and self.admin_only():
                 return self.admin_get(path.path, parse_qs(path.query))
             return self.send_json({'error': 'Không có endpoint này.'}, 404)
@@ -173,6 +177,8 @@ class Handler(SimpleHTTPRequestHandler):
             if self.admin_only():
                 self.admin_post(path, payload)
             return
+        if path.startswith('/api/lab/'):
+            return self.lab_post(path, payload)
         if path not in ('/api/extract_hpo', '/api/match_diseases'):
             return self.send_json({'error': 'Không có endpoint này.'}, 404)
         extract = path.endswith('extract_hpo')
@@ -307,6 +313,30 @@ class Handler(SimpleHTTPRequestHandler):
         except ValueError as exc:
             return self.send_json({'error': str(exc)}, 422)
         self.send_json({'error': 'Không có endpoint này.'}, 404)
+
+    def lab_post(self, path, p):
+        """Cases sent to the lab. Audit holds the case id, never its content."""
+        try:
+            if path == '/api/lab/cases/create':
+                if self.role == 'lab':
+                    return self.send_json({'error': 'Tài khoản Phòng Lab nhận ca, không gửi ca.'}, 403)
+                case = LAB.create(self.user, self.session['name'] if self.session else self.user, p)
+                AUDIT.write('lab_case_sent', self.user, case=case['id'], hpo_count=len(case['hpos']),
+                            diseases=len(case['diseases']), chars=len(case['text']))
+                return self.send_json({'case': case})
+            if path == '/api/lab/cases/update':
+                case = LAB.update(str(p.get('id') or ''), self.user, self.role, p.get('status'), p.get('note'))
+                AUDIT.write('lab_case_updated', self.user, case=case['id'], status=case['status'])
+                return self.send_json({'case': case})
+            if path == '/api/lab/cases/delete':
+                case = LAB.delete(str(p.get('id') or ''), self.user, self.role)
+                AUDIT.write('lab_case_deleted', self.user, case=case['id'])
+                return self.send_json({'ok': True})
+        except PermissionError as exc:
+            return self.send_json({'error': str(exc)}, 403)
+        except ValueError as exc:
+            return self.send_json({'error': str(exc)}, 422)
+        return self.send_json({'error': 'Không có endpoint này.'}, 404)
 
     def admin_gpu(self, action):
         runner = SYSTEM.runner

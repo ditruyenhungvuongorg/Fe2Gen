@@ -18,6 +18,7 @@ EVENTS = {
     'user_created': 'Tạo tài khoản', 'user_updated': 'Sửa tài khoản', 'password_reset': 'Đặt lại mật khẩu',
     'user_deleted': 'Xóa tài khoản', 'sessions_ended': 'Buộc đăng xuất', 'gpu': 'Điều khiển GPU',
     'extract': 'Tách đoạn văn', 'match': 'Đối chiếu bệnh',
+    'lab_case_sent': 'Gửi ca sang Lab', 'lab_case_updated': 'Lab cập nhật ca', 'lab_case_deleted': 'Xoá ca gửi Lab',
 }
 
 
