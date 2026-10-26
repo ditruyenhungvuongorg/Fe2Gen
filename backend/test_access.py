@@ -18,12 +18,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 # Tests also run on the production host (deployment step 3): keep serve_web's module-level stores away from the
-# real users.json, audit log, access log and lockout file. Child processes inherit these variables.
+# real users.json, audit log, access log and model state file (the lockout file sits next to users.json).
+# Child processes inherit these variables.
 if 'FE2GEN_TEST_DIR' not in os.environ:
     os.environ['FE2GEN_TEST_DIR'] = tempfile.mkdtemp(prefix='fe2gen-test-')
     for _name, _file in (('WEB_USERS_FILE', 'users.json'), ('WEB_AUDIT_FILE', 'audit.jsonl'),
-                         ('WEB_ACCESS_LOG', 'access.log'), ('WEB_LOGIN_FAILURES_FILE', 'login_failures.json'),
-                         ('MODEL1_STATE_FILE', 'model1_state.json')):
+                         ('WEB_ACCESS_LOG', 'access.log'), ('MODEL1_STATE_FILE', 'model1_state.json')):
         os.environ[_name] = str(Path(os.environ['FE2GEN_TEST_DIR'], _file))
 
 from accesslog import AccessLog
@@ -630,12 +630,12 @@ class AccessLogTests(unittest.TestCase):
                 urllib.request.urlopen(srv.base + '/app.js', timeout=30).read()
             text = log.path.read_text(encoding='utf-8')
             lines = [json.loads(x) for x in text.splitlines()]
-            self.assertEqual([(e['method'], e['path'], e['status']) for e in lines],
-                             [('POST', '/api/login', 200), ('GET', '/api/hpo_search', 200),
-                              ('POST', '/api/extract_hpo', 200), ('GET', '/api/nope%01', 404), ('GET', '/app.js', 200)])
-            self.assertEqual([e['user'] for e in lines], ['-', 'bs.an', 'bs.an', 'bs.an', '-'])
+            # a line is written after its response, so the client may already be on the next request: no order
+            self.assertEqual(sorted((e['method'], e['path'], e['status'], e['user']) for e in lines), sorted([
+                ('POST', '/api/login', 200, '-'), ('GET', '/api/hpo_search', 200, 'bs.an'),
+                ('POST', '/api/extract_hpo', 200, 'bs.an'), ('GET', '/api/nope%01', 404, 'bs.an'), ('GET', '/app.js', 200, '-')]))
             self.assertEqual(set(lines[0]), {'time', 'method', 'path', 'status', 'user', 'ms', 'bytes'})
-            self.assertGreater(lines[-1]['bytes'], 1000)
+            self.assertGreater(next(e for e in lines if e['path'] == '/app.js')['bytes'], 1000)
             for secret in (token, 'mat-khau-1', 'BÍ-MẬT', 'B\\u00cd', 'não', 'Thai'):
                 self.assertNotIn(secret, text)
             if os.name == 'posix':
@@ -1062,6 +1062,91 @@ class ModelStateFileTests(unittest.TestCase):
                     self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
             finally:
                 m.stop()
+
+
+class DurableLockAndAuditChainTests(unittest.TestCase):
+    """B14: the login lock survives a restart; the audit log is hash-chained, verifiable and copied to stderr."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor'})
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_lock_survives_restart(self):
+        a = Auth(self.store)
+        for _ in range(5):
+            with self.assertRaises(PermissionError):
+                a.login('bs.an', 'sai-mat-khau')
+        failures = Path(self.dir.name, 'login_failures.json')
+        self.assertTrue(failures.exists())                      # next to users.json
+        if os.name == 'posix':
+            self.assertEqual(os.stat(failures).st_mode & 0o777, 0o600)
+        restarted = Auth(self.store)                            # the service restarted
+        self.assertGreater(restarted.locked_seconds('bs.an'), 0)
+        with self.assertRaisesRegex(PermissionError, 'nhiều lần'):
+            restarted.login('bs.an', 'mat-khau-bs.an')
+        restarted.unlock('bs.an')
+        self.assertEqual(Auth(self.store).locked_seconds('bs.an'), 0)  # the unlock is saved too
+        Auth(self.store).login('bs.an', 'mat-khau-bs.an')
+
+    def test_sprayed_names_do_not_grow_the_file_without_bound(self):
+        a = Auth(self.store)
+        a.MAX_FAILURE_KEYS = 50
+        for i in range(80):
+            with self.assertRaises(PermissionError):
+                a.login(f'khach{i:03d}', 'sai')
+            a.recent.clear()  # keep the global spraying pause out of the way
+        self.assertLessEqual(len(json.loads(Path(self.dir.name, 'login_failures.json').read_text())), 50)
+
+    def test_broken_failures_file_is_ignored(self):
+        Path(self.dir.name, 'login_failures.json').write_text('{oops', encoding='utf-8')
+        with redirect_stderr(StringIO()) as err:
+            a = Auth(self.store)
+        self.assertEqual(a.failures, {})
+        self.assertIn('login_failures.json', err.getvalue())
+
+    def test_audit_chain_detects_edits_and_deletions(self):
+        import audit
+        log = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+        with redirect_stderr(StringIO()) as err:
+            for i in range(5):
+                log.write('match', 'bs.an', hpo_count=i)
+        self.assertEqual(err.getvalue().count('[audit] '), 5)  # second copy for journald
+        lines = log.path.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(json.loads(lines[0])['prev'], '0' * 64)
+        self.assertNotIn('prev', log.tail()[0])                 # the admin page does not show the hashes
+        ok, report = audit.verify([log.path])
+        self.assertTrue(ok, report)
+        self.assertIn('OK: 5', report[-1])
+        edited = lines[:2] + [lines[2].replace('"hpo_count": 2', '"hpo_count": 9')] + lines[3:]
+        log.path.write_text('\n'.join(edited) + '\n', encoding='utf-8')
+        ok, report = audit.verify([log.path])
+        self.assertFalse(ok)
+        self.assertIn(':4:', report[-1])                        # the line after the edited one no longer matches
+        log.path.write_text('\n'.join(lines[:1] + lines[2:]) + '\n', encoding='utf-8')  # a line deleted
+        self.assertFalse(audit.verify([log.path])[0])
+        log.path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        with patch('sys.stdout', StringIO()) as out:
+            self.assertEqual(audit.main(['verify', str(log.path)]), 0)
+        self.assertIn('OK', out.getvalue())
+
+    def test_chain_continues_across_rotation_and_after_legacy_lines(self):
+        import audit
+        path = Path(self.dir.name, 'audit.jsonl')
+        path.write_text('{"time": "2026-10-01 08:00:00", "event": "login_ok", "user": "cu"}\n', encoding='utf-8')
+        log = AuditLog(path)
+        with redirect_stderr(StringIO()), patch.object(audit, 'MAX_BYTES', 300):
+            for i in range(8):
+                log.write('match', 'bs.an', hpo_count=i)
+        older = path.with_name('audit.jsonl.1')
+        self.assertTrue(older.exists())
+        ok, report = audit.verify([older, path])
+        self.assertTrue(ok, report)
+        ok, report = audit.verify([path])                       # the newest file alone continues an older one
+        self.assertTrue(ok, report)
+        self.assertTrue(any('nối tiếp' in r for r in report))
 
 
 class FailClosedTests(unittest.TestCase):

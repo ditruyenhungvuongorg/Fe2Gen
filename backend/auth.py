@@ -228,7 +228,8 @@ class Auth:
 
     PENDING_SECONDS, TOTP_TRIES = 300, 5  # second step of a login: 5 minutes, 5 codes
 
-    def __init__(self, store=None, token=None, session_hours=None, idle_hours=None, require_accounts=None, admin_2fa=None):
+    def __init__(self, store=None, token=None, session_hours=None, idle_hours=None, require_accounts=None, admin_2fa=None,
+                 failures_file=None):
         self.store = store or UserStore()
         self.token = os.getenv('WEB_ACCESS_TOKEN', '') if token is None else token
         self.require_accounts = (env_flag('WEB_REQUIRE_ACCOUNTS', '1') if require_accounts is None
@@ -244,7 +245,10 @@ class Auth:
         self.temp_seconds = _env_float('WEB_TEMP_PASSWORD_HOURS', 72) * 3600
         self.lock = threading.Lock()
         self.sessions = {}   # sha256(token) -> {"user", "name", "role", "must_change", "created", "seen"}
-        self.failures = {}   # username -> (count, locked_until, last_failure)
+        self.failures = {}   # username -> (count, locked_until, last_failure); kept in failures_file across restarts
+        self.failures_file = Path(failures_file or os.getenv('WEB_LOGIN_FAILURES_FILE')
+                                  or self.store.path.with_name('login_failures.json'))
+        self._load_failures()
         self.recent = []     # times of wrong passwords, all usernames
         self.dummy = hash_password('timing-equaliser')
 
@@ -261,6 +265,40 @@ class Auth:
         return hashlib.sha256(token.encode()).hexdigest()
 
     # ------------------------------------------------------------------ login
+    MAX_FAILURE_KEYS = 2000
+
+    def _load_failures(self):
+        try:
+            data = json.loads(self.failures_file.read_text(encoding='utf-8'))
+            now = time.time()
+            self.failures = {str(k)[:64]: (int(v[0]), float(v[1]), float(v[2])) for k, v in data.items()
+                             if isinstance(v, list) and len(v) == 3 and now - float(v[2]) <= 3600}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError) as exc:
+            print('[auth] login_failures.json not read:', type(exc).__name__, file=sys.stderr, flush=True)
+
+    def _save_failures(self):
+        """Write the lock counters (mode 600); call with self.lock held. Entries older than an hour are dropped and
+        at most MAX_FAILURE_KEYS kept, so names sprayed by an attacker cannot grow the file without bound."""
+        now = time.time()
+        live = sorted(((k, v) for k, v in self.failures.items() if now - v[2] <= 3600), key=lambda kv: -kv[1][2])
+        self.failures = dict(live[:self.MAX_FAILURE_KEYS])
+        try:
+            self.failures_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.failures_file.with_suffix('.tmp')
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump({k: list(v) for k, v in self.failures.items()}, f)
+            os.replace(tmp, self.failures_file)
+        except OSError as exc:  # the lock still works in memory
+            print('[auth] login_failures.json not written:', type(exc).__name__, file=sys.stderr, flush=True)
+
+    def _forget(self, username):
+        """Clear username's wrong-password count; call with self.lock held."""
+        if self.failures.pop(username, None) is not None:
+            self._save_failures()
+
     def _failed(self, username, now):
         """Count a wrong password or code toward username's lock; call with self.lock held."""
         count, _, last = self.failures.get(username, (0, 0, 0))
@@ -269,6 +307,7 @@ class Auth:
         self.recent.append(now)
         lock = min(LOCK_MAX, LOCK_BASE * 2 ** (count - LOCK_AFTER)) if count >= LOCK_AFTER else 0
         self.failures[username] = (count, now + lock, now)
+        self._save_failures()
 
     def _check_lock(self, username, now):
         with self.lock:
@@ -301,7 +340,7 @@ class Auth:
                 self.pending[self._key(pending)] = {'user': username, 'created': now, 'tries': 0}
             return None, {'second_factor': True, 'pending': pending}
         with self.lock:
-            self.failures.pop(username, None)
+            self._forget(username)
         return self._open_session(username, user, now, mfa=False)
 
     def login_totp(self, pending, given):
@@ -345,7 +384,7 @@ class Auth:
         with self.lock:
             if self.pending.pop(key, None) is None:  # two tabs racing with one pending login
                 raise LoginRefused('Bước xác thực đã hết hạn. Vui lòng đăng nhập lại.', 'totp_expired')
-            self.failures.pop(username, None)
+            self._forget(username)
         self.store.modify(spend)
         token, info = self._open_session(username, user, now, mfa=True)
         return token, info, backup is not None
@@ -457,7 +496,7 @@ class Auth:
         """Forget username's wrong passwords (admin page); True when it was locked."""
         was = self.locked_seconds(username) > 0
         with self.lock:
-            self.failures.pop(username, None)
+            self._forget(username)
         return was
 
     def logout(self, token):
@@ -580,7 +619,7 @@ class Auth:
         self.store.modify(apply)
         self.end_sessions(username)
         with self.lock:
-            self.failures.pop(username, None)  # a reset also lifts a lock
+            self._forget(username)  # a reset also lifts a lock
         return temp
 
     def delete_user(self, actor, username):
