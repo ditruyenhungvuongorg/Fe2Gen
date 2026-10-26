@@ -19,12 +19,16 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_PAUSE_FILE = Path.home() / 'prenatal_pubcasefinder/.deployment/gpu_pause'
+# Read by `bash gpu.sh status`, since /api/status no longer shows the model state. MODEL1_STATE_FILE='' turns it off.
+DEFAULT_STATE_FILE = Path.home() / 'prenatal_pubcasefinder/.deployment/model1_state.json'
 
 
 # Fixed ValueError messages that may reach the doctor (grep "raise ValueError" in model1_v6/, model1_v38_package/ and
@@ -89,6 +93,21 @@ def env_number(name, default):
         return float(default)
 
 
+def write_private_json(path, data):
+    """Write JSON atomically (temporary file in the same directory + os.replace), mode 600."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name + '.', suffix='.tmp')  # mkstemp: mode 600
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def free_vram_mib():
     """Free memory of the first visible GPU from nvidia-smi, or None when it cannot be read."""
     index = os.getenv('CUDA_VISIBLE_DEVICES', '0').split(',')[0].strip() or '0'
@@ -102,7 +121,7 @@ def free_vram_mib():
 
 class Model1Process:
     def __init__(self, kind, adapter_path, idle_seconds=3600, load_wait=120, request_seconds=300,
-                 min_free_mib=13000, pause_file=None, command=None, free_mib=free_vram_mib):
+                 min_free_mib=13000, pause_file=None, command=None, free_mib=free_vram_mib, state_file=None):
         self.kind = kind                    # 'v6' (v6/v7 bundle) or 'v38'
         self.adapter_path = adapter_path    # configured bundle/adapter, for /api/status
         self.idle_seconds = idle_seconds
@@ -110,6 +129,8 @@ class Model1Process:
         self.request_seconds = request_seconds
         self.min_free_mib = min_free_mib
         self.pause_file = Path(pause_file) if pause_file else None
+        self.state_file = Path(state_file) if state_file else None  # None: no state file (tests)
+        self.saved = None
         self.command = command or [sys.executable, '-m', 'model1_process']
         self.free_mib = free_mib
         self.cond = threading.Condition()
@@ -120,17 +141,20 @@ class Model1Process:
         self.last_used = time.monotonic()
         self.next_id = 0
         self.busy = False
+        self._save_state()  # a restarted web process must not leave the previous 'ready' in the file
         threading.Thread(target=self._watch, daemon=True).start()
 
     @classmethod
     def from_env(cls):
         bundle = os.getenv('MODEL1_V6_BUNDLE')
         adapter = bundle or os.getenv('MODEL1_ADAPTER')
+        state_file = os.environ.get('MODEL1_STATE_FILE')
         return cls('v6' if bundle else 'v38', Path(adapter) if adapter else None,
                    idle_seconds=env_number('MODEL1_IDLE_MINUTES', 60) * 60,
                    load_wait=env_number('MODEL1_LOAD_WAIT_SECONDS', 120),
                    min_free_mib=env_number('MODEL1_MIN_FREE_MIB', 13000),
-                   pause_file=os.getenv('MODEL1_PAUSE_FILE') or DEFAULT_PAUSE_FILE)
+                   pause_file=os.getenv('MODEL1_PAUSE_FILE') or DEFAULT_PAUSE_FILE,
+                   state_file=DEFAULT_STATE_FILE if state_file is None else state_file or None)
 
     # ------------------------------------------------------------------ state
     @property
@@ -139,6 +163,26 @@ class Model1Process:
 
     def paused(self):
         return bool(self.pause_file and self.pause_file.exists())
+
+    def _set(self, state, error=None):
+        """Change the state (caller holds self.cond) and record it in the state file."""
+        self.state = state
+        if error is not None:
+            self.error = error
+        self._save_state()
+
+    def _save_state(self):
+        if not self.state_file:
+            return
+        current = (self.state, self.error if self.state == 'failed' else '', self.load_seconds)
+        if current == self.saved:
+            return
+        try:
+            write_private_json(self.state_file, {'model_state': current[0], 'model_error': current[1], 'model_load_seconds': current[2],
+                                                 'updated': datetime.now().astimezone().isoformat(timespec='seconds')})
+            self.saved = current
+        except OSError as exc:  # the state file is for operators; serving goes on without it
+            print('[Model 1] Không ghi được file trạng thái:', type(exc).__name__, file=sys.stderr, flush=True)
 
     def touch(self):
         """Doctor activity: postpones the idle stop (does not start the model)."""
@@ -157,26 +201,26 @@ class Model1Process:
             if self.state in ('loading', 'ready'):
                 return self.state
             if not self.adapter_path:
-                self.state, self.error = 'failed', 'Model trích văn bản chưa được cấu hình.'
+                self._set('failed', 'Model trích văn bản chưa được cấu hình.')
                 return self.state
             if self.paused():
-                self.state, self.error = 'stopped', ''
+                self._set('stopped', '')
                 return 'paused'
             free = self.free_mib() if self.min_free_mib > 0 else None
             if free is not None and free < self.min_free_mib:
-                self.state = 'failed'
-                self.error = (f'GPU chỉ còn {free:,} MiB trống, Model 1 cần khoảng {int(self.min_free_mib):,} MiB. '
-                              'GPU có thể đang dùng để train hoặc chạy AI cục bộ; thử lại sau.')
+                self._set('failed', f'GPU chỉ còn {free:,} MiB trống, Model 1 cần khoảng {int(self.min_free_mib):,} MiB. '
+                                    'GPU có thể đang dùng để train hoặc chạy AI cục bộ; thử lại sau.')
                 print('[Model 1] Không khởi động:', self.error, file=sys.stderr, flush=True)
                 return self.state
             try:
                 proc = subprocess.Popen(self.command, cwd=str(BASE_DIR), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         text=True, encoding='utf-8', bufsize=1)
             except OSError as exc:
-                self.state, self.error = 'failed', f'Không chạy được tiến trình model: {exc}'
+                self._set('failed', f'Không chạy được tiến trình model: {exc}')
                 return self.state
             self.proc, self.responses = proc, queue.Queue()
-            self.state, self.error, self.started = 'loading', '', time.monotonic()
+            self.started = time.monotonic()
+            self._set('loading', '')
             print('[Model 1] Đang nạp model trong tiến trình', proc.pid, file=sys.stderr, flush=True)
             threading.Thread(target=self._read, args=(proc, self.responses), daemon=True).start()
             return self.state
@@ -207,7 +251,7 @@ class Model1Process:
         with self.cond:
             proc, self.proc = self.proc, None
             if self.state in ('loading', 'ready'):
-                self.state = 'stopped'
+                self._set('stopped')
             self.cond.notify_all()
         if not proc:
             return
@@ -280,11 +324,12 @@ class Model1Process:
                 with self.cond:
                     if self.proc is proc:
                         if event == 'ready':
-                            self.state, self.manifest = 'ready', msg.get('manifest') or {}
+                            self.manifest = msg.get('manifest') or {}
                             self.load_seconds = round(time.monotonic() - self.started, 1)
+                            self._set('ready')
                             print(f'[Model 1] Sẵn sàng sau {self.load_seconds} giây', file=sys.stderr, flush=True)
                         elif event == 'failed':
-                            self.state, self.error = 'failed', msg.get('message') or 'Model không nạp được.'
+                            self._set('failed', msg.get('message') or 'Model không nạp được.')
                         self.cond.notify_all()
             else:
                 responses.put(msg)
@@ -294,7 +339,7 @@ class Model1Process:
             if self.proc is proc:  # exited on its own (crash, CUDA error), not through stop()
                 self.proc = None
                 if self.state != 'failed':
-                    self.state, self.error = 'failed', f'Tiến trình model dừng bất thường (mã {code}).'
+                    self._set('failed', f'Tiến trình model dừng bất thường (mã {code}).')
                 print('[Model 1]', self.error, file=sys.stderr, flush=True)
             self.cond.notify_all()
 

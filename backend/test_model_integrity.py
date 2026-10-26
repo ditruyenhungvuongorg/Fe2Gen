@@ -1,17 +1,20 @@
-"""Model 1 process security: error messages never echo the report (B23), bundle SHA-256 check before loading (B22).
-Runs without GPU, torch or HPO data."""
+"""Model 1 process security: error messages never echo the report (B23), bundle SHA-256 check before loading (B22),
+state file for `gpu.sh status` (B10). Runs without GPU, torch or HPO data."""
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from contextlib import redirect_stderr
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import model1_process
 from model1_process import (GENERIC_INPUT_ERROR, KNOWN_INPUT_ERRORS, Model1Process, ModelProcessError, safe_input_error)
 from model1_v6.build_bundle import write_manifest
 from model1_v6.integrity import file_hashes, sha256_file, verify_bundle
@@ -260,6 +263,79 @@ class BundleIntegrityTests(unittest.TestCase):
                 Model1V6Runner(self.dir).load_model()
             unsloth.FastLanguageModel.from_pretrained.assert_not_called()
             save_and_load.load_peft_weights.assert_not_called()
+
+
+class StateFileTests(unittest.TestCase):
+    """B10: Model1Process writes its state for `gpu.sh status`; nothing is written unless configured."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.log = StringIO()
+        self.quiet = redirect_stderr(self.log)
+        self.quiet.__enter__()
+        self.models = []
+
+    def tearDown(self):
+        for m in self.models:
+            m.stop()
+        self.quiet.__exit__(None, None, None)
+        self.tmp.cleanup()
+
+    def make(self, **kw):
+        m = model(**kw)
+        self.models.append(m)
+        return m
+
+    def read(self, path):
+        return json.loads(path.read_text(encoding='utf-8'))
+
+    def test_state_changes_update_the_file(self):
+        path = self.dir / 'deployment/model1_state.json'
+        m = self.make(state_file=path)
+        first = self.read(path)
+        self.assertEqual(set(first), {'model_state', 'model_error', 'model_load_seconds', 'updated'})
+        self.assertEqual(first['model_state'], 'stopped')
+        datetime.fromisoformat(first['updated'])
+        m.ensure_ready()
+        ready = self.read(path)
+        self.assertEqual(ready['model_state'], 'ready')
+        self.assertIsInstance(ready['model_load_seconds'], float)
+        m.stop('test')
+        self.assertEqual(self.read(path)['model_state'], 'stopped')
+        self.assertFalse([p.name for p in path.parent.iterdir() if p.name != path.name])  # no temporary file left
+        if os.name == 'posix':
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_failure_is_written_with_its_message(self):
+        path = self.dir / 'state.json'
+        m = self.make(state_file=path, min_free_mib=13000, free_mib=lambda: 4000)
+        m.start()
+        state = self.read(path)
+        self.assertEqual(state['model_state'], 'failed')
+        self.assertIn('4,000 MiB', state['model_error'])
+
+    def test_not_configured_writes_nothing(self):
+        with patch.object(Path, 'home', return_value=self.dir), patch.dict(os.environ, {'HOME': str(self.dir)}):
+            m = self.make()  # state_file=None, as in test_access.py
+            m.ensure_ready()
+            m.stop()
+        self.assertIsNone(m.state_file)
+        self.assertEqual(list(self.dir.rglob('*')), [])
+
+    def test_from_env(self):
+        default = self.dir / 'default_state.json'
+        with patch.object(model1_process, 'DEFAULT_STATE_FILE', default):
+            with patch.dict(os.environ, {'MODEL1_STATE_FILE': '', 'MODEL1_PAUSE_FILE': str(self.dir / 'pause')}):
+                self.assertIsNone(Model1Process.from_env().state_file)
+            env = {k: v for k, v in os.environ.items() if k != 'MODEL1_STATE_FILE'}
+            env['MODEL1_PAUSE_FILE'] = str(self.dir / 'pause')
+            with patch.dict(os.environ, env, clear=True):
+                m = Model1Process.from_env()
+            self.assertEqual(m.state_file, default)
+            self.assertEqual(self.read(default)['model_state'], 'stopped')
+            with patch.dict(os.environ, {'MODEL1_STATE_FILE': str(self.dir / 'custom.json'), 'MODEL1_PAUSE_FILE': ''}):
+                self.assertEqual(Model1Process.from_env().state_file, self.dir / 'custom.json')
 
 
 if __name__ == '__main__':
