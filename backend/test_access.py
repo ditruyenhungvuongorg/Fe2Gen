@@ -179,16 +179,16 @@ class AuthTests(unittest.TestCase):
         self.assertFalse(check_password('sai', stored))
         self.assertFalse(check_password('x', 'hỏng'))
 
-    def test_mode_follows_users_file(self):
-        self.assertEqual(Auth(self.store, token='').mode, 'none')
-        self.assertEqual(Auth(self.store, token='abc').mode, 'token')
+    def test_mode_follows_users_file(self):  # WEB_REQUIRE_ACCOUNTS=0: local use only
+        self.assertEqual(Auth(self.store, token='', require_accounts=False).mode, 'none')
+        self.assertEqual(Auth(self.store, token='abc', require_accounts=False).mode, 'token')
         self.add()
         self.assertEqual(Auth(self.store, token='abc').mode, 'accounts')
         if os.name == 'posix':
             self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
 
     def test_shared_token_mode(self):
-        a = Auth(self.store, token='abc')
+        a = Auth(self.store, token='abc', require_accounts=False)
         self.assertEqual(a.check('Bearer abc'), (True, None))
         self.assertFalse(a.check('Bearer abd')[0])
         self.assertFalse(a.check('Bearer ábc')[0])  # non-ASCII header: refused, no TypeError
@@ -338,9 +338,9 @@ class HttpTests(unittest.TestCase):
         cls.quiet.__exit__(None, None, None)
         cls.dir.cleanup()
 
-    def call(self, path, payload=None, token=None):
+    def call(self, path, payload=None, token=None, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(payload).encode() if payload is not None else None,
-                                     headers={'Content-Type': 'application/json',
+                                     headers={'Content-Type': 'application/json', **(headers or {}),
                                               **({'Authorization': 'Bearer ' + token} if token else {})})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
@@ -463,6 +463,118 @@ class AdminHttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + '/api/status', timeout=30) as r:
             self.assertIn("script-src 'self'", r.headers['Content-Security-Policy'])
             self.assertEqual(r.headers['X-Frame-Options'], 'DENY')
+
+
+class LiveServer:
+    """serve_web.Handler on a free port with patched module globals; use as a context manager."""
+
+    def __init__(self, **globals_):
+        import serve_web
+        self.serve_web = serve_web
+        globals_.setdefault('SYSTEM', types.SimpleNamespace(
+            matcher=types.SimpleNamespace(profiles=[1]), canonical={'HP:1': {}}, runner=model(),
+            search_hpo=lambda q: [], extract=lambda text: {'mentions': [], 'seconds': 0.0}, match=lambda p: {'ok': True}))
+        self.system = globals_['SYSTEM']
+        self.patches = [patch.object(serve_web, k, v) for k, v in globals_.items()]
+
+    def __enter__(self):
+        self.quiet = redirect_stderr(StringIO())
+        self.stderr = self.quiet.__enter__()
+        for p in self.patches:
+            p.start()
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), self.serve_web.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = 'http://127.0.0.1:%d' % self.server.server_address[1]
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.system.runner.stop()
+        for p in self.patches:
+            p.stop()
+        self.quiet.__exit__(None, None, None)
+
+    def call(self, path, payload=None, token=None, headers=None):
+        return HttpTests.call(self, path, payload, token, headers)
+
+
+class FailClosedTests(unittest.TestCase):
+    """B3/B4: a missing, corrupt or empty users.json never opens the API (WEB_REQUIRE_ACCOUNTS=1)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name, 'users.json')
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def cases(self):
+        yield 'missing', lambda: None
+        yield 'corrupt', lambda: self.path.write_text('{"users": {"bs.an": ', encoding='utf-8')
+        yield 'empty', lambda: self.path.write_text('{"users": {}}', encoding='utf-8')
+
+    def test_locked_mode_refuses_every_api_call(self):
+        for kind, make in self.cases():
+            with self.subTest(kind):
+                self.path.unlink(missing_ok=True)
+                make()
+                with redirect_stderr(StringIO()):
+                    auth = Auth(UserStore(self.path), token='shared-code', require_accounts=True)
+                    self.assertEqual(auth.mode, 'locked')
+                    self.assertEqual(auth.check('Bearer shared-code'), (False, None))  # never falls back to the code
+                with LiveServer(AUTH=auth, AUDIT=AuditLog(Path(self.dir.name, 'audit.jsonl'))) as srv:
+                    for path, payload in (('/api/status', None), ('/api/hpo_search?q=a', None),
+                                          ('/api/login', {'username': 'bs.an', 'password': 'mat-khau-1'}),
+                                          ('/api/match_diseases', {'hpos': []})):
+                        code, data = srv.call(path, payload, token='shared-code')
+                        self.assertEqual(code, 503, (kind, path))
+                        self.assertIn('Hệ thống tạm khóa', data['error'])
+                    with urllib.request.urlopen(srv.base + '/', timeout=30) as r:
+                        self.assertEqual(r.status, 200)  # the page still loads and shows the message
+
+    def test_require_off_keeps_the_old_fallback(self):
+        for kind, make in self.cases():
+            with self.subTest(kind), redirect_stderr(StringIO()):
+                self.path.unlink(missing_ok=True)
+                make()
+                self.assertEqual(Auth(UserStore(self.path), token='abc', require_accounts=False).mode, 'token')
+                self.assertEqual(Auth(UserStore(self.path), token='', require_accounts=False).mode, 'none')
+
+    def test_default_is_fail_closed(self):
+        with patch.dict(os.environ, {}), redirect_stderr(StringIO()):
+            os.environ.pop('WEB_REQUIRE_ACCOUNTS', None)
+            self.assertEqual(Auth(UserStore(self.path), token='abc').mode, 'locked')
+            os.environ['WEB_REQUIRE_ACCOUNTS'] = '0'
+            self.assertEqual(Auth(UserStore(self.path), token='abc').mode, 'token')
+
+    def test_corrupt_file_keeps_last_good_copy_and_reports_once(self):
+        problems = []
+        store = UserStore(self.path, on_problem=problems.append)
+        store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+        auth = Auth(store, require_accounts=True)
+        token, _ = auth.login('bs.an', 'mat-khau-1')
+        with redirect_stderr(StringIO()) as err:
+            self.path.write_text('{"users": ', encoding='utf-8')  # half-written by hand
+            os.utime(self.path, ns=(time.time_ns(), time.time_ns() + 10 ** 9))
+            self.assertEqual(auth.mode, 'accounts')               # no 500 and no opening up
+            self.assertTrue(auth.check('Bearer ' + token)[0])     # doctors keep working
+            self.assertEqual(auth.mode, 'accounts')
+            with self.assertRaisesRegex(ValueError, 'Không đọc được'):  # the broken file is not overwritten blindly
+                auth.create_user('bs.binh', 'BS. Bình', 'doctor')
+        self.assertEqual(problems, ['corrupt'])                   # reported once per broken version of the file
+        self.assertIn('corrupt', err.getvalue())
+        store.save({'bs.an': {'name': 'BS. An', 'password': hash_password('mat-khau-1')}})
+        self.assertIsNone(store.problem)
+
+    def test_store_problem_is_audited(self):
+        import serve_web
+        log = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+        with patch.object(serve_web, 'AUDIT', log), redirect_stderr(StringIO()):
+            store = UserStore(self.path, on_problem=serve_web.AUTH.store.on_problem)
+            Auth(store, require_accounts=True).mode
+            Auth(store, require_accounts=True).mode
+        self.assertEqual([(e['event'], e['kind']) for e in log.tail()], [('auth_store_error', 'missing')])
 
 
 if __name__ == '__main__':

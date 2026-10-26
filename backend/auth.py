@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from pathlib import Path
@@ -89,25 +90,67 @@ def public_user(username, user):
             'created': user.get('created', ''), 'last_login': user.get('last_login', '')}
 
 
+class StoreError(ValueError):
+    """users.json cannot be read or written safely; the message is shown to the user."""
+
+
+def env_flag(name, default):
+    return os.getenv(name, default).strip().lower() not in ('0', 'false', 'no', 'off', '')
+
+
 class UserStore:
     """users.json: {"users": {username: {"name", "role", "password", "disabled", "must_change", "created",
-    "last_login"}}}; reread when it changes on disk (manage_users.py)."""
+    "last_login"}}}; reread when it changes on disk (manage_users.py).
 
-    def __init__(self, path=None):
+    problem is None while the file reads well, else 'missing', 'unreadable' or 'corrupt'. A missing file means no
+    accounts. An unreadable or corrupt file keeps the last good copy in memory (if any) so logged-in doctors keep
+    working, and writes are refused so the broken file is not overwritten blindly. on_problem(kind) is called
+    once per new problem (serve_web writes it to the audit log)."""
+
+    def __init__(self, path=None, on_problem=None):
         self.path = Path(path or os.getenv('WEB_USERS_FILE') or DEFAULT_USERS_FILE)
         self.lock = threading.Lock()
         self.write_lock = threading.Lock()
         self.users, self.mtime = {}, None
+        self.problem, self.problem_key = None, None
+        self.on_problem = on_problem
+
+    def _report(self, kind, key, detail=''):
+        self.problem = kind
+        if key != self.problem_key:
+            self.problem_key = key
+            print(f'[auth] users.json {kind}: {self.path} {detail}'.rstrip(), file=sys.stderr, flush=True)
+            if self.on_problem:
+                try:
+                    self.on_problem(kind)
+                except Exception:  # reporting must never break a request
+                    pass
 
     def _refresh(self):
         try:
             mtime = self.path.stat().st_mtime_ns
-        except OSError:
+        except FileNotFoundError:
             self.users, self.mtime = {}, None
+            self._report('missing', 'missing')
             return
-        if mtime != self.mtime:
-            self.users = json.loads(self.path.read_text(encoding='utf-8')).get('users', {})
-            self.mtime = mtime
+        except OSError as exc:
+            self._report('unreadable', ('unreadable', type(exc).__name__), type(exc).__name__)
+            return
+        if mtime == self.mtime:
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding='utf-8'))
+            users = data.get('users') if isinstance(data, dict) else None
+            if not isinstance(users, dict) or not all(isinstance(u, dict) for u in users.values()):
+                raise ValueError('no "users" object')
+        except OSError as exc:
+            self._report('unreadable', ('unreadable', mtime), type(exc).__name__)
+            return
+        except ValueError as exc:  # JSON syntax (JSONDecodeError, UnicodeDecodeError) or shape
+            self._report('corrupt', ('corrupt', mtime), type(exc).__name__)
+            return
+        self.users, self.mtime = users, mtime
+        self.problem, self.problem_key = None, None
 
     def all(self):
         with self.lock:
@@ -127,6 +170,7 @@ class UserStore:
         os.replace(tmp, self.path)
         with self.lock:
             self.users, self.mtime = {k: dict(v) for k, v in users.items()}, None
+            self.problem, self.problem_key = None, None
 
     def modify(self, change):
         """Read the current file, apply change(users) and save; returns what change returns."""
@@ -134,17 +178,28 @@ class UserStore:
             with self.lock:
                 self.mtime = None
             users = self.all()
+            if self.problem in ('unreadable', 'corrupt'):
+                raise StoreError('Không đọc được danh sách tài khoản; chưa lưu thay đổi. Liên hệ quản trị viên.')
             result = change(users)
             self.save(users)
             return result
 
 
-class Auth:
-    """Accounts when users.json lists at least one user; else the shared WEB_ACCESS_TOKEN; else open (local use)."""
+LOCKED_MESSAGE = 'Hệ thống tạm khóa: không đọc được danh sách tài khoản. Liên hệ quản trị viên.'
 
-    def __init__(self, store=None, token=None, session_hours=12, idle_hours=4):
+
+class Auth:
+    """Accounts when users.json lists at least one user.
+
+    With require_accounts (WEB_REQUIRE_ACCOUNTS, default on) a missing, unreadable, corrupt or empty users.json
+    gives mode 'locked': the service refuses every API request instead of opening up. Only with
+    WEB_REQUIRE_ACCOUNTS=0 (local use) does it fall back to the shared WEB_ACCESS_TOKEN, then to no login."""
+
+    def __init__(self, store=None, token=None, session_hours=12, idle_hours=4, require_accounts=None):
         self.store = store or UserStore()
         self.token = os.getenv('WEB_ACCESS_TOKEN', '') if token is None else token
+        self.require_accounts = (env_flag('WEB_REQUIRE_ACCOUNTS', '1') if require_accounts is None
+                                 else bool(require_accounts))
         self.session_seconds, self.idle_seconds = session_hours * 3600, idle_hours * 3600
         self.lock = threading.Lock()
         self.sessions = {}   # sha256(token) -> {"user", "name", "role", "must_change", "created", "seen"}
@@ -154,7 +209,11 @@ class Auth:
 
     @property
     def mode(self):
-        return 'accounts' if self.store.all() else 'token' if self.token else 'none'
+        if self.store.all():
+            return 'accounts'
+        if self.require_accounts:
+            return 'locked'
+        return 'token' if self.token else 'none'
 
     @staticmethod
     def _key(token):
@@ -194,7 +253,10 @@ class Auth:
         def stamp(users):
             if username in users:
                 users[username]['last_login'] = time.strftime('%Y-%m-%d %H:%M')
-        self.store.modify(stamp)
+        try:
+            self.store.modify(stamp)
+        except (StoreError, OSError):  # a read-only or broken file must not block a valid login
+            pass
         return token, {k: info[k] for k in ('username', 'name', 'role', 'must_change')}
 
     def session(self, token):
@@ -250,6 +312,8 @@ class Auth:
     def check(self, header):
         """Authorization header -> (allowed, session or None)."""
         mode = self.mode
+        if mode == 'locked':
+            return False, None
         if mode == 'none':
             return True, None
         token = header[7:] if header.startswith('Bearer ') else ''

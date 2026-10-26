@@ -17,7 +17,7 @@ EVENTS = {
     'login_paused': 'Đăng nhập khi hệ thống tạm ngừng', 'logout': 'Đăng xuất', 'password_changed': 'Đổi mật khẩu',
     'user_created': 'Tạo tài khoản', 'user_updated': 'Sửa tài khoản', 'password_reset': 'Đặt lại mật khẩu',
     'user_deleted': 'Xóa tài khoản', 'sessions_ended': 'Buộc đăng xuất', 'gpu': 'Điều khiển GPU',
-    'extract': 'Tách đoạn văn', 'match': 'Đối chiếu bệnh',
+    'extract': 'Tách đoạn văn', 'match': 'Đối chiếu bệnh', 'auth_store_error': 'Lỗi đọc danh sách tài khoản',
 }
 
 

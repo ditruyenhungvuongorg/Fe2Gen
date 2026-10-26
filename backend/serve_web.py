@@ -7,7 +7,7 @@ from pathlib import Path
 from threading import BoundedSemaphore, Thread
 from urllib.parse import urlparse, parse_qs
 from audit import EVENTS, AuditLog
-from auth import GPU_ROLES, ROLES, USERNAME, Auth, LoginRefused, public_user
+from auth import GPU_ROLES, LOCKED_MESSAGE, ROLES, USERNAME, Auth, LoginRefused, public_user
 from model1_process import ModelUnavailable, free_vram_mib
 from web_service import WebSystem
 
@@ -19,6 +19,7 @@ STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/con
 SYSTEM = WebSystem()
 AUTH = Auth()
 AUDIT = AuditLog()
+AUTH.store.on_problem = lambda kind: AUDIT.write('auth_store_error', '', kind=kind)
 WORK = BoundedSemaphore(1)
 QUEUE_SECONDS = 90
 # On logout Model 1 stays loaded while another doctor was active in the last 10 minutes; otherwise it is released.
@@ -128,8 +129,17 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     # ------------------------------------------------------------------ routes
+    def locked(self):
+        """Fail closed: without a readable account list (WEB_REQUIRE_ACCOUNTS=1) every API request is refused."""
+        if AUTH.mode != 'locked':
+            return False
+        self.send_json({'error': LOCKED_MESSAGE, 'status': 'locked', 'auth_mode': 'locked'}, 503)
+        return True
+
     def do_GET(self):
         path = urlparse(self.path)
+        if path.path.startswith('/api/') and self.locked():
+            return
         if path.path == '/api/status':
             mode = AUTH.mode
             return self.send_json({'status': 'online', 'profiles_count': len(SYSTEM.matcher.profiles),
@@ -153,6 +163,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if self.locked():
+            return
         if path == '/api/login':
             return self.login()
         if not self.authorized(path):

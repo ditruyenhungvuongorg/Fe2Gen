@@ -9,7 +9,8 @@
 
 Passwords are asked interactively and stored as scrypt hashes. The running service rereads the file:
 no restart is needed, and a disabled or removed account is logged out at its next request.
-While the file lists no account, the service keeps using WEB_ACCESS_TOKEN.
+While the file lists no account (or cannot be read), the service refuses every API request (503) unless
+WEB_REQUIRE_ACCOUNTS=0 (local use), which falls back to WEB_ACCESS_TOKEN, then to no login.
 """
 import argparse
 import getpass
