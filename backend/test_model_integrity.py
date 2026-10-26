@@ -1,14 +1,20 @@
-"""Model 1 process security: error messages never echo the report (B23). Runs without GPU, torch or HPO data."""
+"""Model 1 process security: error messages never echo the report (B23), bundle SHA-256 check before loading (B22).
+Runs without GPU, torch or HPO data."""
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from model1_process import (GENERIC_INPUT_ERROR, KNOWN_INPUT_ERRORS, Model1Process, ModelProcessError, safe_input_error)
+from model1_v6.build_bundle import write_manifest
+from model1_v6.integrity import file_hashes, sha256_file, verify_bundle
 
 BASE = Path(__file__).resolve().parent
 SECRET = 'BÍ-MẬT-123'
@@ -127,6 +133,133 @@ class ErrorMessageTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             WebSystem.extract(v38, f'Thai {SECRET}')
         self.assertEqual(str(caught.exception), GENERIC_INPUT_ERROR)
+
+
+def make_bundle(root):
+    root = Path(root)
+    (root / 'adapters/a').mkdir(parents=True)
+    (root / 'tokenizer').mkdir()
+    (root / 'adapters/a/adapter_model.safetensors').write_bytes(b'\x00weights' * 100)
+    (root / 'adapters/a/adapter_config.json').write_text('{"r": 16, "lora_alpha": 32}', encoding='utf-8')
+    (root / 'tokenizer/tokenizer.json').write_text('{}', encoding='utf-8')
+    manifest = {'schema': 'fe2gen-model1-v6-bundle', 'base_model_dir': '/base', 'adapters': {'a': 'adapters/a'},
+                'extractor': {'members': [], 'need': 3, 'extend': True}}
+    (root / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+    return write_manifest(root, manifest)
+
+
+class BundleIntegrityTests(unittest.TestCase):
+    """B22: every bundle file is checked against manifest.json before weights load."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.manifest = make_bundle(self.dir)
+        self.env = patch.dict(os.environ, {'MODEL1_REQUIRE_HASH': '1', 'MODEL1_MANIFEST_SHA256': ''})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def stored(self):
+        return json.loads((self.dir / 'manifest.json').read_text(encoding='utf-8'))
+
+    def test_build_writes_every_file_but_the_manifest(self):
+        self.assertEqual(sorted(self.stored()['sha256']), ['adapters/a/adapter_config.json',
+                                                           'adapters/a/adapter_model.safetensors', 'tokenizer/tokenizer.json'])
+        self.assertEqual(self.stored()['sha256']['tokenizer/tokenizer.json'], sha256_file(self.dir / 'tokenizer/tokenizer.json'))
+        self.assertEqual(self.stored()['base_model_dir'], '/base')
+        self.assertFalse(list(self.dir.glob('.manifest.*')))  # no temporary file left
+
+    def test_matching_bundle_passes(self):
+        self.assertEqual(verify_bundle(self.dir, self.stored())['checked'], 3)
+
+    def test_one_changed_byte_names_the_file(self):
+        path = self.dir / 'adapters/a/adapter_model.safetensors'
+        data = bytearray(path.read_bytes())
+        data[3] ^= 1
+        path.write_bytes(bytes(data))
+        with self.assertRaises(RuntimeError) as caught:
+            verify_bundle(self.dir, self.stored())
+        self.assertEqual(str(caught.exception), 'Bundle không khớp manifest: adapters/a/adapter_model.safetensors')
+
+    def test_missing_file_and_bad_path(self):
+        (self.dir / 'tokenizer/tokenizer.json').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'không khớp manifest: tokenizer/tokenizer.json$'):
+            verify_bundle(self.dir, self.stored())
+        with self.assertRaisesRegex(RuntimeError, r'không khớp manifest: \.\./outside$'):
+            verify_bundle(self.dir, {'sha256': {'../outside': '0' * 64}})
+
+    def test_missing_hash_key_depends_on_mode(self):
+        old = {k: v for k, v in self.stored().items() if k != 'sha256'}
+        with self.assertRaisesRegex(RuntimeError, 'không khớp manifest: manifest.json'):
+            verify_bundle(self.dir, old)
+        log = StringIO()
+        with patch.dict(os.environ, {'MODEL1_REQUIRE_HASH': '0'}), redirect_stderr(log):
+            self.assertEqual(verify_bundle(self.dir, old)['problems'], ['manifest.json'])
+            (self.dir / 'tokenizer/tokenizer.json').write_text('{"changed": 1}', encoding='utf-8')
+            self.assertEqual(verify_bundle(self.dir, self.stored())['problems'], ['tokenizer/tokenizer.json'])
+        self.assertIn('chưa có khóa sha256', log.getvalue())
+        self.assertIn('tokenizer/tokenizer.json', log.getvalue())
+
+    def test_unlisted_file_warns_or_stops_in_strict_mode(self):
+        (self.dir / 'tokenizer/extra.py').write_text('print(1)', encoding='utf-8')
+        log = StringIO()
+        with redirect_stderr(log):
+            self.assertEqual(verify_bundle(self.dir, self.stored())['unlisted'], ['tokenizer/extra.py'])
+        self.assertIn('tokenizer/extra.py', log.getvalue())
+        with patch.dict(os.environ, {'MODEL1_REQUIRE_HASH': 'strict'}):
+            with self.assertRaisesRegex(RuntimeError, 'không khớp manifest: tokenizer/extra.py'):
+                verify_bundle(self.dir, self.stored())
+
+    def test_pinned_manifest_hash(self):
+        good = sha256_file(self.dir / 'manifest.json')
+        with patch.dict(os.environ, {'MODEL1_MANIFEST_SHA256': good}):
+            verify_bundle(self.dir, self.stored())
+        with patch.dict(os.environ, {'MODEL1_MANIFEST_SHA256': '0' * 64}):
+            with self.assertRaisesRegex(RuntimeError, 'không khớp manifest: manifest.json'):
+                verify_bundle(self.dir, self.stored())
+
+    def test_rehash_command_adds_hashes_to_an_old_bundle(self):
+        old = {k: v for k, v in self.stored().items() if k != 'sha256'}
+        (self.dir / 'manifest.json').write_text(json.dumps(old), encoding='utf-8')
+        out = subprocess.run([sys.executable, '-m', 'model1_v6.build_bundle', '--rehash', str(self.dir)], cwd=BASE,
+                             capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.stored()['sha256'], file_hashes(self.dir))
+        self.assertEqual(self.stored()['adapters'], {'a': 'adapters/a'})
+        self.assertEqual(json.loads(out.stdout)['MODEL1_MANIFEST_SHA256'], sha256_file(self.dir / 'manifest.json'))
+        verify_bundle(self.dir, self.stored())
+
+    def test_runner_checks_before_loading_weights(self):
+        from model1_v6.runner import Model1V6Runner
+
+        class WeightsRead(Exception):
+            pass
+        unsloth = types.ModuleType('unsloth')
+        unsloth.FastLanguageModel = MagicMock()
+        unsloth.FastLanguageModel.from_pretrained.side_effect = WeightsRead
+        torch = types.ModuleType('torch')
+        torch.cuda = types.SimpleNamespace(is_available=lambda: True)
+        torch.bfloat16 = 'bf16'
+        transformers = types.ModuleType('transformers')
+        transformers.AutoModel = transformers.AutoTokenizer = MagicMock()
+        peft = types.ModuleType('peft')
+        peft.get_peft_model_state_dict = MagicMock()
+        save_and_load = types.ModuleType('peft.utils.save_and_load')
+        save_and_load.load_peft_weights = MagicMock()
+        fake = {'unsloth': unsloth, 'torch': torch, 'transformers': transformers, 'peft': peft,
+                'peft.utils': types.ModuleType('peft.utils'), 'peft.utils.save_and_load': save_and_load}
+        with patch.dict(sys.modules, fake), redirect_stderr(StringIO()):
+            with self.assertRaises(WeightsRead):  # intact bundle: the check passes and loading starts
+                Model1V6Runner(self.dir).load_model()
+            unsloth.FastLanguageModel.from_pretrained.reset_mock()
+            (self.dir / 'adapters/a/adapter_config.json').write_text('{"r": 32}', encoding='utf-8')
+            with self.assertRaisesRegex(RuntimeError, 'không khớp manifest: adapters/a/adapter_config.json'):
+                Model1V6Runner(self.dir).load_model()
+            unsloth.FastLanguageModel.from_pretrained.assert_not_called()
+            save_and_load.load_peft_weights.assert_not_called()
 
 
 if __name__ == '__main__':

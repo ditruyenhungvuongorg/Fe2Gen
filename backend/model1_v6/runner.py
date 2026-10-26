@@ -15,6 +15,7 @@ from pathlib import Path
 from threading import Lock
 
 from . import contract as C
+from .integrity import verify_bundle
 
 RANK, ALPHA = 32, 64
 TARGETS = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
@@ -51,6 +52,8 @@ class Model1V6Runner:
         def step(name):  # load time per step, to see what keeps a released model from serving within 30 s
             print(f'[Model 1] {name}: {time.monotonic() - t0:.1f} s', file=sys.stderr, flush=True)
         m = json.loads((self.bundle / 'manifest.json').read_text(encoding='utf-8'))
+        verify_bundle(self.bundle, m)  # every bundle file against its manifest SHA-256 before any weight is read
+        step('SHA-256 bundle')
         self.manifest = m
         self.members = [(c, eps) for c, eps in m['extractor']['members']]
         self.need, self.extend = m['extractor']['need'], m['extractor']['extend']
