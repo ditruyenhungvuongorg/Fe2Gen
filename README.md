@@ -116,3 +116,9 @@ mechanism grouping and the shipped group table, review requirements, rejection o
 and that the service starts without a usable GPU.
 GPU/API/UI deployment checks are documented separately; these tests do not establish clinical accuracy.
 
+
+## Pre-commit
+Install once per clone: `pip install pre-commit && pre-commit install`.
+Before each commit it runs gitleaks, rejects files over 1 MB, and refuses `*.xlsx`, `*.jsonl` outside
+`backend/resources/`, `users.json`, `*.env` and `audit*.jsonl`. CI (`.github/workflows/ci.yml`) repeats the secret
+scan and also rejects any file type in `docs/` other than html, css, js, txt and fonts.
