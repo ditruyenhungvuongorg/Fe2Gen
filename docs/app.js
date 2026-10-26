@@ -1,7 +1,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let base = window.PRENATAL_CONFIG?.apiBase || '';
+const DEFAULT_BASE = window.PRENATAL_CONFIG?.apiBase || '';
+let base = DEFAULT_BASE;
 try { base = localStorage.getItem('prenatal-api') || base; } catch {}
 const selection = new CaseSelection(), chosen = selection.items, labIds = new Set(), requests = new Set();
 let access = '', result = null, revision = 0, searchVersion = 0, extractVersion = 0, busy = false;
@@ -9,6 +10,16 @@ let searchTerms = [], extraction = null, connectionVersion = 0, timer;
 // authMode from /api/status: 'accounts' (doctor login), 'token' (shared access code) or 'none'.
 // user: {username, name, role ('admin' | 'doctor' | 'lab'), must_change}; lab accounts do not use text extraction.
 let authMode = '', user = null, modelState = '', modelPoll, lastWarmup = 0, lastModel = null;
+// B26: the public page keeps the API server from config.js; only a page served from localhost (or Shift+click on
+// the server name, for testing) may change it, and a different saved server shows a permanent red warning.
+let serverUnlocked = false;
+const canChangeServer = () => serverUnlocked || FrontLogic.serverLockState(location.hostname, base, DEFAULT_BASE).canChange;
+function showServerLock() {
+  const s = FrontLogic.serverLockState(location.hostname, base, DEFAULT_BASE);
+  $('server-warning').hidden = !s.warn; $('server-warning-host').textContent = s.host || '(chưa đặt)';
+  $('login-server').classList.toggle('locked', !canChangeServer());
+  $('login-server').title = canChangeServer() ? 'Đổi máy chủ' : '';
+}
 function notice(message = '') { $('notice').textContent = message; $('notice').hidden = !message; }
 function localStatus(id, message = '') { $(id).textContent = message; }
 // A 401 from these means a wrong password or code, not an ended session.
@@ -93,7 +104,7 @@ function openAccount() {
   $('account-title').textContent = forced ? 'Đặt mật khẩu mới' : 'Tài khoản';
   $('account-who').textContent = user ? user.name + ' · ' + user.username + ' · ' + (ROLE_NAMES[user.role] || '') : '';
   $('account-forced').hidden = !forced; $('account-close').hidden = forced;
-  $('account-admin').hidden = forced || user?.role !== 'admin'; $('account-server').hidden = forced;
+  $('account-admin').hidden = forced || user?.role !== 'admin'; $('account-server').hidden = forced || !canChangeServer();
   $('account-error').hidden = true; $('account-ok').hidden = true;
   if (!$('account').open) $('account').showModal();
   $('old-password').focus();
@@ -101,7 +112,7 @@ function openAccount() {
 // Server address (and the shared access code when the server has no accounts); signing in is on the sign-in page.
 function openSettings(message = '') {
   const accounts = authMode === 'accounts';
-  $('api-url').value = base; $('token-fields').hidden = accounts;
+  $('api-url').value = base; $('api-url').readOnly = !canChangeServer(); $('token-fields').hidden = accounts;
   $('settings-title').textContent = 'Kết nối máy chủ';
   $('connect').textContent = 'Kết nối';
   $('settings-hint').textContent = accounts
@@ -125,7 +136,7 @@ function showGate(state, message = '') {
   $('login-error').textContent = message; $('login-error').hidden = !message;
   let host = location.host;
   try { if (base) host = new URL(base).host; } catch {}
-  $('login-server-name').textContent = host;
+  $('login-server-name').textContent = host; showServerLock();
   if (state === 'login') ($('login-username').value ? $('login-password') : $('login-username')).focus();
 }
 function sessionEnded() {
@@ -417,12 +428,13 @@ $('password-form').onsubmit=async e=>{
 $('connect').onclick=async e=>{
   e.preventDefault();
   try{
-    const value=$('api-url').value.trim().replace(/\/+$/,'');
+    // The public page ignores a typed address unless changing server is allowed (see canChangeServer).
+    const value=canChangeServer()?$('api-url').value.trim().replace(/\/+$/,''):base;
     if(value){const u=new URL(value);if(u.protocol!=='https:'&&!(u.protocol==='http:'&&['localhost','127.0.0.1'].includes(u.hostname)))throw Error('Máy chủ từ xa phải dùng HTTPS.');if(u.username||u.password||u.search||u.hash)throw Error('Chỉ nhập địa chỉ gốc của máy chủ.');}
     for(const c of requests)c.abort('connection-changed');searchVersion++;extractVersion++;connectionVersion++;clearTimeout(timer);
     if(value!==base){access='';user=null;authMode='';showUser();}
-    base=value;
-    try{localStorage.setItem('prenatal-api',base);}catch{}
+    if(value!==base){base=value;try{localStorage.setItem('prenatal-api',base);}catch{}}
+    showServerLock();
     if($('access-token').value)access=$('access-token').value;
     $('access-token').value='';searchTerms=[];extraction=null;renderSearch();renderMentions();
     invalidate();$('settings').close();checkConnection();
@@ -461,6 +473,7 @@ $('login-form').onsubmit=async e=>{
   finally{$('login-submit').disabled=false;$('login-password').value='';}
 };
 $('login-retry').onclick=()=>{showGate('checking');checkConnection();};
-$('login-server').onclick=()=>openSettings();
+$('login-server').onclick=e=>{if(e.shiftKey)serverUnlocked=true;if(canChangeServer()){showServerLock();openSettings();}};
+$('server-default').onclick=()=>{try{localStorage.removeItem('prenatal-api');}catch{}location.reload();};
 renderSelected();showGate('checking');checkConnection();
 
