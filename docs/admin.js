@@ -3,8 +3,23 @@
 (() => {
   const STATE = {stopped:'Nghỉ (không chiếm GPU)', loading:'Đang khởi động', ready:'Sẵn sàng (đang chiếm GPU)', paused:'Tạm dừng', failed:'Chưa chạy được'};
   const DETAIL = {target:'tài khoản', role:'vai', changes:'thay đổi', chars:'số ký tự', findings:'số cụm', seconds:'giây',
-                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên'};
+                  hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên',
+                  correction_id:'góp ý', report_id:'báo lỗi', images:'số ảnh', status:'trạng thái'};
+  // The same key means something else in some events: corrections_exported counts rows, not sessions.
+  const EVENT_DETAIL = {corrections_exported:{count:'số dòng'}};
   const ACTIONS = {pause:'tạm dừng', resume:'cho chạy lại', release:'giải phóng ngay'};
+  const CORR_LABELS = {pending:'Chờ duyệt', approved:'Đã duyệt', rejected:'Đã từ chối'};
+  const CORR_PILL = {pending:'pending', approved:'active', rejected:'locked'};
+  const CORR_SOURCE = {text:'từ đoạn văn', search:'từ tìm HPO', selected:'từ HPO của ca'};
+  const BUG_STATUS = {new:'Mới', closed:'Đã xử lý'};
+  const IMAGE_EXT = {'image/png':'png', 'image/jpeg':'jpg', 'image/webp':'webp'};
+  const termLine = t => t && t.id ? (t.vi || t.en || '') + ' · ' + t.id : '';
+  const kb = bytes => Math.max(1, Math.round((Number(bytes) || 0) / 1024)) + ' kB';
+  const readDataUrl = blob => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || '')); r.onerror = () => reject(Error('Không đọc được ảnh.'));
+    r.readAsDataURL(blob);
+  });
   let tab = 'users', temp = null;
 
   function el(tag, props = {}, ...children) {
@@ -137,7 +152,7 @@
       const form = el('form', {class:'admin-filter'}, who, what, el('button', {class:'quiet'}, 'Lọc'));
       form.onsubmit = e => { e.preventDefault(); f.user = who.value.trim().toLowerCase(); f.event = what.value; show('audit'); };
       const describe = e => Object.entries(e).filter(([k]) => !['time','event','user'].includes(k)).map(([k, v]) =>
-        (DETAIL[k] || k) + ': ' + (k === 'role' ? ROLE_NAMES[v] || v : k === 'action' ? ACTIONS[v] || v : typeof v === 'object' ? JSON.stringify(v) : v === true ? 'có' : v === false ? 'không' : v)).join(' · ');
+        ((EVENT_DETAIL[e.event] || {})[k] || DETAIL[k] || k) + ': ' + (k === 'role' ? ROLE_NAMES[v] || v : k === 'action' ? ACTIONS[v] || v : k === 'status' ? (BUG_STATUS[v] || CORR_LABELS[v] || v) : typeof v === 'object' ? JSON.stringify(v) : v === true ? 'có' : v === false ? 'không' : v)).join(' · ');
       const rows = data.entries.map(e => el('div', {class:'audit-row' + (/fail|locked|paused|rate_limited|error|expired|totp_reset/.test(e.event) ? ' warn' : '')},
         el('span', {class:'audit-time'}, e.time), el('strong', {}, e.user || '—'), el('span', {}, data.events[e.event] || e.event), el('small', {}, describe(e))));
       return el('div', {}, form, el('p', {class:'hint'}, 'Nhật ký ghi ai làm gì và lúc nào; không ghi nội dung ca (đoạn văn, HPO, gene). ' + data.entries.length + ' dòng mới nhất.'),
@@ -161,6 +176,100 @@
           el('button', {type:'button', class:'quiet', disabled:!['ready','loading'].includes(g.model_state), onclick:send('release', 'Giải phóng GPU ngay? Bác sĩ đang tách đoạn văn sẽ phải thử lại.')}, 'Giải phóng ngay'),
           g.paused ? el('button', {type:'button', onclick:send('resume')}, 'Cho chạy lại')
                    : el('button', {type:'button', class:'quiet', onclick:send('pause', 'Tạm dừng Model 1 và giữ tắt cho đến khi bấm Cho chạy lại? Tra cứu và đối chiếu vẫn chạy.')}, 'Tạm dừng (giữ tắt)')));
+    },
+
+    // "Sửa sai": doctors' corrections (phrase → right HPO). Approving makes the phrase map to that code for everyone at once.
+    async corrections() {
+      const f = VIEWS.correctionsFilter || (VIEWS.correctionsFilter = {status:'pending', user:''});
+      const data = await api('/api/admin/corrections?status=' + encodeURIComponent(f.status) + '&user=' + encodeURIComponent(f.user), null, 20000);
+      const labels = {...CORR_LABELS, ...(data.labels || {})}, counts = data.counts || {}, items = Array.isArray(data.items) ? data.items : [];
+      const statusSelect = el('select', {'aria-label':'Lọc theo trạng thái'},
+        [['pending', 'Chờ duyệt'], ['approved', 'Đã duyệt'], ['rejected', 'Đã từ chối'], ['all', 'Tất cả']].map(([k, v]) => el('option', {value:k, selected:k === f.status}, v)));
+      const who = el('input', {value:f.user, placeholder:'Tên đăng nhập', 'aria-label':'Lọc theo tài khoản', autocapitalize:'none', spellcheck:'false'});
+      const form = el('form', {class:'admin-filter'}, statusSelect, who, el('button', {class:'quiet'}, 'Lọc'));
+      form.onsubmit = e => { e.preventDefault(); f.status = statusSelect.value; f.user = who.value.trim().toLowerCase(); show('corrections'); };
+      const head = el('div', {class:'admin-head'},
+        el('p', {class:'hint'}, 'Chờ duyệt ' + (counts.pending || 0) + ' · Đã duyệt ' + (counts.approved || 0) + ' · Đã từ chối ' + (counts.rejected || 0)),
+        el('button', {type:'button', class:'quiet', title:'Tệp JSON các góp ý đã duyệt: dòng memory và cụm từ bác sĩ cho lần huấn luyện sau',
+          onclick:() => act(() => window.apiDownload('/api/admin/corrections/export', 'fe2gen_gop_y.json'), () => 'Đã tải tệp góp ý đã duyệt.')}, 'Tải dữ liệu huấn luyện'));
+      const decide = (it, decision) => {
+        const question = decision === 'approved'
+          ? 'Duyệt góp ý này? Từ giờ cụm “' + it.phrase + '” sẽ ra mã ' + termLine(it.right) + ' cho mọi bác sĩ.'
+          : 'Từ chối góp ý này? Cụm “' + it.phrase + '” giữ cách tách hiện tại.';
+        if (!confirm(question)) return;
+        act(() => api('/api/admin/corrections/decide', {id:it.id, decision}, 20000), () => decision === 'approved' ? 'Đã duyệt góp ý.' : 'Đã từ chối góp ý.');
+      };
+      const rows = items.map(it => el('div', {class:'corr-row'},
+        el('div', {class:'admin-who'}, el('strong', {}, it.name || it.user), el('small', {}, it.user + ' · ' + it.time + (CORR_SOURCE[it.source] ? ' · ' + CORR_SOURCE[it.source] : ''))),
+        el('div', {class:'corr-body'},
+          el('blockquote', {class:'corr-phrase'}, '“' + it.phrase + '”'),
+          el('p', {class:'corr-map'},
+            el('span', {class:'corr-wrong'}, Array.isArray(it.wrong) && it.wrong.length ? it.wrong.map(termLine).join(', ') : 'Model chưa đề xuất mã'),
+            ' → ', el('strong', {}, termLine(it.right))),
+          it.context ? el('small', {}, 'Ngữ cảnh: …' + it.context + '…') : null,
+          it.note ? el('small', {}, 'Ghi chú: ' + it.note) : null,
+          it.decided_by ? el('small', {}, (labels[it.status] || it.status) + ' bởi ' + it.decided_by + (it.decided_at ? ' · ' + it.decided_at : '') + (it.decision_note ? ' · ' + it.decision_note : '')) : null),
+        el('span', {class:'state-pill ' + (CORR_PILL[it.status] || 'pending')}, labels[it.status] || it.status),
+        el('div', {class:'admin-buttons'},
+          it.status === 'approved' ? null : el('button', {type:'button', onclick:() => decide(it, 'approved')}, 'Duyệt'),
+          it.status === 'rejected' ? null : el('button', {type:'button', class:'quiet danger', onclick:() => decide(it, 'rejected')}, 'Từ chối'))));
+      return el('div', {}, form, head,
+        el('p', {class:'hint'}, 'Bác sĩ báo mã sai cho một cụm và nêu mã đúng. Duyệt xong, cụm đó ra mã đúng ngay cho mọi người, không cần huấn luyện lại. ' + items.length + ' góp ý đang hiện.'),
+        rows.length ? rows : el('p', {class:'hint'}, 'Không có góp ý nào trong bộ lọc này.'));
+    },
+
+    // "Báo lỗi": reports with screenshots, stored on the server. Images are fetched with the bearer header.
+    async bugs() {
+      const f = VIEWS.bugsFilter || (VIEWS.bugsFilter = {status:'new'});
+      const data = await api('/api/admin/bug_reports?status=' + encodeURIComponent(f.status), null, 20000);
+      const counts = data.counts || {}, items = Array.isArray(data.items) ? data.items : [];
+      const statusSelect = el('select', {'aria-label':'Lọc theo trạng thái'},
+        [['new', 'Mới'], ['closed', 'Đã xử lý'], ['all', 'Tất cả']].map(([k, v]) => el('option', {value:k, selected:k === f.status}, v)));
+      const form = el('form', {class:'admin-filter bug-filter'}, statusSelect, el('button', {class:'quiet'}, 'Lọc'));
+      form.onsubmit = e => { e.preventDefault(); f.status = statusSelect.value; show('bugs'); };
+      const head = el('p', {class:'hint'}, 'Mới ' + (counts.new || 0) + ' · Đã xử lý ' + (counts.closed || 0) + ' · ' + items.length + ' báo lỗi đang hiện.');
+      const setStatus = (r, status) => act(() => api('/api/admin/bug_reports/status', {id:r.id, status}, 20000), () => status === 'closed' ? 'Đã đánh dấu báo lỗi là đã xử lý.' : 'Đã mở lại báo lỗi.');
+      const rows = items.map(r => {
+        const ci = r.client_info && typeof r.client_info === 'object' ? r.client_info : {};
+        const info = [ci.model_version ? 'model ' + ci.model_version : '', ci.app_version ? 'trang ' + ci.app_version : '', ci.viewport ? 'màn hình ' + ci.viewport : '', ci.user_agent || ''].filter(Boolean).join(' · ');
+        const preview = el('div', {class:'bug-preview'});
+        const imageButtons = (Array.isArray(r.images) ? r.images : []).flatMap((im, i) => {
+          const n = Number.isInteger(im.n) ? im.n : i, path = '/api/admin/bug_reports/image?id=' + encodeURIComponent(r.id) + '&n=' + n;
+          const holder = el('div', {class:'bug-preview-item'}); preview.append(holder);
+          const view = el('button', {type:'button', class:'quiet', onclick:async () => {
+            if (holder.children.length) { holder.replaceChildren(); view.textContent = 'Xem ảnh ' + (n + 1) + ' (' + kb(im.bytes) + ')'; return; }
+            view.disabled = true; status('');
+            try {
+              const url = await readDataUrl(await window.apiBlob(path));
+              holder.replaceChildren(el('img', {class:'bug-thumb', src:url, alt:'Ảnh ' + (n + 1) + ' của báo lỗi'}));
+              view.textContent = 'Ẩn ảnh ' + (n + 1);
+            } catch (e) { status(e.message, true); }
+            finally { view.disabled = false; }
+          }}, 'Xem ảnh ' + (n + 1) + ' (' + kb(im.bytes) + ')');
+          const download = el('button', {type:'button', class:'quiet', onclick:() => {
+            status('');
+            window.apiDownload(path, r.id + '_' + n + '.' + (IMAGE_EXT[im.type] || 'bin')).catch(e => status(e.message, true));
+          }}, 'Tải ảnh');
+          return [view, download];
+        });
+        return el('div', {class:'bug-row' + (r.status === 'new' ? ' is-new' : '')},
+          el('div', {class:'bug-head'}, el('span', {class:'audit-time'}, r.time), el('strong', {}, r.name || r.user),
+            el('small', {}, r.user + ' · ' + (ROLE_NAMES[r.role] || r.role || '') + (r.page ? ' · ' + r.page : '')),
+            el('span', {class:'state-pill ' + (r.status === 'new' ? 'pending' : 'active')}, BUG_STATUS[r.status] || r.status),
+            r.closed_by ? el('small', {}, 'xử lý bởi ' + r.closed_by + (r.closed_at ? ' · ' + r.closed_at : '')) : null),
+          el('pre', {class:'bug-text'}, r.text || ''),
+          info ? el('small', {class:'bug-client'}, info) : null,
+          imageButtons.length ? el('div', {class:'bug-images'}, imageButtons) : el('small', {class:'bug-client'}, 'Không có ảnh đính kèm.'),
+          el('div', {class:'admin-buttons'},
+            r.status === 'closed' ? el('button', {type:'button', class:'quiet', onclick:() => setStatus(r, 'new')}, 'Mở lại')
+                                  : el('button', {type:'button', onclick:() => setStatus(r, 'closed')}, 'Đã xử lý'),
+            el('button', {type:'button', class:'quiet danger', onclick:() => {
+              if (!confirm('Xóa báo lỗi này và các ảnh đính kèm?')) return;
+              act(() => api('/api/admin/bug_reports/delete', {id:r.id}, 20000), () => 'Đã xóa báo lỗi.');
+            }}, 'Xóa')),
+          preview);
+      });
+      return el('div', {}, form, head, rows.length ? rows : el('p', {class:'hint'}, 'Không có báo lỗi nào trong bộ lọc này.'));
     },
   };
 

@@ -58,6 +58,36 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
     throw e;
   } finally { clearTimeout(timeoutId); requests.delete(controller); }
 }
+// Files from the API (admin exports, bug-report screenshots): same bearer header and error handling as api(), but the
+// body comes back as a Blob. The page has no cookies, so a plain <a href> or <img src> could not authenticate.
+async function apiBlob(path, timeout = 60000) {
+  if (!base && location.hostname.endsWith('github.io')) throw Error('Mở Kết nối để nhập địa chỉ máy chủ Ubuntu.');
+  const controller = new AbortController(); requests.add(controller); markActivity();
+  const timeoutId = setTimeout(() => controller.abort('timeout'), timeout);
+  try {
+    const response = await fetch(base + path, {headers:access ? {Authorization:'Bearer ' + access} : {}, signal:controller.signal, cache:'no-store'});
+    if (!response.ok) {
+      let data = null;
+      try { data = await response.json(); } catch {}
+      if (response.status === 429) throw apiError(FrontLogic.tooFastMessage(response.headers.get('Retry-After'), data || {}), 429, data || {});
+      if (response.status === 401 && authMode === 'accounts' && access) sessionEnded();
+      throw apiError((data && data.error) || 'Không xử lý được yêu cầu. Vui lòng thử lại.', response.status, data || {});
+    }
+    return await response.blob();
+  } catch (e) {
+    if (controller.signal.aborted) throw Error(controller.signal.reason === 'timeout' ? 'Máy chủ phản hồi chậm. Bạn có thể thử lại.' : 'Yêu cầu đã hủy.');
+    if (e instanceof TypeError) throw Error('Chưa kết nối được máy chủ. Kiểm tra Ubuntu và mã truy cập; danh sách HPO vẫn được giữ.');
+    throw e;
+  } finally { clearTimeout(timeoutId); requests.delete(controller); }
+}
+window.apiBlob = apiBlob;
+window.apiDownload = async function (path, filename) {
+  const blob = await apiBlob(path);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = String(filename || 'tai-xuong').replace(/[\\/:*?"<>|]+/g, '_'); a.rel = 'noopener';
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+};
 const MODEL_TEXT = {stopped:'Model: nghỉ · tự bật khi dùng', paused:'Model: tạm dừng · GPU bận việc khác', loading:'Model: đang khởi động…', ready:'Model: sẵn sàng', failed:'Model: chưa chạy được'};
 const MODEL_SHORT = {stopped:'GPU nghỉ', paused:'GPU bận', loading:'Đang bật…', ready:'Sẵn sàng', failed:'Lỗi model'};
 function showModel(data) {
@@ -157,8 +187,8 @@ function showGate(state, message = '') {
   if (state === 'totp') ($('login-backup-label').hidden ? $('login-code') : $('login-backup')).focus();
 }
 function sessionEnded() {
-  access = ''; user = null; sessionInfo = null; pendingLogin = null; window.resetTwoFactor?.(); showUser();
-  for (const d of ['account', 'admin', 'settings', 'lab']) if ($(d).open) $(d).close();
+  access = ''; user = null; sessionInfo = null; pendingLogin = null; window.resetTwoFactor?.(); window.resetCorrection?.(); window.resetBugReport?.(); showUser();
+  for (const d of ['account', 'admin', 'settings', 'lab', 'correction', 'bug-report']) if ($(d).open) $(d).close();
   showGate('login', 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
 }
 function updateActions() {
@@ -199,8 +229,14 @@ function renderSelected() {
     div.innerHTML = '<div class="chosen-head"><strong>' + escape(h.vi || h.en) + '</strong><small>' + escape(h.en) + ' · ' + escape(h.id) + '</small></div>' +
       '<div class="source-label">' + sourceNames.map(s => '<span>' + escape(s) + '</span>').join('') + (stale ? '<small class="stale-source">Đoạn văn đã thay đổi · cần duyệt lại</small>' : '') + '</div>' +
       '<label class="status-control"><span>Trạng thái</span><select aria-label="Trạng thái ' + h.id + '">' + ['CÓ','NGHI NGỜ','KHÔNG'].map(s => '<option ' + (s === h.status ? 'selected' : '') + '>' + s + '</option>').join('') + '</select></label>' +
-      '<button class="remove-hpo quiet" aria-label="Xóa ' + h.id + '">Xóa</button>';
+      '<div class="chosen-actions">' + (user?.role === 'lab' ? '' : '<button class="correct-hpo quiet" aria-label="Sửa mã ' + escape(h.id) + '">Sửa mã</button>') + '<button class="remove-hpo quiet" aria-label="Xóa ' + escape(h.id) + '">Xóa</button></div>';
     div.querySelector('.remove-hpo').onclick = () => { selection.remove(h.id); invalidate(); renderSelected(); renderSearch(); renderMentions(); };
+    // "Sửa mã": this HPO is wrong for the phrase it came from (or for the case); the doctor names the right code.
+    const fix = div.querySelector('.correct-hpo');
+    if (fix) fix.onclick = () => {
+      const src = h.sources.find(s => s.kind === 'text' && s.phrase);
+      window.openCorrection?.({phrase:src ? src.phrase : (h.vi || h.en), wrong:[h.id], wrongNames:[h.vi || h.en], text:src ? src.text : '', start:src ? src.start : null, status:h.status, source:'selected'});
+    };
     div.querySelector('select').onchange = e => { selection.resolve(h.id, e.target.value); invalidate(); renderSelected(); renderSearch(); renderMentions(); notice('Đã cập nhật trạng thái. Duyệt danh sách trước khi đối chiếu lại.'); };
     if (h.pending.length) {
       const conflict = document.createElement('div'); conflict.className = 'conflict';
@@ -249,6 +285,13 @@ function renderMentions() {
       b.onclick = () => add(term, m.reviewStatus, {kind:'text', text:extraction.text, phrase:m.mention_text, start:m.span_start});
       box.append(b);
     }
+    // "Báo mã sai": the suggested codes are wrong for this phrase; the doctor names the right one for the admin to approve.
+    if (user?.role !== 'lab') {
+      const text = extraction.text, top = m.candidates.slice(0, 3);
+      const fix = document.createElement('button'); fix.type = 'button'; fix.className = 'quiet text-button correction-open'; fix.textContent = 'Báo mã sai';
+      fix.onclick = () => window.openCorrection?.({phrase:m.mention_text, wrong:top.map(c => c.id), wrongNames:top.map(c => c.vi || c.en), text, start:m.span_start, status:m.reviewStatus, source:'text'});
+      box.append(fix);
+    }
     $('mentions').append(box);
   }
 }
@@ -293,7 +336,7 @@ $('extract').onclick = async () => {
     const data = await api('/api/extract_hpo', {text}, 420000);  // server: up to 120 s loading + 300 s extraction
     pollModel();
     if (seq !== extractVersion) return;
-    extraction = {text, mentions:data.mentions.map(m => ({...m, reviewStatus:m.context_review ? '' : m.status}))};
+    extraction = {text, model_version:typeof data.model_version === 'string' ? data.model_version : '', mentions:data.mentions.map(m => ({...m, reviewStatus:m.context_review ? '' : m.status}))};
     renderMentions();
     localStatus('extract-status', data.mentions.length ? 'Tìm thấy ' + data.mentions.length + ' cụm. Chọn HPO phù hợp bên dưới; không tự ghi đè danh sách đã duyệt.' : 'Chưa tách được dấu hiệu. Bạn vẫn có thể tìm HPO thủ công.');
   } catch (e) { if (seq === extractVersion) localStatus('extract-status', e.message); }
@@ -417,13 +460,13 @@ $('logout').onclick=async()=>{
   // A shared hospital computer: the next person must not see this case.
   if(hasCase()&&!confirm('Đăng xuất sẽ xóa nội dung ca đang mở trong tab này. Tiếp tục?'))return;
   try{await api('/api/logout',{},15000);}catch{}
-  for(const d of ['account','admin'])if($(d).open)$(d).close();
+  for(const d of ['account','admin','settings','lab','correction','bug-report'])if($(d).open)$(d).close();
   signedOut();showGate('login');checkConnection();
 };
 // After logout: forget the user, the 2FA state and the case. /api/logout sends Clear-Site-Data "cache", which
 // leaves localStorage alone; still reread the saved server instead of assuming it is kept or gone.
 function signedOut(){
-  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();showUser();
+  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();showUser();
   $('idle-warning').hidden=true;
   try{const saved=localStorage.getItem('prenatal-api');if(saved)base=saved;}catch{}
 }
@@ -453,7 +496,7 @@ function checkIdle(){
 async function idleLogout(){
   idle.ending=true;
   const minutes=FrontLogic.idleMinutesOf(sessionInfo?.idle_minutes);
-  for(const d of ['account','admin','settings','lab'])if($(d).open)$(d).close();
+  for(const d of ['account','admin','settings','lab','correction','bug-report'])if($(d).open)$(d).close();
   resetCase();  // clear the case first, before waiting for the network
   try{await api('/api/logout',{},15000);}catch{}
   signedOut();idle.ending=false;
@@ -532,7 +575,7 @@ let pendingLogin=null;  // {pending, user, at, failures}
 const PENDING_MS=5*60000,CODE_TRIES=5;
 const BAD_REPLY='Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.';
 async function signedIn(step,data){
-  access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();
+  access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();
   idle.last=idle.lastPing=Date.now();
   showUser();notice('');
   await refreshSession();  // 2FA requirement and the idle limit

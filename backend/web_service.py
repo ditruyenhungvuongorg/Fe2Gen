@@ -42,6 +42,30 @@ def phrase_key(text):
     return ' '.join(unicodedata.normalize('NFC', text).casefold().split())
 
 class WebSystem(Fe2genSystem):
+    def __init__(self):
+        super().__init__()
+        # Approved doctor corrections (serve_web.apply_live_corrections): phrase_key -> [HPO ids] for extraction,
+        # normalize_text -> [HPO ids] for search. Empty until apply_corrections runs; replaced as whole dicts.
+        self.corrections, self.corrections_search = {}, {}
+
+    def apply_corrections(self, items):
+        """items: approved corrections ({"phrase", "right": {"id"}}), the most recently approved first. Builds
+        both lookup maps and swaps them in atomically; codes outside the current catalog are dropped."""
+        by_phrase, by_search = {}, {}
+        canonical = getattr(self, 'canonical', {}) or {}
+        for item in items:
+            hid = (item.get('right') or {}).get('id')
+            phrase = item.get('phrase') or ''
+            if hid not in canonical or not phrase.strip():
+                continue
+            for mapping, key in ((by_phrase, phrase_key(phrase)), (by_search, normalize_text(phrase))):
+                if key:
+                    ids = mapping.setdefault(key, [])
+                    if hid not in ids:
+                        ids.append(hid)
+        self.corrections, self.corrections_search = by_phrase, by_search
+        return len(by_phrase)
+
     def initialize(self):
         super().initialize()
         self.profiles_by_id = {p.disease_id: p for p in self.matcher.profiles}
@@ -143,7 +167,11 @@ class WebSystem(Fe2genSystem):
             value = (score, len(vi), hid)
             if hid not in ranked or value < ranked[hid]:
                 ranked[hid] = value
-        return [self.term(v[2]) for v in sorted(ranked.values())[:limit]]
+        found = [v[2] for v in sorted(ranked.values())]
+        corrected = self.corrections_search.get(q, [])
+        if corrected:  # the doctors' approved choice for exactly this wording goes first
+            found = list(corrected) + [h for h in found if h not in corrected]
+        return [self.term(h) for h in found[:limit]]
 
     def extract(self, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 6000:
@@ -183,8 +211,14 @@ class WebSystem(Fe2genSystem):
             choices = [dict(self.term(h['id']), retriever_cosine=h['retriever_cosine'], reranker_logprob=h['reranker_logprob'])
                        for h in f['hpo_ranked'] if h['id'] in self.canonical]
             key = phrase_key(f['mention_text'])
-            reviewed = self.doctor_phrases.get(key, [])
-            if key in self.context_phrases:  # meaning lies in the sentence: keep the model order, flag for review
+            # An approved correction (admin-reviewed doctor feedback) outranks the gold-case phrase list and is
+            # not demoted as a context fragment; the context_review flag stays as computed from the sentence.
+            corrected = self.corrections.get(key, [])
+            reviewed = [] if corrected else self.doctor_phrases.get(key, [])
+            if corrected:  # corrected ids, then the gold-case phrase ids, then the model's candidates
+                lead = list(corrected) + [h for h in self.doctor_phrases.get(key, []) if h not in corrected]
+                choices = [self.term(h) for h in lead] + [c for c in choices if c['id'] not in lead]
+            elif key in self.context_phrases:  # meaning lies in the sentence: keep the model order, flag for review
                 choices += [self.term(h) for h in reviewed if h not in {c['id'] for c in choices}]
                 caution, reviewed = True, []
             elif reviewed:  # the doctor's earlier choice first; the model's candidates stay below it
@@ -192,10 +226,12 @@ class WebSystem(Fe2genSystem):
             mentions.append({'mention_text': f['mention_text'], 'span_start': f['span_start'], 'span_end': f['span_end'],
                              'status': labels[f['assertion']],
                              'explanation': 'Model 1 ' + version + ' gợi ý trạng thái ' + labels[f['assertion']]
-                                            + ('; mã đầu tiên theo cụm bác sĩ đã duyệt' if reviewed else '') + '; bác sĩ xác nhận.',
+                                            + ('; mã đầu tiên theo góp ý bác sĩ đã được quản trị duyệt' if corrected
+                                               else '; mã đầu tiên theo cụm bác sĩ đã duyệt' if reviewed else '') + '; bác sĩ xác nhận.',
                              'context_review': caution, 'alignment': f.get('alignment', 'unique'),
                              'candidates': choices or self.search_hpo(f['mention_text'], 5),
-                             'mapping': 'doctor_reviewed_phrase' if reviewed else 'model1_v6_retriever_reranker' if choices else 'search_suggestion',
+                             'mapping': 'doctor_correction' if corrected else 'doctor_reviewed_phrase' if reviewed
+                                        else 'model1_v6_retriever_reranker' if choices else 'search_suggestion',
                              'approved': False})
         return {'mentions': mentions, 'engine': 'model1_v6_ensemble', 'model_version': version, 'review_required': True,
                 'warnings': [safe_input_error(e) for e in result.get('errors', [])], 'seconds': result.get('seconds')}

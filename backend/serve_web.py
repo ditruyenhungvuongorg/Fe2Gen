@@ -13,6 +13,8 @@ from urllib.parse import urlparse, parse_qs
 from accesslog import AccessLog
 from audit import EVENTS, AuditLog
 from auth import GPU_ROLES, LOCKED_MESSAGE, ROLES, USERNAME, Auth, LoginRefused, public_user
+from bug_reports import BugReportStore, parse_report
+from corrections import HPO_ID, LABELS as CORRECTION_LABELS, CorrectionStore, export_payload, parse_submission
 from model1_process import ModelUnavailable, free_vram_mib
 from ratelimit import RateLimiter, WorkQueue, env_int
 from web_service import WebSystem
@@ -20,13 +22,18 @@ from web_service import WebSystem
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT.parent / 'docs'
 STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/config.js', '/case-state.js', '/idle.js', '/twofactor.js',
+                '/corrections.js', '/bugreport.js',
                 '/fonts/BeVietnamPro-Regular.ttf', '/fonts/BeVietnamPro-SemiBold.ttf', '/fonts/OFL.txt',
                 '/fonts/Inter-vietnamese.woff2', '/fonts/Inter-latin-ext.woff2', '/fonts/Inter-latin.woff2', '/fonts/OFL-Inter.txt')
 SYSTEM = WebSystem()
 AUTH = Auth()
 AUDIT = AuditLog()
 ACCESS = AccessLog()
+CORRECTIONS = CorrectionStore()   # doctors' "Góp ý sửa mã"; approved ones feed SYSTEM.apply_corrections
+BUG_REPORTS = BugReportStore()    # "Báo lỗi" with screenshots, read on the admin page
 AUTH.store.on_problem = lambda kind: AUDIT.write('auth_store_error', '', kind=kind)
+# Only /api/bug_reports (screenshots as base64) may send a body this large; every other route keeps 100 kB.
+UPLOAD_BYTES = env_int('WEB_MAX_UPLOAD_BYTES', 8000000)
 QUEUE_SECONDS = 90
 # One request at a time on the GPU/CPU; at most WEB_QUEUE_MAX more wait (up to QUEUE_SECONDS), the next gets 503.
 WORK = WorkQueue(env_int('WEB_QUEUE_MAX', 5))
@@ -37,7 +44,9 @@ RATES = {'hpo_search': RateLimiter(env_int('WEB_RATE_HPO_SEARCH', 60)),
          'extract_hpo': RateLimiter(env_int('WEB_RATE_EXTRACT', 10)),
          'login': RateLimiter(env_int('WEB_RATE_LOGIN', 10)),
          'login_user': RateLimiter(env_int('WEB_RATE_LOGIN', 10)),
-         'admin': RateLimiter(env_int('WEB_RATE_ADMIN', 60))}
+         'admin': RateLimiter(env_int('WEB_RATE_ADMIN', 60)),
+         'corrections': RateLimiter(env_int('WEB_RATE_CORRECTIONS', 20)),
+         'bug_report': RateLimiter(env_int('WEB_RATE_BUG_REPORT', 5))}
 # Behind Tailscale Funnel every connection comes from 127.0.0.1. Only with WEB_TRUST_PROXY=1 is the last
 # X-Forwarded-For entry (the one the local proxy appended) used as the source; never trust it otherwise.
 TRUST_PROXY = os.getenv('WEB_TRUST_PROXY', '0') == '1'
@@ -148,6 +157,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_bytes(self, body, content_type, filename):
+        """A file download (export JSON, bug-report screenshot); filename is server-made ASCII."""
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Content-Disposition', 'attachment; filename="%s"' % filename.replace('"', ''))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ------------------------------------------------------------------ identity
     @property
     def role(self):
@@ -213,11 +231,11 @@ class Handler(SimpleHTTPRequestHandler):
                        {'Retry-After': str(wait)})
         return True
 
-    def read_json(self):
+    def read_json(self, limit=100000):
         """The request body as a dict, or None after an error reply."""
         try:
             size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= 100000:
+            if not 0 < size <= limit:
                 self.send_json({'error': 'Yêu cầu quá lớn hoặc rỗng.'}, 413)
                 return None
             payload = json.loads(self.rfile.read(size).decode())
@@ -268,6 +286,15 @@ class Handler(SimpleHTTPRequestHandler):
                 if self.limited('hpo_search'):
                     return
                 return self.send_json(SYSTEM.search_hpo(parse_qs(path.query).get('q', [''])[0][:200]))
+            if path.path == '/api/corrections':  # the signed-in user's own corrections
+                if self.limited('corrections'):
+                    return
+                status = parse_qs(path.query).get('status', ['all'])[0]
+                try:
+                    items = CORRECTIONS.own(self.user, status)
+                except (OSError, ValueError):  # corrections.json unreadable or hand-edited badly
+                    return self.send_json({'error': 'Không đọc được danh sách góp ý. Liên hệ quản trị viên.'}, 500)
+                return self.send_json({'items': items, 'labels': CORRECTION_LABELS})
             if path.path.startswith('/api/admin/'):
                 if not self.admin_only():  # admin_only already answered 403; a second reply would desync HTTP
                     return
@@ -294,6 +321,13 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({'error': 'Tài khoản Phòng Lab không dùng tách đoạn văn.'}, 403)
             SYSTEM.runner.start()
             return self.send_json(self.model_status())
+        if path == '/api/bug_reports':  # the one route that may carry screenshots (UPLOAD_BYTES)
+            if self.limited('bug_report'):  # before the body is read: HTTP/1.0, the unread upload is just dropped
+                return
+            payload = self.read_json(limit=UPLOAD_BYTES)
+            if payload is not None:
+                self.bug_report(payload)
+            return
         payload = self.read_json()
         if payload is None:
             return
@@ -301,6 +335,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self.change_password(payload)
         if path in ('/api/totp/setup', '/api/totp/enable', '/api/totp/disable'):
             return self.totp(path, payload)
+        if path == '/api/corrections':
+            if self.role not in GPU_ROLES:
+                return self.send_json({'error': 'Tài khoản Phòng Lab không dùng tách đoạn văn.'}, 403)
+            if not self.limited('corrections'):
+                self.submit_correction(payload)
+            return
         if path.startswith('/api/admin/'):
             if self.admin_only() and not self.limited('admin'):
                 self.admin_post(path, payload)
@@ -428,6 +468,42 @@ class Handler(SimpleHTTPRequestHandler):
             SYSTEM.runner.start()
         self.send_json({'ok': True, 'user': AUTH.describe(self.session)})
 
+    # ------------------------------------------------------------------ corrections and bug reports
+    def display_name(self):
+        return self.session['name'] if self.session else self.user
+
+    def resolve_hpo(self, hid):
+        """The catalog term for an HPO id (an alias maps to its primary id); ValueError when unknown/obsolete."""
+        hid = getattr(SYSTEM, 'aliases', {}).get(hid, hid)
+        canonical = getattr(SYSTEM, 'canonical', {})
+        if not HPO_ID.match(hid) or (canonical and hid not in canonical):
+            raise ValueError('Mã HPO không có trong danh mục.')
+        term = getattr(SYSTEM, 'term', None)
+        return term(hid) if callable(term) else {'id': hid, 'vi': '', 'en': ''}
+
+    def submit_correction(self, payload):
+        try:
+            fields = parse_submission(payload, self.resolve_hpo)
+            item, duplicate = CORRECTIONS.add(self.user, self.display_name(), fields)
+        except ValueError as exc:
+            return self.send_json({'error': str(exc)}, 422)
+        except OSError:
+            return self.send_json({'error': 'Chưa lưu được góp ý. Liên hệ quản trị viên.'}, 500)
+        if not duplicate:  # the id only: the phrase and codes are clinical wording, not for the audit log
+            AUDIT.write('correction_submitted', self.user, correction_id=item['id'])
+        self.send_json({'ok': True, 'item': item, **({'duplicate': True} if duplicate else {})})
+
+    def bug_report(self, payload):
+        try:
+            text, page, info, images = parse_report(payload)
+            report_id = BUG_REPORTS.add(self.user, self.display_name(), self.role, text, page, info, images)
+        except ValueError as exc:
+            return self.send_json({'error': str(exc)}, 422)
+        except OSError:
+            return self.send_json({'error': 'Chưa lưu được báo lỗi. Liên hệ quản trị viên.'}, 500)
+        AUDIT.write('bug_report_created', self.user, report_id=report_id, images=len(images))
+        self.send_json({'ok': True, 'id': report_id})
+
     # ------------------------------------------------------------------ admin page
     def admin_only(self):
         if self.session and self.role == 'admin' and not AUTH.needs_2fa(self.session):
@@ -461,11 +537,56 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({'entries': AUDIT.tail(limit, first('user'), first('event')), 'events': EVENTS})
         if path == '/api/admin/gpu':
             return self.send_json(self.gpu_status())
+        first = lambda key, default='': query.get(key, [default])[0]
+        try:
+            return self.admin_stores_get(path, first)
+        except (OSError, ValueError):  # a store file unreadable or hand-edited badly
+            return self.send_json({'error': 'Không đọc được dữ liệu đã lưu. Liên hệ quản trị viên.'}, 500)
+
+    def admin_stores_get(self, path, first):
+        if path == '/api/admin/corrections':
+            items, counts = CORRECTIONS.listing(first('status', 'pending'), first('user').strip().lower()[:64])
+            return self.send_json({'items': items, 'labels': CORRECTION_LABELS, 'counts': counts})
+        if path == '/api/admin/corrections/export':
+            data = export_payload(CORRECTIONS.approved_items())
+            AUDIT.write('corrections_exported', self.user, count=data['count'])
+            return self.send_bytes(json.dumps(data, ensure_ascii=False, indent=1).encode(), 'application/json; charset=utf-8',
+                                   'fe2gen_gop_y_%s.json' % datetime.now().strftime('%Y%m%d'))
+        if path == '/api/admin/bug_reports':
+            items, counts = BUG_REPORTS.listing(first('status', 'new'))
+            return self.send_json({'items': items, 'counts': counts})
+        if path == '/api/admin/bug_reports/image':
+            try:
+                found = BUG_REPORTS.image(first('id')[:12], int(first('n', '0')))
+            except ValueError:
+                found = None
+            if not found:
+                return self.send_json({'error': 'Không tìm thấy ảnh này.'}, 404)
+            return self.send_bytes(*found)
         self.send_json({'error': 'Không có endpoint này.'}, 404)
 
     def admin_post(self, path, p):
         target = str(p.get('username') or '').strip().lower()
         try:
+            if path == '/api/admin/corrections/decide':
+                decision = p.get('decision')
+                if decision not in ('approved', 'rejected'):
+                    raise ValueError('Quyết định không hợp lệ.')
+                item = CORRECTIONS.decide(str(p.get('id') or ''), decision, p.get('note') or '', self.user)
+                apply_live_corrections()
+                AUDIT.write('correction_' + decision, self.user, correction_id=item['id'], target=item['user'])
+                return self.send_json({'ok': True, 'item': item})
+            if path == '/api/admin/bug_reports/status':
+                status = p.get('status')
+                if status not in ('new', 'closed'):
+                    raise ValueError('Trạng thái không hợp lệ.')
+                BUG_REPORTS.set_status(str(p.get('id') or ''), status, self.user)
+                AUDIT.write('bug_report_updated', self.user, report_id=str(p.get('id'))[:12], status=status)
+                return self.send_json({'ok': True})
+            if path == '/api/admin/bug_reports/delete':
+                BUG_REPORTS.delete(str(p.get('id') or ''))
+                AUDIT.write('bug_report_deleted', self.user, report_id=str(p.get('id'))[:12])
+                return self.send_json({'ok': True})
             if path == '/api/admin/users/create':
                 temp = AUTH.create_user(target, p.get('name'), p.get('role'))
                 AUDIT.write('user_created', self.user, target=target, role=p.get('role'))
@@ -504,6 +625,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.admin_gpu(str(p.get('action') or ''))
         except ValueError as exc:
             return self.send_json({'error': str(exc)}, 422)
+        except OSError:  # corrections.json / bug_reports not writable
+            return self.send_json({'error': 'Chưa lưu được thay đổi. Liên hệ quản trị viên.'}, 500)
         self.send_json({'error': 'Không có endpoint này.'}, 404)
 
     def admin_gpu(self, action):
@@ -558,6 +681,19 @@ class Server(ThreadingHTTPServer):
             self.slots.release()
 
 
+def apply_live_corrections():
+    """Hand the approved corrections to the live WebSystem (at startup and after every admin decision). Tests
+    replace SYSTEM with a SimpleNamespace that may lack apply_corrections; a broken store must not stop serving."""
+    apply = getattr(SYSTEM, 'apply_corrections', None)
+    if not callable(apply):
+        return 0
+    try:
+        return apply(CORRECTIONS.approved_items())
+    except (OSError, ValueError) as exc:
+        print('Corrections not applied:', type(exc).__name__, exc, file=sys.stderr, flush=True)
+        return 0
+
+
 def preload_model1():
     """Load Model 1 at startup (MODEL1_PRELOAD=1; it is still released after MODEL1_IDLE_MINUTES unused).
     HPO search and disease matching need no GPU, so a failure (e.g. no NVIDIA driver after a reboot) must not
@@ -571,6 +707,7 @@ def preload_model1():
 
 if __name__ == '__main__':
     SYSTEM.initialize()
+    print(f'[Góp ý] {apply_live_corrections()} cụm từ theo góp ý bác sĩ đã duyệt được áp dụng.', flush=True)
     if os.getenv('MODEL1_PRELOAD') == '1':
         preload_model1()
     port = int(os.getenv('PORT', '8000'))
