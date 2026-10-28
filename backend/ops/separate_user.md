@@ -43,6 +43,8 @@ readlink -f ~/venvs/nckh-model1-span-v1/bin/python     # phải là /usr/bin/pyt
 cd ~/prenatal_pubcasefinder/.deployment
 sudo cp -p users.json web.env login_failures.json model1_state.json /home/fe2gen/prenatal_pubcasefinder/.deployment/ 2>/dev/null
 sudo cp -p audit.jsonl* access.log* /home/fe2gen/prenatal_pubcasefinder/.deployment/ 2>/dev/null
+sudo cp -p corrections.json /home/fe2gen/prenatal_pubcasefinder/.deployment/ 2>/dev/null     # góp ý sửa mã (nếu đã có)
+sudo cp -a bug_reports /home/fe2gen/prenatal_pubcasefinder/.deployment/ 2>/dev/null          # báo lỗi kèm ảnh (nếu đã có)
 sudo chown -R fe2gen:fe2gen /home/fe2gen/prenatal_pubcasefinder /home/fe2gen/venvs
 sudo chmod 600 /home/fe2gen/prenatal_pubcasefinder/.deployment/*
 ```

@@ -32,6 +32,10 @@ EVENTS = {
     'totp_backup_used': 'Dùng mã dự phòng 2 lớp', 'totp_reset': 'Đặt lại xác thực 2 lớp',
     'totp_disabled': 'Tắt xác thực 2 lớp',
     'temp_password_expired': 'Mật khẩu tạm đã hết hạn',
+    # Góp ý sửa mã / báo lỗi: only ids and counts, never the phrase, HPO codes, notes or report text.
+    'correction_submitted': 'Gửi góp ý sửa mã', 'correction_approved': 'Duyệt góp ý sửa mã',
+    'correction_rejected': 'Từ chối góp ý sửa mã', 'corrections_exported': 'Tải góp ý đã duyệt',
+    'bug_report_created': 'Gửi báo lỗi', 'bug_report_updated': 'Cập nhật báo lỗi', 'bug_report_deleted': 'Xóa báo lỗi',
 }
 
 

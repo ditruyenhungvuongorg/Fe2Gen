@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Encrypted backup of the web's private state (B24): accounts, audit/access logs, login locks, web.env and
-# lab_cases.json (cases sent to the Lab: patient data, kept mode 600 and only ever written encrypted here).
+# Encrypted backup of the web's private state (B24): accounts, audit/access logs, login locks, web.env,
+# lab_cases.json (cases sent to the Lab: patient data, kept mode 600 and only ever written encrypted here),
+# corrections.json (doctors' HPO corrections: clinical wording, 600) and the bug_reports/ folder (reports with
+# screenshots that may show a case; folder 700, files 600).
 #   bash backup_deployment.sh                      one backup now (what the daily timer runs)
 #   bash backup_deployment.sh --setup              key/passphrase config + daily systemd user timer
 #   bash backup_deployment.sh --list               backups present
@@ -61,21 +63,25 @@ backup_now() {
   else die "no key: list an age public key in $RECIPIENTS or create $PASSFILE (bash $0 --setup)"; fi
   stamp="$(date +%Y%m%d-%H%M%S)"
   shopt -s nullglob
-  for f in "$SRC"/users.json "$SRC"/audit.jsonl* "$SRC"/login_failures.json "$SRC"/access.log* "$SRC"/web.env "$SRC"/lab_cases.json; do
+  for f in "$SRC"/users.json "$SRC"/audit.jsonl* "$SRC"/login_failures.json "$SRC"/access.log* "$SRC"/web.env "$SRC"/lab_cases.json \
+           "$SRC"/corrections.json; do
     [ -f "$f" ] && files+=("$(basename "$f")")
   done
   shopt -u nullglob
-  [ "${#files[@]}" -gt 0 ] || die "nothing to back up in $SRC"
+  local dirs=()
+  [ -d "$SRC/bug_reports" ] && dirs+=(bug_reports)   # index.json + screenshots, copied as a whole folder (cp -a)
+  [ "${#files[@]}" -gt 0 ] || [ "${#dirs[@]}" -gt 0 ] || die "nothing to back up in $SRC"
   # Snapshot first (the service appends to the logs while tar would read them), in a 700 folder, removed on exit.
   out="$DEST/$PREFIX-$stamp.tar.gz"
   SNAP="$(mktemp -d "$DEST/.snapshot.XXXXXX")"   # globals: the EXIT trap runs after this function returned
   PART="$out.part"
   trap 'rm -rf -- "$SNAP" "$PART"' EXIT
   for f in "${files[@]}"; do cp -p "$SRC/$f" "$SNAP/$f"; done
-  tar -C "$SNAP" -czf - -- "${files[@]}" | encrypt "$ext" > "$PART"
+  for f in "${dirs[@]}"; do cp -a "$SRC/$f" "$SNAP/$f"; done
+  tar -C "$SNAP" -czf - -- "${files[@]}" "${dirs[@]}" | encrypt "$ext" > "$PART"
   mv "$out.part" "$out.$ext"
   chmod 600 "$out.$ext"
-  echo "backup: $out.$ext (${files[*]})"
+  echo "backup: $out.$ext (${files[*]} ${dirs[*]})"
   # Keep the newest $KEEP (names sort by time).
   find "$DEST" -maxdepth 1 -type f -name "$PREFIX-*.tar.gz.*" ! -name '*.part' -printf '%f\n' | sort -r \
     | tail -n +"$((KEEP + 1))" | while read -r old; do rm -f -- "$DEST/$old"; echo "backup: removed old $old"; done
@@ -138,15 +144,19 @@ restore() {  # $1 = backup file, $2 = age identity
   mkdir -m 700 "$target"
   decrypt "$file" "${2:-}" | tar -C "$target" -xzf -
   chmod 600 "$target"/* 2>/dev/null || true
+  if [ -d "$target/bug_reports" ]; then chmod 700 "$target/bug_reports"; chmod 600 "$target"/bug_reports/* 2>/dev/null || true; fi
   echo "restore: decrypted into $target:"; ls -l "$target"
   cat <<EOF
 
 Nothing live was changed. To put the files back (stop first so the service does not write meanwhile):
   systemctl --user stop prenatal-web
   STAMP=\$(date +%Y%m%d-%H%M%S); mkdir -m 700 "$SRC/before-restore-\$STAMP"
-  cp -p "$SRC"/users.json "$SRC"/login_failures.json "$SRC"/audit.jsonl* "$SRC"/web.env "$SRC"/lab_cases.json "$SRC/before-restore-\$STAMP"/ 2>/dev/null
+  cp -p "$SRC"/users.json "$SRC"/login_failures.json "$SRC"/audit.jsonl* "$SRC"/web.env "$SRC"/lab_cases.json "$SRC"/corrections.json "$SRC/before-restore-\$STAMP"/ 2>/dev/null
+  cp -a "$SRC"/bug_reports "$SRC/before-restore-\$STAMP"/ 2>/dev/null
   cp -p "$target"/<file you need> "$SRC"/      # usually users.json; audit/access logs only if the live ones are lost
-  chmod 600 "$SRC"/users.json "$SRC"/web.env "$SRC"/lab_cases.json 2>/dev/null || true
+  cp -a "$target"/bug_reports "$SRC"/          # only if the live bug reports are lost (index.json + screenshots)
+  chmod 600 "$SRC"/users.json "$SRC"/web.env "$SRC"/lab_cases.json "$SRC"/corrections.json 2>/dev/null || true
+  chmod 700 "$SRC"/bug_reports 2>/dev/null; chmod 600 "$SRC"/bug_reports/* 2>/dev/null || true
   systemctl --user start prenatal-web
 Check: python3 manage_users.py list   (from the backend folder);  bash gpu.sh status
        python3 audit.py verify "$SRC/audit.jsonl"   (if this release has audit.py verify)

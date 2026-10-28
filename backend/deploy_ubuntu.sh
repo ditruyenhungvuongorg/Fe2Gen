@@ -45,6 +45,11 @@ if [ ! -f "$ENV_FILE" ]; then
     '# WEB_QUEUE_MAX=5' \
     '# WEB_MAX_CONNECTIONS=64' \
     '# WEB_RATE_HPO_SEARCH=60' \
+    '# WEB_RATE_CORRECTIONS=20' \
+    '# WEB_RATE_BUG_REPORT=5' \
+    '# WEB_MAX_UPLOAD_BYTES=8000000' \
+    "# WEB_CORRECTIONS_FILE=$STATE_DIR/corrections.json" \
+    "# WEB_BUG_REPORTS_DIR=$STATE_DIR/bug_reports" \
     '# MODEL1_REQUIRE_HASH=1' > "$ENV_FILE"
 fi
 chmod 600 "$ENV_FILE"

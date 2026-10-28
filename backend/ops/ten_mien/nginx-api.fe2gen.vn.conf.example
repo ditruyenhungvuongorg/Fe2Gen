@@ -1,0 +1,24 @@
+# Mẫu nginx trên máy trung gian (VPS) cho API Fe2Gen ở api.fe2gen.vn.
+# Chứng chỉ: certbot --nginx -d api.fe2gen.vn. UBUNTU_TAILSCALE_IP là IP tailnet (100.x.y.z) của máy Ubuntu;
+# backend ở đó vẫn chỉ nghe 127.0.0.1:8000, nên trên Ubuntu cần `tailscale serve --bg 8000` (tailnet-only, không Funnel)
+# và proxy_pass tới https://adminpc-system-product-name.taila6ff46.ts.net thay cho IP, hoặc mở 8000 cho tailnet.
+server {
+    listen 443 ssl http2;
+    server_name api.fe2gen.vn;
+    ssl_certificate     /etc/letsencrypt/live/api.fe2gen.vn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.fe2gen.vn/privkey.pem;
+    client_max_body_size 12m;           # ảnh báo lỗi tối đa ~8 MB sau mã hóa base64
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    location / {
+        proxy_pass https://adminpc-system-product-name.taila6ff46.ts.net;
+        proxy_set_header Host adminpc-system-product-name.taila6ff46.ts.net;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 180s;         # tách đoạn văn có thể mất vài chục giây khi Model 1 đang nạp
+    }
+}
+server {
+    listen 80;
+    server_name api.fe2gen.vn;
+    return 301 https://$host$request_uri;
+}

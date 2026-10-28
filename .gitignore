@@ -21,4 +21,6 @@ audit*.jsonl.*
 access.log*
 login_failures.json
 model1_state.json
+corrections.json
+bug_reports/
 *.xlsx

@@ -15,7 +15,7 @@ from contextlib import redirect_stderr
 from http.server import ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # Tests also run on the production host (deployment step 3): keep serve_web's module-level stores away from the
 # real users.json, audit log, access log and model state file (the lockout file sits next to users.json).
@@ -23,12 +23,15 @@ from unittest.mock import patch
 if 'FE2GEN_TEST_DIR' not in os.environ:
     os.environ['FE2GEN_TEST_DIR'] = tempfile.mkdtemp(prefix='fe2gen-test-')
     for _name, _file in (('WEB_USERS_FILE', 'users.json'), ('WEB_AUDIT_FILE', 'audit.jsonl'),
-                         ('WEB_ACCESS_LOG', 'access.log'), ('MODEL1_STATE_FILE', 'model1_state.json')):
+                         ('WEB_ACCESS_LOG', 'access.log'), ('MODEL1_STATE_FILE', 'model1_state.json'),
+                         ('WEB_CORRECTIONS_FILE', 'corrections.json'), ('WEB_BUG_REPORTS_DIR', 'bug_reports')):
         os.environ[_name] = str(Path(os.environ['FE2GEN_TEST_DIR'], _file))
 
 from accesslog import AccessLog
 from audit import AuditLog
 from auth import Auth, UserStore, check_password, hash_password, password_problem, public_user, temporary_password
+from bug_reports import BugReportStore
+from corrections import CorrectionStore
 from model1_process import Model1Process, ModelProcessError, ModelUnavailable
 
 FAKE = [sys.executable, '-c', 'import sys, model1_process, test_access; '
@@ -484,7 +487,7 @@ class AdminHttpTests(unittest.TestCase):
 
 def fresh_rates(per_minute=1000, **override):
     from ratelimit import RateLimiter
-    groups = ('hpo_search', 'match_diseases', 'extract_hpo', 'login', 'login_user', 'admin')
+    groups = ('hpo_search', 'match_diseases', 'extract_hpo', 'login', 'login_user', 'admin', 'corrections', 'bug_report')
     return {g: RateLimiter(override.get(g, per_minute)) for g in groups}
 
 
@@ -1408,6 +1411,422 @@ class FailClosedTests(unittest.TestCase):
             Auth(store, require_accounts=True).mode
         self.assertEqual([(e['event'], e['kind']) for e in log.tail()], [('auth_store_error', 'missing')])
 
+
+
+def raw_fetch(base, path, token, payload=None):
+    """(status, headers, body bytes) of one request; for downloads and images, which HttpTests.call cannot read."""
+    req = urllib.request.Request(base + path, data=json.dumps(payload).encode() if payload is not None else None,
+                                 headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def fake_hpo_system(runner):
+    """A WebSystem stand-in with a small catalog, an alias and the hooks serve_web consults for corrections."""
+    names = {'HP:0001520': ('Thai to so với tuổi thai', 'Large for gestational age'),
+             'HP:0001518': ('Thai nhỏ so với tuổi thai', 'Small for gestational age'),
+             'HP:0001640': ('Tim to', 'Cardiomegaly')}
+    return types.SimpleNamespace(
+        matcher=types.SimpleNamespace(profiles=[1]), canonical={h: {'id': h, 'vi': v, 'en': e} for h, (v, e) in names.items()},
+        aliases={'HP:0009999': 'HP:0001520'}, term=lambda h: {'id': h, 'vi': names[h][0], 'en': names[h][1]},
+        apply_corrections=Mock(return_value=1), runner=runner, search_hpo=lambda q: [],
+        extract=lambda text: {'mentions': [], 'seconds': 0.0}, match=lambda p: {'ok': True})
+
+
+class CorrectionsTests(unittest.TestCase):
+    """Góp ý sửa mã: doctors submit, admins decide, approved items reach SYSTEM.apply_corrections and the export."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        d = self.dir.name
+        self.store = accounts(d, **{'bs.an': 'doctor', 'bs.binh': 'doctor', 'lab.hv': 'lab', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(d, 'audit.jsonl'))
+        self.corrections = CorrectionStore(Path(d, 'corrections.json'))
+        self.system = fake_hpo_system(model())
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def server(self, **extra):
+        return LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit, CORRECTIONS=self.corrections,
+                          SYSTEM=self.system, **extra)
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data['token']
+
+    BODY = {'phrase': 'Thai to', 'right_id': 'HP:0001520', 'wrong_ids': ['HP:0001518'], 'context': 'Thai 36 tuần, thai to.',
+            'note': 'Model chọn thai nhỏ', 'source': 'text'}
+
+    def test_doctor_submits_and_reads_own_items(self):
+        with self.server() as srv:
+            an, binh, lab = (self.login(srv, n) for n in ('bs.an', 'bs.binh', 'lab.hv'))
+            code, out = srv.call('/api/corrections', self.BODY, an)
+            self.assertEqual(code, 200, out)
+            item = out['item']
+            self.assertEqual((out['ok'], item['status'], item['user'], item['name']), (True, 'pending', 'bs.an', 'bs.an'))
+            self.assertEqual((item['right']['id'], item['right']['en']), ('HP:0001520', 'Large for gestational age'))
+            self.assertEqual([w['id'] for w in item['wrong']], ['HP:0001518'])
+            self.assertRegex(item['id'], r'^[0-9a-f]{12}$')
+            self.assertRegex(item['time'], r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$')
+            self.assertIsNone(item['decided_by'])
+            # the same pending phrase + code again: no second item
+            code, again = srv.call('/api/corrections', {**self.BODY, 'phrase': ' thai TO '}, an)
+            self.assertEqual((code, again['duplicate'], again['item']['id']), (200, True, item['id']))
+            # an alias is stored under its primary id
+            code, alias = srv.call('/api/corrections', {'phrase': 'thai lớn', 'right_id': 'HP:0009999'}, an)
+            self.assertEqual((code, alias['item']['right']['id'], alias['item']['wrong'], alias['item']['source']),
+                             (200, 'HP:0001520', [], 'text'))
+            for body, message in (({'phrase': '', 'right_id': 'HP:0001520'}, 'Nhập cụm từ cần sửa.'),
+                                  ({'phrase': 'x', 'right_id': 'HP:0000001'}, 'Mã HPO không có trong danh mục.'),
+                                  ({'phrase': 'x', 'right_id': 'HP:1'}, 'HP:0000000'),
+                                  ({'phrase': 'x' * 201, 'right_id': 'HP:0001520'}, '200'),
+                                  ({'phrase': 'x', 'right_id': 'HP:0001520', 'wrong_ids': ['HP:0001518'] * 6}, 'Tối đa 5'),
+                                  ({'phrase': 'x', 'right_id': 'HP:0001520', 'source': 'mail'}, 'Nguồn')):
+                code, err = srv.call('/api/corrections', body, an)
+                self.assertEqual(code, 422, (body, err))
+                self.assertIn(message, err['error'])
+            self.assertEqual(srv.call('/api/corrections', self.BODY, lab)[0], 403)
+            code, mine = srv.call('/api/corrections', token=an)
+            self.assertEqual((code, [i['phrase'] for i in mine['items']]), (200, ['thai lớn', 'Thai to']))  # newest first
+            self.assertEqual(mine['labels']['pending'], 'Chờ duyệt')
+            self.assertEqual(srv.call('/api/corrections?status=approved', token=an)[1]['items'], [])
+            self.assertEqual(srv.call('/api/corrections', token=binh)[1]['items'], [])  # own items only
+            for path in ('/api/admin/corrections', '/api/admin/corrections/export'):
+                raw = raw_get(srv.base, path, an)
+                self.assertEqual(len(re.findall(rb'HTTP/1\.[01] \d{3} ', raw)), 1, raw[:300])
+                self.assertTrue(raw.startswith(b'HTTP/1.0 403'))
+            self.assertEqual(srv.call('/api/admin/corrections/decide', {'id': item['id'], 'decision': 'approved'}, an)[0], 403)
+            if os.name == 'posix':
+                self.assertEqual(os.stat(self.corrections.path).st_mode & 0o777, 0o600)
+        log = json.dumps(self.audit.tail(), ensure_ascii=False)
+        self.assertIn('correction_submitted', log)
+        self.assertIn(item['id'], log)
+        for secret in ('Thai to', 'thai lớn', 'HP:0001520', 'HP:0001518', 'Model chọn'):
+            self.assertNotIn(secret, log)  # clinical wording never reaches the audit log
+        self.assertEqual(sum(1 for e in self.audit.tail() if e['event'] == 'correction_submitted'), 2)
+
+    def test_admin_decides_applies_and_exports(self):
+        with self.server() as srv:
+            an, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            item = srv.call('/api/corrections', self.BODY, an)[1]['item']
+            other = srv.call('/api/corrections', {'phrase': 'tim to', 'right_id': 'HP:0001640'}, an)[1]['item']
+            code, listing = srv.call('/api/admin/corrections', token=admin)
+            self.assertEqual((code, listing['counts']), (200, {'pending': 2, 'approved': 0, 'rejected': 0}))
+            self.assertEqual([i['id'] for i in listing['items']], [other['id'], item['id']])
+            self.assertEqual(srv.call('/api/admin/corrections?status=approved', token=admin)[1]['items'], [])
+            self.assertEqual(len(srv.call('/api/admin/corrections?user=bs.binh&status=all', token=admin)[1]['items']), 0)
+            self.system.apply_corrections.reset_mock()
+            code, decided = srv.call('/api/admin/corrections/decide', {'id': item['id'], 'decision': 'approved', 'note': 'Đúng'}, admin)
+            self.assertEqual(code, 200, decided)
+            self.assertEqual((decided['item']['status'], decided['item']['decided_by'], decided['item']['decision_note']),
+                             ('approved', 'quan.tri', 'Đúng'))
+            self.assertIsNotNone(decided['item']['decided_at'])
+            self.system.apply_corrections.assert_called_once()
+            applied = self.system.apply_corrections.call_args[0][0]
+            self.assertEqual([(i['id'], i['status'], i['right']['id']) for i in applied], [(item['id'], 'approved', 'HP:0001520')])
+            counts = srv.call('/api/admin/corrections', token=admin)[1]['counts']
+            self.assertEqual(counts, {'pending': 1, 'approved': 1, 'rejected': 0})
+            self.assertEqual(srv.call('/api/corrections?status=approved', token=an)[1]['items'][0]['id'], item['id'])
+            code, err = srv.call('/api/admin/corrections/decide', {'id': 'khongco00000', 'decision': 'approved'}, admin)
+            self.assertEqual((code, err['error']), (422, 'Không tìm thấy góp ý này.'))
+            self.assertEqual(srv.call('/api/admin/corrections/decide', {'id': item['id'], 'decision': 'maybe'}, admin)[0], 422)
+            # export: approved only, as a download
+            status, headers, body = raw_fetch(srv.base, '/api/admin/corrections/export', admin)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers['Content-Type'], 'application/json; charset=utf-8')
+            self.assertRegex(headers['Content-Disposition'], r'^attachment; filename="fe2gen_gop_y_\d{8}\.json"$')
+            self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+            export = json.loads(body)
+            self.assertEqual(export['count'], 1)
+            row = export['items'][0]
+            self.assertEqual((row['mention_text'], row['hpo_id'], row['wrong_hpo_ids'], row['user'], row['approved_by']),
+                             ('Thai to', 'HP:0001520', ['HP:0001518'], 'bs.an', 'quan.tri'))
+            self.assertEqual(export['memory_rows'], [{'query_text': 'thai to', 'hpo_id': 'HP:0001520'}])
+            self.assertEqual(export['doctor_phrases'], [{'id': 'HP:0001520', 'vi': 'Thai to', 'en': 'Large for gestational age'}])
+            # the admin may change their mind: the live map is rebuilt without the item
+            self.system.apply_corrections.reset_mock()
+            code, flipped = srv.call('/api/admin/corrections/decide', {'id': item['id'], 'decision': 'rejected'}, admin)
+            self.assertEqual((code, flipped['item']['status']), (200, 'rejected'))
+            self.assertEqual(self.system.apply_corrections.call_args[0][0], [])
+            self.assertEqual(json.loads(raw_fetch(srv.base, '/api/admin/corrections/export', admin)[2])['count'], 0)
+        events = [(e['event'], e.get('target'), e.get('count')) for e in self.audit.tail()]
+        self.assertIn(('correction_approved', 'bs.an', None), events)
+        self.assertIn(('correction_rejected', 'bs.an', None), events)
+        self.assertIn(('corrections_exported', None, 1), events)
+        self.assertNotIn('Thai to', json.dumps(self.audit.tail(), ensure_ascii=False))
+
+    def test_store_rereads_file_and_orders_approved_by_decision(self):
+        a = CorrectionStore(Path(self.dir.name, 'c.json'))
+        fields = lambda phrase, hid: {'phrase': phrase, 'right': {'id': hid, 'vi': '', 'en': ''}, 'wrong': [], 'context': '',
+                                      'note': '', 'source': 'text'}
+        one, _ = a.add('bs.an', 'BS. An', fields('thai to', 'HP:0001520'))
+        two, _ = a.add('bs.an', 'BS. An', fields('thai to', 'HP:0001640'))
+        three, _ = a.add('bs.an', 'BS. An', fields('tim to', 'HP:0001640'))
+        a.decide(three['id'], 'approved', '', 'quan.tri')
+        del a.items[-1]['decided_ts']  # an item decided before decided_ts existed sorts last
+        a._save()
+        time.sleep(0.05)
+        a.decide(two['id'], 'approved', '', 'quan.tri')
+        time.sleep(0.05)
+        a.decide(one['id'], 'approved', '', 'quan.tri')
+        b = CorrectionStore(a.path)  # another reader (the CLI) sees the same file
+        approved = b.approved_items()
+        # all three decided in the same minute (decided_at ties): the most recent decision comes first
+        self.assertEqual([i['id'] for i in approved], [one['id'], two['id'], three['id']])
+        self.assertGreater(approved[0]['decided_ts'], approved[1]['decided_ts'])
+        self.assertNotIn('decided_ts', approved[2])
+        self.assertRegex(approved[0]['decided_at'], r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$')  # kept for display
+        self.assertEqual({i['status'] for i in b.listing('all')[0]}, {'approved'})
+        with self.assertRaisesRegex(ValueError, 'Không tìm thấy'):
+            b.decide('x', 'rejected', '', 'quan.tri')
+
+    def test_corrupt_store_answers_500_not_422(self):
+        # A hand-edited or truncated corrections.json is an operator problem: never the parser's message as a 422.
+        self.corrections.path.write_text('{"items": [', encoding='utf-8')
+        with self.server() as srv:
+            an, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            code, err = srv.call('/api/corrections', self.BODY, an)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được góp ý. Liên hệ quản trị viên.'))
+            code, err = srv.call('/api/corrections', token=an)
+            self.assertEqual((code, err['error']), (500, 'Không đọc được danh sách góp ý. Liên hệ quản trị viên.'))
+            code, err = srv.call('/api/admin/corrections', token=admin)
+            self.assertEqual((code, err['error']), (500, 'Không đọc được dữ liệu đã lưu. Liên hệ quản trị viên.'))
+            code, err = srv.call('/api/admin/corrections/decide', {'id': 'a' * 12, 'decision': 'approved'}, admin)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được thay đổi. Liên hệ quản trị viên.'))
+            # the doctor's own mistakes still answer 422 (validation runs before the store is touched)
+            code, err = srv.call('/api/corrections', {**self.BODY, 'phrase': ''}, an)
+            self.assertEqual((code, err['error']), (422, 'Nhập cụm từ cần sửa.'))
+            time.sleep(0.02)
+            self.corrections.path.write_text('{"items": "x"}', encoding='utf-8')  # parses, wrong shape
+            self.assertEqual(srv.call('/api/corrections', self.BODY, an)[0], 500)
+            self.corrections.path.unlink()
+            self.assertEqual(srv.call('/api/corrections', self.BODY, an)[0], 200)  # a missing file is an empty store
+        self.corrections.path.write_text('nope', encoding='utf-8')
+        with self.assertRaises(OSError):  # StoreError is an OSError, so every existing 500 branch catches it
+            CorrectionStore(self.corrections.path).all()
+
+
+PNG_1X1 = (b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89'
+           b'\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82')
+
+
+class BugReportTests(unittest.TestCase):
+    """Báo lỗi: every role can send text + up to 3 screenshots; they stay on disk (600) for the admin page."""
+
+    def setUp(self):
+        import base64
+        self.dir = tempfile.TemporaryDirectory()
+        d = self.dir.name
+        self.store = accounts(d, **{'bs.an': 'doctor', 'lab.hv': 'lab', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(d, 'audit.jsonl'))
+        self.reports = BugReportStore(Path(d, 'bug_reports'))
+        self.png = base64.b64encode(PNG_1X1).decode()
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def server(self, **extra):
+        return LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit, BUG_REPORTS=self.reports, **extra)
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data['token']
+
+    def report(self, text='Nút Tách dấu hiệu không bấm được. BÍ-MẬT-789', images=None, **extra):
+        return {'text': text, 'page': '/#tach', 'client_info': {'model_version': 'v7.1', 'viewport': '1280x720'},
+                'images': [{'name': 'man-hinh.png', 'type': 'image/png', 'data': self.png}] if images is None else images, **extra}
+
+    def test_report_stored_listed_served_closed_and_deleted(self):
+        with self.server() as srv:
+            lab, admin = self.login(srv, 'lab.hv'), self.login(srv, 'quan.tri')
+            code, out = srv.call('/api/bug_reports', self.report(), lab)
+            self.assertEqual(code, 200, out)
+            rid = out['id']
+            self.assertRegex(rid, r'^[0-9a-f]{12}$')
+            image_file = Path(self.dir.name, 'bug_reports', rid + '_0.png')
+            self.assertEqual(image_file.read_bytes(), PNG_1X1)
+            index = Path(self.dir.name, 'bug_reports', 'index.json')
+            self.assertNotIn(self.png[:40], index.read_text(encoding='utf-8'))  # metadata only, never the image data
+            if os.name == 'posix':
+                self.assertEqual(os.stat(image_file).st_mode & 0o777, 0o600)
+                self.assertEqual(os.stat(index).st_mode & 0o777, 0o600)
+                self.assertEqual(os.stat(index.parent).st_mode & 0o777, 0o700)
+            self.assertEqual(srv.call('/api/admin/bug_reports', token=lab)[0], 403)
+            code, listing = srv.call('/api/admin/bug_reports', token=admin)
+            self.assertEqual((code, listing['counts']), (200, {'new': 1, 'closed': 0}))
+            item = listing['items'][0]
+            self.assertEqual((item['id'], item['user'], item['role'], item['status'], item['page']), (rid, 'lab.hv', 'lab', 'new', '/#tach'))
+            self.assertIn('BÍ-MẬT-789', item['text'])
+            self.assertEqual(item['client_info']['model_version'], 'v7.1')
+            self.assertEqual(item['images'], [{'n': 0, 'name': 'man-hinh.png', 'type': 'image/png', 'bytes': len(PNG_1X1)}])
+            self.assertNotIn('data', json.dumps(item['images']))
+            status, headers, body = raw_fetch(srv.base, f'/api/admin/bug_reports/image?id={rid}&n=0', admin)
+            self.assertEqual((status, body), (200, PNG_1X1))
+            self.assertEqual(headers['Content-Type'], 'image/png')
+            self.assertEqual(headers['Content-Length'], str(len(PNG_1X1)))
+            self.assertEqual(headers['Content-Disposition'], f'attachment; filename="{rid}_0.png"')
+            self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+            for query in (f'id={rid}&n=1', 'id=000000000000&n=0', f'id={rid}&n=x', f'id=..%2F{rid}&n=0'):
+                status, _, body = raw_fetch(srv.base, '/api/admin/bug_reports/image?' + query, admin)
+                self.assertEqual((status, json.loads(body)['error']), (404, 'Không tìm thấy ảnh này.'), query)
+            self.assertEqual(srv.call('/api/admin/bug_reports/status', {'id': rid, 'status': 'closed'}, admin)[1], {'ok': True})
+            code, closed = srv.call('/api/admin/bug_reports', token=admin)
+            self.assertEqual((closed['counts'], closed['items']), ({'new': 0, 'closed': 1}, []))  # default view: new ones
+            code, all_items = srv.call('/api/admin/bug_reports?status=all', token=admin)
+            self.assertEqual((all_items['items'][0]['status'], all_items['items'][0]['closed_by']), ('closed', 'quan.tri'))
+            self.assertEqual(srv.call('/api/admin/bug_reports/status', {'id': rid, 'status': 'new'}, admin)[0], 200)
+            self.assertIsNone(srv.call('/api/admin/bug_reports?status=all', token=admin)[1]['items'][0]['closed_at'])
+            code, err = srv.call('/api/admin/bug_reports/status', {'id': 'khongco00000', 'status': 'closed'}, admin)
+            self.assertEqual((code, err['error']), (422, 'Không tìm thấy báo lỗi này.'))
+            self.assertEqual(srv.call('/api/admin/bug_reports/status', {'id': rid, 'status': 'gone'}, admin)[0], 422)
+            self.assertEqual(srv.call('/api/admin/bug_reports/delete', {'id': rid}, admin)[1], {'ok': True})
+            self.assertFalse(image_file.exists())
+            self.assertEqual(srv.call('/api/admin/bug_reports?status=all', token=admin)[1]['counts'], {'new': 0, 'closed': 0})
+            self.assertEqual(srv.call('/api/admin/bug_reports/delete', {'id': rid}, admin)[0], 422)
+            # a doctor and an admin may report too, without images
+            for who in (self.login(srv, 'bs.an'), admin):
+                self.assertEqual(srv.call('/api/bug_reports', self.report(images=[]), who)[0], 200)
+        log = json.dumps(self.audit.tail(), ensure_ascii=False)
+        self.assertNotIn('BÍ-MẬT', log)
+        self.assertNotIn('Tách dấu hiệu', log)
+        events = [(e['event'], e.get('report_id'), e.get('images'), e.get('status')) for e in self.audit.tail()]
+        self.assertIn(('bug_report_created', rid, 1, None), events)
+        self.assertIn(('bug_report_updated', rid, None, 'closed'), events)
+        self.assertIn(('bug_report_deleted', rid, None, None), events)
+
+    def test_rejects_bad_images_sizes_and_floods(self):
+        import base64
+        jpeg_as_png = base64.b64encode(b'\xff\xd8\xff\xe0' + b'\x00' * 20).decode()
+        bad_images = ([{'name': 'a.png', 'type': 'image/png', 'data': jpeg_as_png}],   # declared PNG, JPEG bytes
+                      [{'name': 'a.png', 'type': 'image/png', 'data': 'kh&ng-base64!'}],
+                      [{'name': 'a.gif', 'type': 'image/gif', 'data': self.png}])
+        with self.server(RATES=fresh_rates(bug_report=3)) as srv:
+            doctor = self.login(srv, 'bs.an')
+            for images in bad_images:
+                code, err = srv.call('/api/bug_reports', self.report(images=images), doctor)
+                self.assertEqual((code, err['error']), (422, 'Ảnh không hợp lệ hoặc không phải PNG/JPEG/WEBP.'), images[0]['type'])
+            code, err = srv.call('/api/bug_reports', self.report(images=[]), doctor)  # the fourth this minute
+            self.assertEqual(code, 429, err)
+        with self.server(UPLOAD_BYTES=600) as srv:
+            doctor = self.login(srv, 'bs.an')
+            self.assertEqual(srv.call('/api/bug_reports', self.report(text='x', images=[]), doctor)[0], 200)
+            code, err = srv.call('/api/bug_reports', self.report(text='x' * 700, images=[]), doctor)  # over 600 bytes
+            self.assertEqual((code, err['error']), (413, 'Yêu cầu quá lớn hoặc rỗng.'))
+            code, err = srv.call('/api/bug_reports', self.report(text='   ', images=[]), doctor)
+            self.assertEqual((code, err['error']), (422, 'Mô tả lỗi không được để trống.'))
+        with self.server() as srv:  # the default 8 MB limit takes 3 images; other routes keep the 100 kB cap
+            doctor = self.login(srv, 'bs.an')
+            big = base64.b64encode(PNG_1X1 + b'\x00' * 150000).decode()
+            one = {'name': 'a.png', 'type': 'image/png', 'data': big}
+            self.assertEqual(srv.call('/api/bug_reports', self.report(images=[one] * 3), doctor)[0], 200)
+            code, err = srv.call('/api/bug_reports', self.report(images=[one] * 4), doctor)
+            self.assertEqual((code, err['error']), (422, 'Tối đa 3 ảnh mỗi báo lỗi.'))
+            code, err = srv.call('/api/corrections', {'phrase': 'x', 'right_id': 'HP:0000001', 'note': 'y' * 150000}, doctor)
+            self.assertEqual(code, 413)
+            self.assertEqual(len(list(Path(self.dir.name, 'bug_reports').glob('*.png'))), 3)
+            self.assertEqual(len(srv.call('/api/admin/bug_reports', token=self.login(srv, 'quan.tri'))[1]['items'][0]['images']), 3)
+        with self.server(RATES=fresh_rates(bug_report=1), UPLOAD_BYTES=600) as srv:  # the limit is checked before the body
+            doctor = self.login(srv, 'bs.an')
+            self.assertEqual(srv.call('/api/bug_reports', self.report(text='x', images=[]), doctor)[0], 200)
+            code, err = srv.call('/api/bug_reports', self.report(text='x' * 700, images=[]), doctor)
+            self.assertEqual((code, 'retry_after' in err), (429, True), err)
+
+    def test_caps_per_user_and_total_size(self):
+        self.reports.per_user = 1
+        with self.server() as srv:
+            doctor, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            code, first = srv.call('/api/bug_reports', self.report(images=[]), doctor)
+            self.assertEqual(code, 200, first)
+            code, err = srv.call('/api/bug_reports', self.report(images=[]), doctor)
+            self.assertEqual((code, err['error']), (422, 'Bác sĩ đã có 1 báo lỗi chưa xử lý; chờ quản trị xử lý trước khi gửi thêm.'))
+            self.assertEqual(srv.call('/api/bug_reports', self.report(images=[]), self.login(srv, 'lab.hv'))[0], 200)  # per user
+            self.assertEqual(srv.call('/api/admin/bug_reports/status', {'id': first['id'], 'status': 'closed'}, admin)[0], 200)
+            self.assertEqual(srv.call('/api/bug_reports', self.report(images=[]), doctor)[0], 200)  # closed ones do not count
+            # total size: image bytes already in index.json + the new images
+            self.reports.per_user = 0
+            self.reports.max_bytes = 2 * len(PNG_1X1) - 1
+            code, kept = srv.call('/api/bug_reports', self.report(), doctor)
+            self.assertEqual(code, 200, kept)
+            code, err = srv.call('/api/bug_reports', self.report(), doctor)
+            self.assertEqual((code, err['error']), (422, 'Kho báo lỗi đã đầy; nhờ quản trị dọn bớt báo lỗi cũ.'))
+            self.assertEqual(len(list(Path(self.dir.name, 'bug_reports').glob('*.png'))), 1)  # nothing written for the refused one
+            self.assertEqual(srv.call('/api/bug_reports', self.report(images=[]), doctor)[0], 200)  # text only still fits
+            self.assertEqual(srv.call('/api/admin/bug_reports/delete', {'id': kept['id']}, admin)[0], 200)
+            self.assertEqual(srv.call('/api/bug_reports', self.report(), doctor)[0], 200)  # room again after a delete
+            counts = srv.call('/api/admin/bug_reports?status=all', token=admin)[1]['counts']
+            self.assertEqual(counts, {'new': 4, 'closed': 1})
+        with patch.dict(os.environ, {'WEB_BUG_REPORTS_PER_USER': '3', 'WEB_BUG_REPORTS_MAX_MB': '2'}):
+            store = BugReportStore(Path(self.dir.name, 'x'))
+        self.assertEqual((store.per_user, store.max_bytes), (3, 2000000))
+        with patch.dict(os.environ, {'WEB_BUG_REPORTS_PER_USER': '', 'WEB_BUG_REPORTS_MAX_MB': 'abc'}):
+            store = BugReportStore(Path(self.dir.name, 'x'))
+        self.assertEqual((store.per_user, store.max_bytes), (20, 500000000))  # defaults
+        import bug_reports
+        for _ in range(3):
+            self.reports.add('bs.an', 'BS. An', 'doctor', 'x', '/', {}, [])
+        with patch.object(bug_reports, 'MAX_ITEMS', 2):
+            items, counts = self.reports.listing('all')
+        self.assertEqual((len(items), counts), (2, {'new': 7, 'closed': 1}))  # the newest 2, counts complete
+        self.assertEqual(items[0]['user'], 'bs.an')
+
+    def test_failed_save_leaves_no_files_and_answers_500(self):
+        import bug_reports
+        folder = Path(self.dir.name, 'bug_reports')
+        with self.server() as srv:
+            doctor, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            with patch.object(bug_reports, 'write_private_json', side_effect=OSError('disk full')):
+                code, err = srv.call('/api/bug_reports', self.report(), doctor)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được báo lỗi. Liên hệ quản trị viên.'))
+            self.assertEqual([p.name for p in folder.iterdir()], [])  # no orphan screenshot, no index.json
+            self.assertEqual(srv.call('/api/admin/bug_reports', token=admin)[1]['counts'], {'new': 0, 'closed': 0})
+            code, out = srv.call('/api/bug_reports', self.report(), doctor)  # the store works again afterwards
+            self.assertEqual(code, 200, out)
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), sorted(['index.json', out['id'] + '_0.png']))
+        self.assertEqual(sum(1 for e in self.audit.tail() if e['event'] == 'bug_report_created'), 1)  # the failed one is not logged
+
+    def test_corrupt_index_answers_500_not_422(self):
+        folder = Path(self.dir.name, 'bug_reports')
+        folder.mkdir()
+        index = folder / 'index.json'
+        index.write_text('{"items": [', encoding='utf-8')
+        with self.server() as srv:
+            doctor, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            code, err = srv.call('/api/bug_reports', self.report(), doctor)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được báo lỗi. Liên hệ quản trị viên.'))
+            self.assertEqual([p.name for p in folder.iterdir()], ['index.json'])  # no image written either
+            code, err = srv.call('/api/admin/bug_reports', token=admin)
+            self.assertEqual((code, err['error']), (500, 'Không đọc được dữ liệu đã lưu. Liên hệ quản trị viên.'))
+            code, err = srv.call('/api/admin/bug_reports/status', {'id': 'a' * 12, 'status': 'closed'}, admin)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được thay đổi. Liên hệ quản trị viên.'))
+            code, err = srv.call('/api/admin/bug_reports/delete', {'id': 'a' * 12}, admin)
+            self.assertEqual(code, 500)
+            code, err = srv.call('/api/bug_reports', self.report(text='  ', images=[]), doctor)  # validation still 422
+            self.assertEqual((code, err['error']), (422, 'Mô tả lỗi không được để trống.'))
+            time.sleep(0.02)
+            index.write_text('{"items": {}}', encoding='utf-8')  # parses, wrong shape
+            self.assertEqual(srv.call('/api/bug_reports', self.report(images=[]), doctor)[0], 500)
+            index.unlink()
+            self.assertEqual(srv.call('/api/bug_reports', self.report(images=[]), doctor)[0], 200)
+
+    def test_delete_skips_image_entries_without_n(self):
+        from model1_process import write_private_json
+        rid = self.reports.add('bs.an', 'BS. An', 'doctor', 'x', '/', {}, [('a.png', 'image/png', PNG_1X1)])
+        folder = Path(self.dir.name, 'bug_reports')
+        data = json.loads((folder / 'index.json').read_text(encoding='utf-8'))
+        data['items'][0]['images'] += [{'name': 'b.png', 'type': 'image/png', 'bytes': 1},   # hand-edited: no n
+                                       {'n': 'x', 'type': 'image/png'}, {'n': True, 'type': 'image/png'}]
+        time.sleep(0.02)
+        write_private_json(folder / 'index.json', data)
+        self.assertEqual(self.reports.listing('all')[0][0]['images'][1], {'name': 'b.png', 'type': 'image/png', 'bytes': 1})
+        self.reports.delete(rid)  # no KeyError; the one real file goes
+        self.assertEqual([p.name for p in folder.iterdir()], ['index.json'])
+        self.assertEqual(self.reports.listing('all'), ([], {'new': 0, 'closed': 0}))
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -300,6 +300,66 @@ class WebTests(unittest.TestCase):
         finally:
             s.runner = original
 
+    @needs_data
+    def test_approved_correction_is_listed_first(self):
+        # A doctor's correction approved by an admin outranks both the model order and the gold-case phrase list,
+        # and is not demoted as a context fragment; the sentence-based context_review flag is left as computed.
+        from unittest.mock import patch
+        from model1_v6.runner import Model1V6Runner
+        s = self.system
+        original = s.runner
+        text = 'Thai 36 tuần, Thai to. Túi mật bình thường, đa ối.'
+        a, g, b = text.index('Thai to'), text.index('Túi mật'), text.index('đa ối')
+        s.runner = Mock(spec=Model1V6Runner)
+        s.runner.extract.return_value = {'findings': [
+            {'mention_text': 'Thai to', 'span_start': a, 'span_end': a + 7, 'assertion': 'present',
+             'hpo_ranked': [{'id': 'HP:0001518', 'retriever_cosine': 0.5, 'reranker_logprob': -0.02},
+                            {'id': 'HP:0001640', 'retriever_cosine': 0.68, 'reranker_logprob': -5.8}]},
+            {'mention_text': 'Túi mật', 'span_start': g, 'span_end': g + 7, 'assertion': 'present',
+             'hpo_ranked': [{'id': 'HP:0002240', 'retriever_cosine': 0.6, 'reranker_logprob': -0.5}]},
+            {'mention_text': 'đa ối', 'span_start': b, 'span_end': b + 5, 'assertion': 'present',
+             'hpo_ranked': [{'id': 'HP:0001561', 'retriever_cosine': 1.0, 'reranker_logprob': 0.0}]}],
+            'errors': [], 'seconds': 1.0}
+        try:
+            with patch.object(s, 'doctor_phrases', {'thai to': ['HP:0001520'], 'túi mật': ['HP:0011467']}), \
+                 patch.object(s, 'context_phrases', {'túi mật'}), \
+                 patch.object(s, 'corrections', {'thai to': ['HP:0001640'], 'túi mật': ['HP:0011467']}):
+                big, gall, poly = s.extract(text)['mentions']
+            # corrected id first, then the gold-case phrase id (not dropped), then the model's candidates
+            self.assertEqual([c['id'] for c in big['candidates']], ['HP:0001640', 'HP:0001520', 'HP:0001518'])
+            self.assertEqual(big['mapping'], 'doctor_correction')
+            self.assertIn('; mã đầu tiên theo góp ý bác sĩ đã được quản trị duyệt', big['explanation'])
+            self.assertNotIn('cụm bác sĩ đã duyệt', big['explanation'])
+            self.assertEqual([c['id'] for c in gall['candidates']], ['HP:0011467', 'HP:0002240'])  # correction beats the fragment rule
+            self.assertEqual(gall['mapping'], 'doctor_correction')
+            self.assertFalse(gall['context_review'])  # "Túi mật bình thường" carries no negation word before the span
+            self.assertEqual(poly['mapping'], 'model1_v6_retriever_reranker')  # untouched phrase: model order kept
+        finally:
+            s.runner = original
+
+    @needs_data
+    def test_apply_corrections_feeds_search_and_extraction_maps(self):
+        s = self.system
+        before = s.search_hpo('thai to')
+        self.assertNotEqual(before[0]['id'], 'HP:0001640')
+        try:
+            n = s.apply_corrections([{'phrase': 'Thai to', 'right': {'id': 'HP:0001640'}},     # approved last: first
+                                     {'phrase': ' thai  to ', 'right': {'id': 'HP:0001520'}},  # same phrase, older approval
+                                     {'phrase': 'thai to', 'right': {'id': 'HP:9999999'}},     # not in the catalog: dropped
+                                     {'phrase': '', 'right': {'id': 'HP:0001518'}}])
+            self.assertEqual(n, 1)
+            self.assertEqual(s.corrections, {'thai to': ['HP:0001640', 'HP:0001520']})
+            self.assertEqual(s.corrections_search, {'thai to': ['HP:0001640', 'HP:0001520']})
+            for query in ('thai to', 'Thai To', 'thái to'):  # search ignores case and diacritics
+                ids = [t['id'] for t in s.search_hpo(query)]
+                self.assertEqual(ids[:2], ['HP:0001640', 'HP:0001520'], query)
+                self.assertEqual(len(ids), len(set(ids)))
+            self.assertEqual(s.search_hpo('thai to', 1), [s.term('HP:0001640')])
+            self.assertEqual(s.search_hpo('HP:0001518')[0]['id'], 'HP:0001518')  # other queries unchanged
+        finally:
+            s.apply_corrections([])
+        self.assertEqual(s.search_hpo('thai to'), before)
+
     def test_v6_contract_alignment_and_chunks(self):
         from model1_v6 import contract as C
         with self.assertRaises(ValueError):
