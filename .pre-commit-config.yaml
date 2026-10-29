@@ -25,7 +25,7 @@ repos:
         files: '\.jsonl$'
         exclude: '^backend/resources/'
       - id: no-credentials-files
-        name: block users.json, *.env, audit logs, corrections and bug reports
+        name: block users.json, *.env, audit logs, corrections, disease feedback and bug reports
         language: fail
-        entry: 'Accounts, environment files, audit logs, doctor corrections and bug reports stay on the server'
-        files: '(^|/)(users\.json|[^/]*\.env|\.env|audit[^/]*\.jsonl|corrections\.json|bug_reports/.*)$'
+        entry: 'Accounts, environment files, audit logs, doctor corrections, disease feedback and bug reports stay on the server'
+        files: '(^|/)(users\.json|[^/]*\.env|\.env|audit[^/]*\.jsonl|corrections\.json|disease_feedback\.json|bug_reports/.*)$'

@@ -187,7 +187,7 @@ function showGate(state, message = '') {
   if (state === 'totp') ($('login-backup-label').hidden ? $('login-code') : $('login-backup')).focus();
 }
 function sessionEnded() {
-  access = ''; user = null; sessionInfo = null; pendingLogin = null; window.resetTwoFactor?.(); window.resetCorrection?.(); window.resetBugReport?.(); showUser();
+  access = ''; user = null; sessionInfo = null; pendingLogin = null; window.resetTwoFactor?.(); window.resetCorrection?.(); window.resetBugReport?.(); window.resetDiseaseFeedback?.(); showUser();
   for (const d of ['account', 'admin', 'settings', 'lab', 'correction', 'bug-report']) if ($(d).open) $(d).close();
   showGate('login', 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
 }
@@ -203,6 +203,7 @@ function updateActions() {
 }
 function invalidate() {
   revision++; result = null; labIds.clear(); $('reviewed').checked = false; $('pattern').hidden = true;
+  window.resetDiseaseFeedback?.();  // the flagged diseases and the draft belong to the result just dropped
   $('results-title').textContent = 'Kết quả bệnh tiềm năng';
   $('inheritance-filter').innerHTML = '<option value="">Tất cả kiểu di truyền</option>';
   $('results').innerHTML = '<div class="empty"><div class="empty-symbol">↻</div><h3>Sẵn sàng cho lần đối chiếu tiếp theo</h3><p>Duyệt danh sách HPO hiện tại để xem kết quả phù hợp với ca này.</p></div>';
@@ -361,7 +362,7 @@ $('match').onclick = async () => {
     const modes = [...new Set(data.candidates.flatMap(c => c.inheritance_modes))].sort();
     $('inheritance-filter').innerHTML = '<option value="">Tất cả kiểu di truyền</option>' + modes.map(m => '<option>' + escape(m) + '</option>').join('');
     renderResults(); notice('');
-  } catch (e) { if (seq === revision) {result = null;labIds.clear();notice(e.message);} }
+  } catch (e) { if (seq === revision) {result = null;labIds.clear();window.resetDiseaseFeedback?.();notice(e.message);} }
   finally { busy = false; idle.busy--; markActivity(); updateActions(); }
 };
 
@@ -374,6 +375,9 @@ const groupTitle=id=>(GROUPS.find(g=>g.id===id)||{title:''}).title;
 function pills(values,cls){return values.length?values.map(v=>'<span class="pill '+cls+'">'+escape(v)+'</span>').join(''):'<span class="hint">Chưa có thông tin</span>';}
 function renderResults(){
   if(!result)return;
+  try{drawResults();}finally{window.renderDiseaseFeedback?.();}
+}
+function drawResults(){
   const filter=$('inheritance-filter').value;
   const list=result.candidates.filter(c=>!filter||c.inheritance_modes.includes(filter));
   $('results-title').textContent=list.length+' bệnh tiềm năng';
@@ -410,7 +414,8 @@ function renderResults(){
   $('results').append(columns);
 }
 function diseaseCard(c){
-    const card=document.createElement('article');card.className='disease';
+    const wrongFlag=!!window.isWrongDisease?.(c.disease_id);
+    const card=document.createElement('article');card.className='disease'+(wrongFlag?' is-wrong':'');
     const match=c.disease_id.match(/^(OMIM|ORPHA|ORPHANET):(\d+)$/);
     const link=match?(match[1]==='OMIM'?'https://omim.org/entry/':'https://www.orpha.net/en/disease/detail/')+match[2]:'';
     card.innerHTML='<div class="disease-top"><div class="rank">'+c.rank+'</div><div class="disease-title"><h3>'+escape(c.disease_name)+'</h3>'+(link?'<a target="_blank" rel="noopener noreferrer" href="'+link+'">'+escape(c.disease_id)+' ↗</a>':escape(c.disease_id))+((c.equivalent_ids||[]).length?'<span class="overall">Cùng bệnh: '+c.equivalent_ids.map(escape).join(', ')+'</span>':'')+(c.overall_rank&&c.overall_rank!==c.rank?'<span class="overall">Hạng chung '+c.overall_rank+'</span>':'')+(c.mixed_mechanism?'<span class="pill amber mixed" title="Bệnh có thể do CNV hoặc do biến thể một gen">Cơ chế hỗn hợp</span>':'')+'</div><div class="score">'+c.match_percentage+'%<small>TƯƠNG ĐỒNG</small></div></div>'+
@@ -419,7 +424,8 @@ function diseaseCard(c){
       '<div class="evidence-row"><span class="evidence-label">Gen liên quan</span><div>'+pills(c.causative_genes,'gray')+'</div></div>'+
       '<details class="features"><summary>Dấu hiệu chưa ghi nhận · Xem '+c.clinical_features_to_check.length+'</summary><p class="hint">Bác sĩ xem xét tính phù hợp với tuổi thai và khả năng khảo sát. Danh sách có thể gồm dấu hiệu sau sinh; chưa ghi nhận không có nghĩa là âm tính.</p><div class="feature-list"></div></details>'+
       (c.model3_rationale||c.model3_recommended_tests?'<div class="recommendation"><strong>Gợi ý hội chẩn · cần bác sĩ duyệt</strong><p>'+escape(c.model3_rationale)+'</p>'+escape(c.model3_recommended_tests)+'</div>':'')+
-      '<label class="check lab-choice"><input type="checkbox" '+(labIds.has(c.disease_id)?'checked':'')+'> Đưa bệnh này vào phiếu Lab</label>';
+      '<div class="disease-foot"><label class="check lab-choice"><input type="checkbox" '+(labIds.has(c.disease_id)?'checked':'')+'> Đưa bệnh này vào phiếu Lab</label>'+
+      '<button type="button" class="quiet text-button disease-wrong" data-disease-id="'+escape(c.disease_id)+'" aria-pressed="'+(wrongFlag?'true':'false')+'" title="AI đề xuất sai bệnh này: đánh dấu rồi ghi bệnh đúng ở ô Bệnh đúng của ca">'+(wrongFlag?'Đã báo sai · bỏ':'Báo sai')+'</button></div>';
     const featureList=card.querySelector('.feature-list');
     for(const t of c.clinical_features_to_check){
       const b=document.createElement('button');b.className='pill amber';b.textContent=(t.vi||t.en)+' · '+t.id+' +';
@@ -428,6 +434,8 @@ function diseaseCard(c){
       featureList.append(b);
     }
     card.querySelector('input').onchange=e=>{if(e.target.checked)labIds.add(c.disease_id);else labIds.delete(c.disease_id);updateActions();};
+    // "Báo sai": Model 2 ranked this disease wrongly; the doctor names the right one in the panel under the results.
+    card.querySelector('.disease-wrong').onclick=()=>window.toggleWrongDisease?.(c);
     return card;
 }
 $('inheritance-filter').onchange=renderResults;
@@ -466,7 +474,7 @@ $('logout').onclick=async()=>{
 // After logout: forget the user, the 2FA state and the case. /api/logout sends Clear-Site-Data "cache", which
 // leaves localStorage alone; still reread the saved server instead of assuming it is kept or gone.
 function signedOut(){
-  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();showUser();
+  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();window.resetDiseaseFeedback?.();showUser();
   $('idle-warning').hidden=true;
   try{const saved=localStorage.getItem('prenatal-api');if(saved)base=saved;}catch{}
 }
@@ -575,7 +583,7 @@ let pendingLogin=null;  // {pending, user, at, failures}
 const PENDING_MS=5*60000,CODE_TRIES=5;
 const BAD_REPLY='Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.';
 async function signedIn(step,data){
-  access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();
+  access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();window.resetDiseaseFeedback?.();
   idle.last=idle.lastPing=Date.now();
   showUser();notice('');
   await refreshSession();  // 2FA requirement and the idle limit

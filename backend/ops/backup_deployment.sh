@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Encrypted backup of the web's private state (B24): accounts, audit/access logs, login locks, web.env,
 # lab_cases.json (cases sent to the Lab: patient data, kept mode 600 and only ever written encrypted here),
-# corrections.json (doctors' HPO corrections: clinical wording, 600) and the bug_reports/ folder (reports with
-# screenshots that may show a case; folder 700, files 600).
+# corrections.json (doctors' HPO corrections: clinical wording, 600), disease_feedback.json (case snapshots with the
+# correct disease, Model 2 training data, 600) and the bug_reports/ folder (reports with screenshots that may show
+# a case; folder 700, files 600).
 #   bash backup_deployment.sh                      one backup now (what the daily timer runs)
 #   bash backup_deployment.sh --setup              key/passphrase config + daily systemd user timer
 #   bash backup_deployment.sh --list               backups present
@@ -64,7 +65,7 @@ backup_now() {
   stamp="$(date +%Y%m%d-%H%M%S)"
   shopt -s nullglob
   for f in "$SRC"/users.json "$SRC"/audit.jsonl* "$SRC"/login_failures.json "$SRC"/access.log* "$SRC"/web.env "$SRC"/lab_cases.json \
-           "$SRC"/corrections.json; do
+           "$SRC"/corrections.json "$SRC"/disease_feedback.json; do
     [ -f "$f" ] && files+=("$(basename "$f")")
   done
   shopt -u nullglob
@@ -151,11 +152,11 @@ restore() {  # $1 = backup file, $2 = age identity
 Nothing live was changed. To put the files back (stop first so the service does not write meanwhile):
   systemctl --user stop prenatal-web
   STAMP=\$(date +%Y%m%d-%H%M%S); mkdir -m 700 "$SRC/before-restore-\$STAMP"
-  cp -p "$SRC"/users.json "$SRC"/login_failures.json "$SRC"/audit.jsonl* "$SRC"/web.env "$SRC"/lab_cases.json "$SRC"/corrections.json "$SRC/before-restore-\$STAMP"/ 2>/dev/null
+  cp -p "$SRC"/users.json "$SRC"/login_failures.json "$SRC"/audit.jsonl* "$SRC"/web.env "$SRC"/lab_cases.json "$SRC"/corrections.json "$SRC"/disease_feedback.json "$SRC/before-restore-\$STAMP"/ 2>/dev/null
   cp -a "$SRC"/bug_reports "$SRC/before-restore-\$STAMP"/ 2>/dev/null
   cp -p "$target"/<file you need> "$SRC"/      # usually users.json; audit/access logs only if the live ones are lost
   cp -a "$target"/bug_reports "$SRC"/          # only if the live bug reports are lost (index.json + screenshots)
-  chmod 600 "$SRC"/users.json "$SRC"/web.env "$SRC"/lab_cases.json "$SRC"/corrections.json 2>/dev/null || true
+  chmod 600 "$SRC"/users.json "$SRC"/web.env "$SRC"/lab_cases.json "$SRC"/corrections.json "$SRC"/disease_feedback.json 2>/dev/null || true
   chmod 700 "$SRC"/bug_reports 2>/dev/null; chmod 600 "$SRC"/bug_reports/* 2>/dev/null || true
   systemctl --user start prenatal-web
 Check: python3 manage_users.py list   (from the backend folder);  bash gpu.sh status

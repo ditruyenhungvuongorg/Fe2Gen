@@ -15,6 +15,8 @@ from audit import EVENTS, AuditLog
 from auth import GPU_ROLES, LOCKED_MESSAGE, ROLES, USERNAME, Auth, LoginRefused, public_user
 from bug_reports import BugReportStore, parse_report
 from corrections import HPO_ID, LABELS as CORRECTION_LABELS, CorrectionStore, export_payload, parse_submission
+from disease_feedback import LABELS as FEEDBACK_LABELS, NOT_IN_CATALOG, DiseaseFeedbackStore, parse_feedback
+from disease_feedback import export_payload as feedback_export
 from model1_process import ModelUnavailable, free_vram_mib
 from ratelimit import RateLimiter, WorkQueue, env_int
 from web_service import WebSystem
@@ -22,7 +24,7 @@ from web_service import WebSystem
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / 'static' if (ROOT / 'static').is_dir() else ROOT.parent / 'docs'
 STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/config.js', '/case-state.js', '/idle.js', '/twofactor.js',
-                '/corrections.js', '/bugreport.js',
+                '/corrections.js', '/bugreport.js', '/diseasefeedback.js',
                 '/fonts/BeVietnamPro-Regular.ttf', '/fonts/BeVietnamPro-SemiBold.ttf', '/fonts/OFL.txt',
                 '/fonts/Inter-vietnamese.woff2', '/fonts/Inter-latin-ext.woff2', '/fonts/Inter-latin.woff2', '/fonts/OFL-Inter.txt')
 SYSTEM = WebSystem()
@@ -31,6 +33,7 @@ AUDIT = AuditLog()
 ACCESS = AccessLog()
 CORRECTIONS = CorrectionStore()   # doctors' "Góp ý sửa mã"; approved ones feed SYSTEM.apply_corrections
 BUG_REPORTS = BugReportStore()    # "Báo lỗi" with screenshots, read on the admin page
+DISEASE_FEEDBACK = DiseaseFeedbackStore()  # "Bệnh đúng của ca": case snapshots kept for retraining Model 2
 AUTH.store.on_problem = lambda kind: AUDIT.write('auth_store_error', '', kind=kind)
 # Only /api/bug_reports (screenshots as base64) may send a body this large; every other route keeps 100 kB.
 UPLOAD_BYTES = env_int('WEB_MAX_UPLOAD_BYTES', 8000000)
@@ -46,7 +49,9 @@ RATES = {'hpo_search': RateLimiter(env_int('WEB_RATE_HPO_SEARCH', 60)),
          'login_user': RateLimiter(env_int('WEB_RATE_LOGIN', 10)),
          'admin': RateLimiter(env_int('WEB_RATE_ADMIN', 60)),
          'corrections': RateLimiter(env_int('WEB_RATE_CORRECTIONS', 20)),
-         'bug_report': RateLimiter(env_int('WEB_RATE_BUG_REPORT', 5))}
+         'bug_report': RateLimiter(env_int('WEB_RATE_BUG_REPORT', 5)),
+         'disease_search': RateLimiter(env_int('WEB_RATE_DISEASE_SEARCH', 60)),
+         'disease_feedback': RateLimiter(env_int('WEB_RATE_DISEASE_FEEDBACK', 20))}
 # Behind Tailscale Funnel every connection comes from 127.0.0.1. Only with WEB_TRUST_PROXY=1 is the last
 # X-Forwarded-For entry (the one the local proxy appended) used as the source; never trust it otherwise.
 TRUST_PROXY = os.getenv('WEB_TRUST_PROXY', '0') == '1'
@@ -55,6 +60,13 @@ HEADER_SECONDS = env_int('WEB_HEADER_TIMEOUT', 15)   # whole request line + head
 REQUEST_SECONDS = 180                                 # each socket read/write once the headers are in
 # On logout Model 1 stays loaded while another doctor was active in the last 10 minutes; otherwise it is released.
 LOGOUT_GRACE_SECONDS = 600
+
+
+def _reject_json_constant(name):
+    """json.loads parse_constant hook: NaN, Infinity and -Infinity are not JSON and never reach a store."""
+    raise ValueError(f'JSON constant {name} not allowed')
+
+
 # Only the page's own files run; inline style attributes are used by the lab sheet.
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
@@ -238,7 +250,9 @@ class Handler(SimpleHTTPRequestHandler):
             if not 0 < size <= limit:
                 self.send_json({'error': 'Yêu cầu quá lớn hoặc rỗng.'}, 413)
                 return None
-            payload = json.loads(self.rfile.read(size).decode())
+            # NaN/Infinity are not JSON: json.loads accepts them by default and they would be stored and emitted
+            # as invalid JSON, so they take the same 400 as any other malformed body.
+            payload = json.loads(self.rfile.read(size).decode(), parse_constant=_reject_json_constant)
             if not isinstance(payload, dict):
                 raise ValueError()
             return payload
@@ -295,6 +309,19 @@ class Handler(SimpleHTTPRequestHandler):
                 except (OSError, ValueError):  # corrections.json unreadable or hand-edited badly
                     return self.send_json({'error': 'Không đọc được danh sách góp ý. Liên hệ quản trị viên.'}, 500)
                 return self.send_json({'items': items, 'labels': CORRECTION_LABELS})
+            if path.path == '/api/disease_search':  # catalog diseases for the "Bệnh đúng" box
+                if self.limited('disease_search'):
+                    return
+                return self.send_json(SYSTEM.search_diseases(parse_qs(path.query).get('q', [''])[0][:200]))
+            if path.path == '/api/disease_feedback':  # the signed-in user's own case feedback
+                if self.limited('disease_feedback'):
+                    return
+                status = parse_qs(path.query).get('status', ['all'])[0]
+                try:
+                    items = DISEASE_FEEDBACK.own(self.user, status)
+                except (OSError, ValueError):  # disease_feedback.json unreadable or hand-edited badly
+                    return self.send_json({'error': 'Không đọc được danh sách ghi nhận. Liên hệ quản trị viên.'}, 500)
+                return self.send_json({'items': items, 'labels': FEEDBACK_LABELS})
             if path.path.startswith('/api/admin/'):
                 if not self.admin_only():  # admin_only already answered 403; a second reply would desync HTTP
                     return
@@ -340,6 +367,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({'error': 'Tài khoản Phòng Lab không dùng tách đoạn văn.'}, 403)
             if not self.limited('corrections'):
                 self.submit_correction(payload)
+            return
+        if path == '/api/disease_feedback':  # every role: the Lab also reviews the disease ranking
+            if not self.limited('disease_feedback'):
+                self.submit_disease_feedback(payload)
             return
         if path.startswith('/api/admin/'):
             if self.admin_only() and not self.limited('admin'):
@@ -493,6 +524,29 @@ class Handler(SimpleHTTPRequestHandler):
             AUDIT.write('correction_submitted', self.user, correction_id=item['id'])
         self.send_json({'ok': True, 'item': item, **({'duplicate': True} if duplicate else {})})
 
+    def resolve_disease(self, did):
+        """(catalog id, catalog name) for a disease id in SYSTEM.profiles_by_id; ValueError when unknown. Tests
+        replace SYSTEM with a stand-in that may lack the catalog: then the id is kept as typed."""
+        profiles = getattr(SYSTEM, 'profiles_by_id', None) or {}
+        if not profiles:
+            return did, did
+        profile = profiles.get(did)
+        if profile is None:
+            raise ValueError(NOT_IN_CATALOG)
+        return did, getattr(profile, 'disease_name', '') or did
+
+    def submit_disease_feedback(self, payload):
+        try:
+            fields = parse_feedback(payload, self.resolve_disease)
+            item = DISEASE_FEEDBACK.add(self.user, self.display_name(), fields)
+        except ValueError as exc:
+            return self.send_json({'error': str(exc)}, 422)
+        except OSError:
+            return self.send_json({'error': 'Chưa lưu được ghi nhận. Liên hệ quản trị viên.'}, 500)
+        # the id only: the case code, HPO terms, genes and disease names are case content, not for the audit log
+        AUDIT.write('disease_feedback_submitted', self.user, feedback_id=item['id'])
+        self.send_json({'ok': True, 'item': item})
+
     def bug_report(self, payload):
         try:
             text, page, info, images = parse_report(payload)
@@ -555,6 +609,14 @@ class Handler(SimpleHTTPRequestHandler):
         if path == '/api/admin/bug_reports':
             items, counts = BUG_REPORTS.listing(first('status', 'new'))
             return self.send_json({'items': items, 'counts': counts})
+        if path == '/api/admin/disease_feedback':
+            items, counts = DISEASE_FEEDBACK.listing(first('status', 'new'), first('user').strip().lower()[:64])
+            return self.send_json({'items': items, 'labels': FEEDBACK_LABELS, 'counts': counts})
+        if path == '/api/admin/disease_feedback/export':  # every item, whatever its status: the Model 2 retraining set
+            data = feedback_export(DISEASE_FEEDBACK.all())
+            AUDIT.write('disease_feedback_exported', self.user, count=data['count'])
+            return self.send_bytes(json.dumps(data, ensure_ascii=False, indent=1).encode(), 'application/json; charset=utf-8',
+                                   'fe2gen_benh_dung_%s.json' % datetime.now().strftime('%Y%m%d'))
         if path == '/api/admin/bug_reports/image':
             try:
                 found = BUG_REPORTS.image(first('id')[:12], int(first('n', '0')))
@@ -586,6 +648,17 @@ class Handler(SimpleHTTPRequestHandler):
             if path == '/api/admin/bug_reports/delete':
                 BUG_REPORTS.delete(str(p.get('id') or ''))
                 AUDIT.write('bug_report_deleted', self.user, report_id=str(p.get('id'))[:12])
+                return self.send_json({'ok': True})
+            if path == '/api/admin/disease_feedback/status':
+                status = p.get('status')
+                if status not in ('new', 'reviewed'):
+                    raise ValueError('Trạng thái không hợp lệ.')
+                DISEASE_FEEDBACK.set_status(str(p.get('id') or ''), status, self.user)
+                AUDIT.write('disease_feedback_updated', self.user, feedback_id=str(p.get('id'))[:12], status=status)
+                return self.send_json({'ok': True})
+            if path == '/api/admin/disease_feedback/delete':
+                DISEASE_FEEDBACK.delete(str(p.get('id') or ''))
+                AUDIT.write('disease_feedback_deleted', self.user, feedback_id=str(p.get('id'))[:12])
                 return self.send_json({'ok': True})
             if path == '/api/admin/users/create':
                 temp = AUTH.create_user(target, p.get('name'), p.get('role'))
@@ -625,7 +698,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.admin_gpu(str(p.get('action') or ''))
         except ValueError as exc:
             return self.send_json({'error': str(exc)}, 422)
-        except OSError:  # corrections.json / bug_reports not writable
+        except OSError:  # corrections.json / bug_reports / disease_feedback.json not writable
             return self.send_json({'error': 'Chưa lưu được thay đổi. Liên hệ quản trị viên.'}, 500)
         self.send_json({'error': 'Không có endpoint này.'}, 404)
 

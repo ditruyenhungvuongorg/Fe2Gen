@@ -4,14 +4,16 @@
   const STATE = {stopped:'Nghỉ (không chiếm GPU)', loading:'Đang khởi động', ready:'Sẵn sàng (đang chiếm GPU)', paused:'Tạm dừng', failed:'Chưa chạy được'};
   const DETAIL = {target:'tài khoản', role:'vai', changes:'thay đổi', chars:'số ký tự', findings:'số cụm', seconds:'giây',
                   hpo_count:'số HPO', wes:'có gene WES', action:'thao tác', count:'số phiên',
-                  correction_id:'góp ý', report_id:'báo lỗi', images:'số ảnh', status:'trạng thái'};
+                  correction_id:'góp ý', report_id:'báo lỗi', images:'số ảnh', status:'trạng thái', feedback_id:'ghi nhận'};
   // The same key means something else in some events: corrections_exported counts rows, not sessions.
-  const EVENT_DETAIL = {corrections_exported:{count:'số dòng'}};
+  const EVENT_DETAIL = {corrections_exported:{count:'số dòng'}, disease_feedback_exported:{count:'số ca'}};
   const ACTIONS = {pause:'tạm dừng', resume:'cho chạy lại', release:'giải phóng ngay'};
   const CORR_LABELS = {pending:'Chờ duyệt', approved:'Đã duyệt', rejected:'Đã từ chối'};
   const CORR_PILL = {pending:'pending', approved:'active', rejected:'locked'};
   const CORR_SOURCE = {text:'từ đoạn văn', search:'từ tìm HPO', selected:'từ HPO của ca'};
   const BUG_STATUS = {new:'Mới', closed:'Đã xử lý'};
+  const DFB_STATUS = {new:'Chờ xem', reviewed:'Đã xem'};
+  const HPO_STATUS_PILL = {'CÓ':'green', 'NGHI NGỜ':'amber', 'KHÔNG':'gray'};
   const IMAGE_EXT = {'image/png':'png', 'image/jpeg':'jpg', 'image/webp':'webp'};
   const termLine = t => t && t.id ? (t.vi || t.en || '') + ' · ' + t.id : '';
   const kb = bytes => Math.max(1, Math.round((Number(bytes) || 0) / 1024)) + ' kB';
@@ -152,7 +154,7 @@
       const form = el('form', {class:'admin-filter'}, who, what, el('button', {class:'quiet'}, 'Lọc'));
       form.onsubmit = e => { e.preventDefault(); f.user = who.value.trim().toLowerCase(); f.event = what.value; show('audit'); };
       const describe = e => Object.entries(e).filter(([k]) => !['time','event','user'].includes(k)).map(([k, v]) =>
-        ((EVENT_DETAIL[e.event] || {})[k] || DETAIL[k] || k) + ': ' + (k === 'role' ? ROLE_NAMES[v] || v : k === 'action' ? ACTIONS[v] || v : k === 'status' ? (BUG_STATUS[v] || CORR_LABELS[v] || v) : typeof v === 'object' ? JSON.stringify(v) : v === true ? 'có' : v === false ? 'không' : v)).join(' · ');
+        ((EVENT_DETAIL[e.event] || {})[k] || DETAIL[k] || k) + ': ' + (k === 'role' ? ROLE_NAMES[v] || v : k === 'action' ? ACTIONS[v] || v : k === 'status' ? (e.event.startsWith('disease_feedback') ? DFB_STATUS[v] || v : BUG_STATUS[v] || CORR_LABELS[v] || v) : typeof v === 'object' ? JSON.stringify(v) : v === true ? 'có' : v === false ? 'không' : v)).join(' · ');
       const rows = data.entries.map(e => el('div', {class:'audit-row' + (/fail|locked|paused|rate_limited|error|expired|totp_reset/.test(e.event) ? ' warn' : '')},
         el('span', {class:'audit-time'}, e.time), el('strong', {}, e.user || '—'), el('span', {}, data.events[e.event] || e.event), el('small', {}, describe(e))));
       return el('div', {}, form, el('p', {class:'hint'}, 'Nhật ký ghi ai làm gì và lúc nào; không ghi nội dung ca (đoạn văn, HPO, gene). ' + data.entries.length + ' dòng mới nhất.'),
@@ -270,6 +272,54 @@
           preview);
       });
       return el('div', {}, form, head, rows.length ? rows : el('p', {class:'hint'}, 'Không có báo lỗi nào trong bộ lọc này.'));
+    },
+
+    // "Bệnh đúng": the doctor's correct disease for a case next to Model 2's wrong suggestions, with the case's HPO
+    // and genes. No approval: the admin reads, marks "Đã xem" and exports the whole set for retraining Model 2.
+    async diseases() {
+      const f = VIEWS.diseasesFilter || (VIEWS.diseasesFilter = {status:'new', user:''});
+      const data = await api('/api/admin/disease_feedback?status=' + encodeURIComponent(f.status) + '&user=' + encodeURIComponent(f.user), null, 20000);
+      const labels = {...DFB_STATUS, ...(data.labels || {})}, counts = data.counts || {}, items = Array.isArray(data.items) ? data.items : [];
+      const statusSelect = el('select', {'aria-label':'Lọc theo trạng thái'},
+        [['new', 'Chờ xem'], ['reviewed', 'Đã xem'], ['all', 'Tất cả']].map(([k, v]) => el('option', {value:k, selected:k === f.status}, v)));
+      const who = el('input', {value:f.user, placeholder:'Tên đăng nhập', 'aria-label':'Lọc theo tài khoản', autocapitalize:'none', spellcheck:'false'});
+      const form = el('form', {class:'admin-filter'}, statusSelect, who, el('button', {class:'quiet'}, 'Lọc'));
+      form.onsubmit = e => { e.preventDefault(); f.status = statusSelect.value; f.user = who.value.trim().toLowerCase(); show('diseases'); };
+      const head = el('div', {class:'admin-head'},
+        el('p', {class:'hint'}, 'Chờ xem ' + (counts.new || 0) + ' · Đã xem ' + (counts.reviewed || 0) + ' · ' + items.length + ' ghi nhận đang hiện.'),
+        el('button', {type:'button', class:'quiet', title:'Tệp JSON mọi ghi nhận (kể cả đã xem): HPO của ca, gene, gợi ý của AI và bệnh đúng, cho lần huấn luyện lại Model 2',
+          onclick:() => act(() => window.apiDownload('/api/admin/disease_feedback/export', 'fe2gen_benh_dung.json'), () => 'Đã tải dữ liệu huấn luyện Model 2.')}, 'Tải dữ liệu huấn luyện Model 2'));
+      const setStatus = (it, status) => act(() => api('/api/admin/disease_feedback/status', {id:it.id, status}, 20000), () => status === 'reviewed' ? 'Đã đánh dấu ghi nhận là đã xem.' : 'Đã mở lại ghi nhận.');
+      const diseaseLine = d => d && d.disease_id ? (d.disease_name || '') + ' · ' + d.disease_id : (d && d.disease_name ? d.disease_name + ' (ngoài danh mục)' : '—');
+      const rows = items.map(it => {
+        const hpos = Array.isArray(it.hpos) ? it.hpos : [], genes = Array.isArray(it.genes) ? it.genes : [];
+        const sugg = (Array.isArray(it.suggestions) ? it.suggestions : []).slice().sort((a, b) => (a.overall_rank ?? a.rank ?? 999) - (b.overall_rank ?? b.rank ?? 999));
+        const wrongIds = Array.isArray(it.wrong_ids) ? it.wrong_ids : [];
+        const nameOf = id => { const s = sugg.find(x => x.disease_id === id); return s && s.disease_name ? s.disease_name + ' (' + id + ')' : id; };
+        return el('div', {class:'dfb-row' + (it.status === 'new' ? ' is-new' : '')},
+          el('div', {class:'bug-head'}, el('span', {class:'audit-time'}, it.time), el('strong', {}, it.name || it.user),
+            el('small', {}, it.user + (it.case_code ? ' · mã ca ' + it.case_code : '')),
+            el('span', {class:'state-pill ' + (it.status === 'new' ? 'pending' : 'active')}, labels[it.status] || it.status),
+            it.reviewed_by ? el('small', {}, 'xem bởi ' + it.reviewed_by + (it.reviewed_at ? ' · ' + it.reviewed_at : '')) : null),
+          el('div', {class:'dfb-body'},
+            el('details', {class:'dfb-hpos'}, el('summary', {}, 'HPO của ca: ' + hpos.length + (genes.length ? ' · gene WES: ' + genes.length : '')),
+              el('div', {}, hpos.map(h => el('span', {class:'pill ' + (HPO_STATUS_PILL[h.status] || 'gray')}, (h.vi || h.en || '') + ' · ' + h.id + ' · ' + (h.status || '')))),
+              genes.length ? el('p', {class:'dfb-genes'}, 'Gene WES: ' + genes.join(', ')) : null),
+            el('p', {}, el('span', {class:'dfb-label'}, 'AI gợi ý: '), sugg.length ? sugg.slice(0, 3).map((s, i) => (i ? ' · ' : '') + (i + 1) + '. ' + (s.disease_name || '') + ' (' + s.disease_id + ')').join('') + (sugg.length > 3 ? ' · …' : '') : '—'),
+            el('p', {}, el('span', {class:'dfb-label'}, 'Báo sai: '), wrongIds.length ? el('span', {class:'corr-wrong'}, wrongIds.map(nameOf).join(', ')) : 'không đánh dấu'),
+            el('p', {}, el('span', {class:'dfb-label'}, 'Bệnh đúng: '), el('strong', {}, diseaseLine(it.correct))),
+            it.note ? el('small', {}, 'Ghi chú: ' + it.note) : null),
+          el('div', {class:'admin-buttons'},
+            it.status === 'reviewed' ? el('button', {type:'button', class:'quiet', onclick:() => setStatus(it, 'new')}, 'Mở lại')
+                                     : el('button', {type:'button', onclick:() => setStatus(it, 'reviewed')}, 'Đã xem'),
+            el('button', {type:'button', class:'quiet danger', onclick:() => {
+              if (!confirm('Xóa ghi nhận này? Bệnh đúng của ca sẽ không còn trong dữ liệu huấn luyện.')) return;
+              act(() => api('/api/admin/disease_feedback/delete', {id:it.id}, 20000), () => 'Đã xóa ghi nhận.');
+            }}, 'Xóa')));
+      });
+      return el('div', {}, form, head,
+        el('p', {class:'hint'}, 'Bác sĩ đánh dấu bệnh AI đề xuất sai và ghi bệnh đúng của ca; không thay đổi kết quả đối chiếu hiện tại. Tệp tải về gồm mọi ghi nhận, kể cả đã xem.'),
+        rows.length ? rows : el('p', {class:'hint'}, 'Không có ghi nhận nào trong bộ lọc này.'));
     },
   };
 

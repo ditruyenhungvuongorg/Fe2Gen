@@ -31,6 +31,32 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len({t['id'] for t in s.search_hpo('tim')}), len(s.search_hpo('tim')))
 
     @needs_data
+    def test_search_diseases_by_id_name_and_limit(self):
+        s = self.system
+        self.assertIn('OMIM:190685', s.profiles_by_id)
+        by_id = s.search_diseases('omim:190685')
+        self.assertEqual((by_id[0]['disease_id'], by_id[0]['group']), ('OMIM:190685', s.disease_group('OMIM:190685')))
+        self.assertEqual(s.search_diseases('OMIM:190685')[0]['disease_id'], 'OMIM:190685')
+        name = s.profiles_by_id['OMIM:190685'].disease_name
+        self.assertEqual(s.search_diseases(name)[0]['disease_id'], 'OMIM:190685')  # the exact name wins
+        found = s.search_diseases('down')
+        self.assertTrue(found and all('down' in f['disease_name'].lower() for f in found))
+        self.assertLessEqual(len(found), 20)
+        self.assertLessEqual(len(s.search_diseases('syndrome')), 20)
+        self.assertEqual(len({f['disease_id'] for f in found}), len(found))
+        self.assertEqual(s.search_diseases('   '), [])
+        self.assertEqual(s.search_diseases('xq-no-such-disease-zz'), [])
+        orpha = next(d for d in s.profiles_by_id if d.startswith('ORPHA:'))
+        self.assertEqual(s.search_diseases('Orphanet:' + orpha[6:])[0]['disease_id'], orpha)
+        for item in found:
+            self.assertEqual(set(item), {'disease_id', 'disease_name', 'group'})
+            self.assertIn(item['group'], ('NST', 'CNV', 'DON_GEN', 'CHUA_RO', None))
+        # Doctors' names for catalog diseases: eponyms and the "hội chứng" prefix.
+        self.assertIn('ORPHA:3380', [f['disease_id'] for f in s.search_diseases('Edwards')[:3]])
+        self.assertEqual(s.search_diseases('hội chứng Down')[0]['disease_name'], 'Down syndrome')
+        self.assertTrue(any('trisomy 13' in f['disease_name'].lower() for f in s.search_diseases('Patau')[:3]))
+
+    @needs_data
     def test_input_validation(self):
         for payload in ({'hpos': []}, {'hpos': [{'id': 'HP:9999999', 'status': 'CÓ'}]},
                         {'hpos': [{'id': 'HP:0000252', 'status': 'KHÔNG'}]},
