@@ -128,3 +128,64 @@ nguyên (chúng vẫn nằm trong sao lưu mã hóa) cho lần triển khai lạ
   từ chối một trong hai để danh sách rõ ràng.
 - Báo lỗi không gửi thông báo; quản trị cần mở thẻ **Báo lỗi** định kỳ (số báo lỗi mới hiện trên thẻ).
 - Chưa có dọn tự động: báo lỗi đã xử lý và ảnh nằm lại cho đến khi quản trị **Xóa**.
+
+## Bổ sung 29/10: Bệnh đúng của ca
+
+Chức năng thứ ba, cùng bản web (Model 1 v7.1), không cần train lại, không cần GPU, không duyệt: khi **Model 2 xếp
+bệnh sai**, bác sĩ (hoặc Phòng Lab, quản trị) đánh dấu bệnh sai và ghi bệnh đúng ngay bên cạnh; máy chủ lưu cả
+ca (HPO đã duyệt kèm trạng thái, gene WES, các bệnh AI gợi ý như đã hiển thị, bệnh báo sai, bệnh đúng, ghi chú)
+làm **dữ liệu huấn luyện lại Model 2**. Thứ tự xếp hạng đang chạy **không đổi**.
+
+### Trên trang
+- Ở bước đối chiếu bệnh, mỗi thẻ bệnh có nút **Báo sai**; bảng **Bệnh đúng của ca** dưới kết quả: tra bệnh đúng
+  theo tên hoặc mã (`OMIM:…`, `ORPHA:…`; `ORPHANET:` được quy về `ORPHA:`), hoặc **Ghi tay tên bệnh này** khi bệnh
+  không có trong danh mục (lưu `disease_id` rỗng), ghi chú (tối đa 500 ký tự), **Lưu bệnh đúng**. Mã ca lấy từ ô mã ca
+  của bác sĩ (tối đa 80 ký tự, tuỳ chọn). Khi mã bệnh có trong danh mục, tên lưu là tên trong danh mục.
+- Giới hạn kho: mỗi tài khoản tối đa 50 ghi nhận *chưa xem* (`WEB_DISEASE_FEEDBACK_PER_USER`) và cả file tối đa
+  50 MB (`WEB_DISEASE_FEEDBACK_MAX_MB`, ước theo nội dung JSON); vượt thì trang báo cho người ghi (422), quản trị
+  đánh dấu đã xem hoặc xóa bớt là ghi lại được. Thứ hạng gợi ý nhận số nguyên 0–100.000, tỉ lệ khớp 0–100; body
+  JSON chứa `NaN`/`Infinity` bị từ chối 400 ở mọi route.
+- Quản trị xem ở **Quản trị → Bệnh đúng**: lọc *Chờ xem / Đã xem / Tất cả*, theo tài khoản; đánh dấu **Đã xem** /
+  **Mở lại**, **Xóa**; **Tải dữ liệu huấn luyện Model 2** tải `fe2gen_benh_dung_<YYYYMMDD>.json` gồm **mọi** ghi nhận
+  (bất kể trạng thái): `cases[]` với `hpos[{id,status}]`, `genes`, `correct_disease_id`, `correct_disease_name`,
+  `wrong_disease_ids`, `ai_suggestions[{disease_id,rank,overall_rank,group,match_percentage}]`, `note`.
+  Trang hiển thị tối đa 200 ghi nhận mới nhất, số đếm vẫn đầy đủ. Người gửi chỉ thấy ghi nhận của mình.
+
+### API
+`GET /api/disease_search?q=` (mọi vai trò, tối đa 20 kết quả, nhóm *disease_search* 60/phút); `POST`/`GET
+/api/disease_feedback` (mọi vai trò, nhóm *disease_feedback* 20/phút); `GET /api/admin/disease_feedback`,
+`/export`, `POST /api/admin/disease_feedback/status` (`new`|`reviewed`), `/delete` (nhóm *admin*). Lỗi nhập 422
+tiếng Việt; file lưu hỏng → 500 "Liên hệ quản trị viên" (không bao giờ 422).
+
+### File, biến môi trường, sao lưu
+| Mục | Giá trị |
+|---|---|
+| File | `~/prenatal_pubcasefinder/.deployment/disease_feedback.json`, quyền 600, ghi nguyên tử, đọc lại khi đổi trên đĩa. **Nội dung lâm sàng** (mã ca, HPO, gene, bệnh): đã thêm vào `.gitignore`, hook pre-commit, `backup_deployment.sh` (chạy lại `--setup` để bản sao timer cập nhật) và `separate_user.md`. |
+| `WEB_DISEASE_FEEDBACK_FILE` | đường dẫn file trên; mặc định như trên. |
+| `WEB_DISEASE_FEEDBACK_PER_USER` | `50` ghi nhận chưa xem tối đa mỗi tài khoản; vượt → 422, ghi lại được sau khi quản trị xem/xóa. `0` tắt. |
+| `WEB_DISEASE_FEEDBACK_MAX_MB` | `50` MB tối đa cho file (ước theo nội dung JSON); vượt → 422 "Kho ghi nhận bệnh đúng đã đầy…" cho đến khi quản trị xóa bớt. `0` tắt. |
+| `WEB_RATE_DISEASE_SEARCH` | `60` yêu cầu/phút mỗi phiên cho `/api/disease_search`. `0` tắt. |
+| `WEB_RATE_DISEASE_FEEDBACK` | `20` yêu cầu/phút mỗi phiên cho `/api/disease_feedback`. `0` tắt. |
+
+`deploy_ubuntu.sh` ghi năm dòng này dạng chú thích vào `web.env` **mới**; `web.env` đang có không bị sửa.
+
+### Nhật ký kiểm toán
+Thêm *Ghi bệnh đúng của ca*, *Cập nhật ghi nhận bệnh đúng*, *Xóa ghi nhận bệnh đúng*, *Tải ghi nhận bệnh đúng*:
+chỉ người, thời gian, mã ghi nhận (12 ký tự hex), trạng thái và số lượng; **không có mã ca, HPO, gene, tên bệnh hay
+ghi chú**.
+
+### Kiểm tra sau triển khai
+1. Đăng nhập bác sĩ, đối chiếu một ca, bấm **Báo sai** ở một bệnh, tra và chọn bệnh đúng, **Lưu bệnh đúng** → thông
+   báo "Đã lưu bệnh đúng của ca. Dữ liệu chờ huấn luyện lại Model 2."
+2. Quản trị → **Bệnh đúng**: thấy ghi nhận với HPO, gợi ý AI, bệnh báo sai, bệnh đúng; **Tải dữ liệu huấn luyện
+   Model 2** cho file có `cases`.
+3. `ls -l ~/prenatal_pubcasefinder/.deployment/disease_feedback.json` → 600; **Nhật ký** không dòng nào chứa tên bệnh.
+4. Test trước khi deploy: `python test_access.py` (lớp `DiseaseFeedbackTests`), `python test_web.py`
+   (`test_search_diseases_by_id_name_and_limit`, cần `backend/data`).
+
+### Giới hạn
+- Dữ liệu chỉ được **lưu và xuất**; chưa có bước huấn luyện lại Model 2 trong bản này (xem `backend/model2_reranker.py`
+  và `tools/` khi làm lần train sau).
+- Bệnh báo sai phải nằm trong danh sách AI đã gợi ý ở lần đối chiếu đó (tối đa 10); bệnh đúng không thể trùng bệnh đã
+  báo sai.
+

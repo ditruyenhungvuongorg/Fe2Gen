@@ -261,11 +261,12 @@ bash "$NEW/backend/ops/backup_deployment.sh" --list
 ```
 
 Sao lưu gồm `users.json`, `audit.jsonl*`, `login_failures.json`, `access.log*`, `web.env`, `lab_cases.json`,
-`corrections.json` và thư mục `bug_reports/`. `lab_cases.json` (ca gửi sang Phòng Lab, khi chức năng đó được triển
+`corrections.json`, `disease_feedback.json` và thư mục `bug_reports/`. `lab_cases.json` (ca gửi sang Phòng Lab, khi chức năng đó được triển
 khai) chứa nội dung ca bệnh: nó thuộc phạm vi sao lưu mã hóa này và phải giữ quyền 600 như `users.json`.
 `corrections.json` (góp ý sửa mã của bác sĩ: cụm từ lâm sàng + mã HPO, quyền 600) và `bug_reports/` (báo lỗi kèm
 ảnh chụp màn hình có thể lộ ca bệnh; thư mục 700, file 600) cũng là nội dung lâm sàng và chỉ rời máy trong bản sao
-lưu mã hóa này. Khóa riêng age / passphrase cất NGOÀI máy chủ.
+lưu mã hóa này. `disease_feedback.json` (bệnh đúng của ca: mã ca của bác sĩ, các HPO đã duyệt, gene WES, bệnh AI
+gợi ý và bệnh đúng; dữ liệu huấn luyện lại Model 2, quyền 600) cũng vậy. Khóa riêng age / passphrase cất NGOÀI máy chủ.
 
 Kiểm tra: `systemctl --user list-timers fe2gen-backup.timer`;
 `bash "$NEW/backend/ops/backup_deployment.sh" --check <file mới nhất>` liệt kê được các file (cần khóa).
@@ -328,11 +329,16 @@ Tên và mặc định lấy từ code (`grep getenv|env_flag|env_int|_env_float
 | `WEB_RATE_ADMIN` | `60` | Yêu cầu/phút mỗi phiên cho `/api/admin/*`. |
 | `WEB_RATE_CORRECTIONS` | `20` | Yêu cầu/phút mỗi phiên cho `/api/corrections` (góp ý sửa mã của bác sĩ). |
 | `WEB_RATE_BUG_REPORT` | `5` | Yêu cầu/phút mỗi phiên cho `/api/bug_reports` (báo lỗi kèm ảnh). |
+| `WEB_RATE_DISEASE_SEARCH` | `60` | Yêu cầu/phút mỗi phiên cho `/api/disease_search` (tra tên/mã bệnh trong ô *Bệnh đúng*). |
+| `WEB_RATE_DISEASE_FEEDBACK` | `20` | Yêu cầu/phút mỗi phiên cho `/api/disease_feedback` (ghi bệnh đúng của ca, mọi vai trò). |
 | `WEB_MAX_UPLOAD_BYTES` | `8000000` | Kích thước body tối đa (byte) riêng cho `/api/bug_reports` (ảnh base64, tối đa 3 ảnh × 4 MB); mọi route khác giữ 100.000 byte. |
 | `WEB_CORRECTIONS_FILE` | `~/prenatal_pubcasefinder/.deployment/corrections.json` | Góp ý sửa mã (chờ duyệt / đã duyệt / đã từ chối), quyền 600, ghi nguyên tử. Nội dung lâm sàng: nằm trong sao lưu mã hóa. |
 | `WEB_BUG_REPORTS_DIR` | `~/prenatal_pubcasefinder/.deployment/bug_reports` | Thư mục báo lỗi: `index.json` + ảnh `<id>_<n>.png|jpg|webp` (thư mục 700, file 600). Nằm trong sao lưu mã hóa. |
+| `WEB_DISEASE_FEEDBACK_FILE` | `~/prenatal_pubcasefinder/.deployment/disease_feedback.json` | Bệnh đúng của ca (chờ xem / đã xem): ảnh chụp ca (HPO, gene, bệnh AI gợi ý, bệnh đúng) để huấn luyện lại Model 2; quyền 600, ghi nguyên tử. Nội dung lâm sàng: nằm trong sao lưu mã hóa. |
 | `WEB_BUG_REPORTS_PER_USER` | `20` | Số báo lỗi *chưa xử lý* tối đa mỗi tài khoản; vượt → 422 "Bác sĩ đã có N báo lỗi chưa xử lý…" cho đến khi quản trị đánh dấu đã xử lý hoặc xóa. `0` tắt. |
 | `WEB_BUG_REPORTS_MAX_MB` | `500` | Tổng dung lượng ảnh (MB, tính theo `index.json`) thư mục báo lỗi được giữ; vượt → 422 "Kho báo lỗi đã đầy…" cho đến khi quản trị xóa bớt. `0` tắt. |
+| `WEB_DISEASE_FEEDBACK_PER_USER` | `50` | Số ghi nhận bệnh đúng *chưa xem* tối đa mỗi tài khoản; vượt → 422 "Bác sĩ đã có N ghi nhận chưa xem…" cho đến khi quản trị đánh dấu đã xem hoặc xóa. `0` tắt. |
+| `WEB_DISEASE_FEEDBACK_MAX_MB` | `50` | Dung lượng tối đa (MB, ước theo nội dung JSON) của `disease_feedback.json`; vượt → 422 "Kho ghi nhận bệnh đúng đã đầy…" cho đến khi quản trị xóa bớt. `0` tắt. |
 | `WEB_QUEUE_MAX` | `5` | Số yêu cầu tối đa chờ hàng đợi GPU/CPU (1 chạy); người tiếp theo nhận 503 ngay. |
 | `WEB_MAX_CONNECTIONS` | `64` | Số kết nối đồng thời; quá → 503 ngắn và đóng. |
 | `WEB_HEADER_TIMEOUT` | `15` | Giây tối đa để nhận dòng yêu cầu + header (chống slowloris). |

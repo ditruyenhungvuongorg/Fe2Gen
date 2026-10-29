@@ -114,9 +114,13 @@ class CorrectionStore:
             raise StoreError('corrections.json không đúng cấu trúc.')
         self.items, self.mtime = [i for i in items if isinstance(i, dict)], mtime
 
-    def _save(self):
-        write_private_json(self.path, {'items': self.items})
-        self.mtime = self.path.stat().st_mtime_ns
+    def _save(self, items=None):
+        """Write items (default the current list) and, only once the file is on disk, make them the current list:
+        a failed write leaves no phantom item in memory."""
+        if items is None:
+            items = self.items
+        write_private_json(self.path, {'items': items})
+        self.items, self.mtime = items, self.path.stat().st_mtime_ns
 
     def all(self):
         """Every item, newest first (copies)."""
@@ -141,8 +145,7 @@ class CorrectionStore:
                 new_id = secrets.token_hex(6)
             item = {'id': new_id, 'time': now(), 'user': user, 'name': name or user, **fields,
                     'status': 'pending', 'decided_by': None, 'decided_at': None, 'decision_note': ''}
-            self.items.append(item)
-            self._save()
+            self._save(self.items + [item])  # copy-on-write: self.items changes only after the file is written
             return dict(item), False
 
     def own(self, user, status='all'):

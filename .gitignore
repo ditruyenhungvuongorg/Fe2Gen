@@ -22,5 +22,6 @@ access.log*
 login_failures.json
 model1_state.json
 corrections.json
+disease_feedback.json
 bug_reports/
 *.xlsx

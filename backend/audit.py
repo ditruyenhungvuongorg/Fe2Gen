@@ -36,6 +36,9 @@ EVENTS = {
     'correction_submitted': 'Gửi góp ý sửa mã', 'correction_approved': 'Duyệt góp ý sửa mã',
     'correction_rejected': 'Từ chối góp ý sửa mã', 'corrections_exported': 'Tải góp ý đã duyệt',
     'bug_report_created': 'Gửi báo lỗi', 'bug_report_updated': 'Cập nhật báo lỗi', 'bug_report_deleted': 'Xóa báo lỗi',
+    # Bệnh đúng của ca: the feedback id and counts only, never the case code, HPO terms, genes or disease names.
+    'disease_feedback_submitted': 'Ghi bệnh đúng của ca', 'disease_feedback_updated': 'Cập nhật ghi nhận bệnh đúng',
+    'disease_feedback_deleted': 'Xóa ghi nhận bệnh đúng', 'disease_feedback_exported': 'Tải ghi nhận bệnh đúng',
 }
 
 

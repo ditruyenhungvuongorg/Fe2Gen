@@ -7,6 +7,7 @@ from collections import defaultdict
 from server import Fe2genSystem, normalize_text, BASE_DIR
 from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy, load_disease_xref
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
+from disease_feedback import disease_id_key
 from model1_process import Model1Process, safe_input_error
 from model1_v6.runner import Model1V6Runner
 from model2_reranker import POOL, Reranker, candidate_features, load_validity
@@ -41,6 +42,16 @@ def phrase_key(text):
     """Exact phrase match ignoring case and spacing but keeping diacritics ("mắt to" and "mặt to" differ)."""
     return ' '.join(unicodedata.normalize('NFC', text).casefold().split())
 
+# Names doctors use that the HPOA catalog does not: eponyms and Vietnamese forms (keys are normalize_text output).
+DISEASE_ALIASES = {'edwards': 'trisomy 18', 'edward': 'trisomy 18', 'patau': 'trisomy 13', 'digeorge': '22q11.2 deletion',
+                   'di george': '22q11.2 deletion', 'tam nhiem sac the 21': 'trisomy 21', 'tam nhiem sac the 18': 'trisomy 18',
+                   'tam nhiem sac the 13': 'trisomy 13', 'tam boi': 'triploidy', 'cri du chat': 'cri-du-chat', 'meo keu': 'cri-du-chat',
+                   'wolf hirschhorn': 'wolf-hirschhorn', 'prader willi': 'prader-willi', 'beckwith wiedemann': 'beckwith-wiedemann',
+                   'smith lemli opitz': 'smith-lemli-opitz', 'cornelia de lange': 'cornelia de lange', 'thalassemia': 'thalassemia',
+                   'tan mau bam sinh': 'thalassemia', 'loan san xuong': 'achondroplasia', 'thoat vi hoanh': 'congenital diaphragmatic hernia',
+                   'tim bam sinh': 'congenital heart'}
+
+
 class WebSystem(Fe2genSystem):
     def __init__(self):
         super().__init__()
@@ -69,6 +80,12 @@ class WebSystem(Fe2genSystem):
     def initialize(self):
         super().initialize()
         self.profiles_by_id = {p.disease_id: p for p in self.matcher.profiles}
+        # search_diseases ("Bệnh đúng của ca"): (id, name, normalize_text(name), its words), computed once.
+        self.disease_index = []
+        for did, profile in self.profiles_by_id.items():
+            name = getattr(profile, 'disease_name', '') or ''
+            key = normalize_text(name)
+            self.disease_index.append((did, name, key, key.split()))
         self.inheritance = defaultdict(set)
         with (BASE_DIR / 'data/phenotype.hpoa').open(encoding='utf-8') as f:
             for row in csv.DictReader((line for line in f if not line.startswith('#')), delimiter='\t'):
@@ -172,6 +189,40 @@ class WebSystem(Fe2genSystem):
         if corrected:  # the doctors' approved choice for exactly this wording goes first
             found = list(corrected) + [h for h in found if h not in corrected]
         return [self.term(h) for h in found[:limit]]
+
+    def disease_group(self, disease_id):
+        """The mechanism group of a catalog disease (NST/CNV/DON_GEN/CHUA_RO), or None without a category table."""
+        return self.categories.get(disease_id, ('CHUA_RO', False))[0] if self.categories else None
+
+    def search_diseases(self, query, limit=20):
+        """Catalog diseases for the "Bệnh đúng" box: a typed id (OMIM:/ORPHA:/ORPHANET:) first, then the name
+        exactly, as a whole-word phrase, by word prefixes, as a plain substring; ties by name length and id."""
+        q = normalize_text(query)
+        for prefix in ('hoi chung ', 'benh ', 'syndrome '):  # "hội chứng Down" -> "down"
+            if q.startswith(prefix) and len(q) > len(prefix):
+                q = q[len(prefix):]
+        q = DISEASE_ALIASES.get(q, q)
+        if not q:
+            return []
+        requested = disease_id_key(query)
+        tokens = q.split()
+        ranked = []
+        for did, name, key, words in self.disease_index:
+            if requested and did == requested:
+                tier = 0
+            elif q == key:
+                tier = 1
+            elif (' ' + q + ' ') in (' ' + key + ' '):
+                tier = 2
+            elif all(any(w.startswith(t) for w in words) for t in tokens):
+                tier = 3
+            elif q in key or (requested and did.startswith(requested)):
+                tier = 4
+            else:
+                continue
+            ranked.append((tier, len(name), did, name))
+        ranked.sort()
+        return [{'disease_id': did, 'disease_name': name, 'group': self.disease_group(did)} for _, _, did, name in ranked[:limit]]
 
     def extract(self, text):
         if not isinstance(text, str) or not text.strip() or len(text) > 6000:

@@ -24,7 +24,8 @@ if 'FE2GEN_TEST_DIR' not in os.environ:
     os.environ['FE2GEN_TEST_DIR'] = tempfile.mkdtemp(prefix='fe2gen-test-')
     for _name, _file in (('WEB_USERS_FILE', 'users.json'), ('WEB_AUDIT_FILE', 'audit.jsonl'),
                          ('WEB_ACCESS_LOG', 'access.log'), ('MODEL1_STATE_FILE', 'model1_state.json'),
-                         ('WEB_CORRECTIONS_FILE', 'corrections.json'), ('WEB_BUG_REPORTS_DIR', 'bug_reports')):
+                         ('WEB_CORRECTIONS_FILE', 'corrections.json'), ('WEB_BUG_REPORTS_DIR', 'bug_reports'),
+                         ('WEB_DISEASE_FEEDBACK_FILE', 'disease_feedback.json')):
         os.environ[_name] = str(Path(os.environ['FE2GEN_TEST_DIR'], _file))
 
 from accesslog import AccessLog
@@ -32,6 +33,7 @@ from audit import AuditLog
 from auth import Auth, UserStore, check_password, hash_password, password_problem, public_user, temporary_password
 from bug_reports import BugReportStore
 from corrections import CorrectionStore
+from disease_feedback import DiseaseFeedbackStore
 from model1_process import Model1Process, ModelProcessError, ModelUnavailable
 
 FAKE = [sys.executable, '-c', 'import sys, model1_process, test_access; '
@@ -487,7 +489,8 @@ class AdminHttpTests(unittest.TestCase):
 
 def fresh_rates(per_minute=1000, **override):
     from ratelimit import RateLimiter
-    groups = ('hpo_search', 'match_diseases', 'extract_hpo', 'login', 'login_user', 'admin', 'corrections', 'bug_report')
+    groups = ('hpo_search', 'match_diseases', 'extract_hpo', 'login', 'login_user', 'admin', 'corrections', 'bug_report',
+              'disease_search', 'disease_feedback')
     return {g: RateLimiter(override.get(g, per_minute)) for g in groups}
 
 
@@ -1827,6 +1830,311 @@ class BugReportTests(unittest.TestCase):
         self.reports.delete(rid)  # no KeyError; the one real file goes
         self.assertEqual([p.name for p in folder.iterdir()], ['index.json'])
         self.assertEqual(self.reports.listing('all'), ([], {'new': 0, 'closed': 0}))
+
+
+def fake_disease_system(runner):
+    """fake_hpo_system plus the disease catalog hooks "Bệnh đúng của ca" consults: profiles_by_id (two profiles with
+    .disease_name), search_diseases and categories."""
+    system = fake_hpo_system(runner)
+    profiles = {'OMIM:190685': types.SimpleNamespace(disease_id='OMIM:190685', disease_name='Down syndrome'),
+                'ORPHA:3380': types.SimpleNamespace(disease_id='ORPHA:3380', disease_name='Trisomy 18')}
+    system.profiles_by_id = profiles
+    system.categories = {}
+    system.search_diseases = lambda q: [{'disease_id': d, 'disease_name': p.disease_name, 'group': None}
+                                        for d, p in profiles.items() if q.strip() and q.lower() in p.disease_name.lower()]
+    return system
+
+
+class DiseaseFeedbackTests(unittest.TestCase):
+    """Bệnh đúng của ca: every role records the correct disease next to the AI's wrong suggestions; the case
+    snapshot stays on the server (600) as Model 2 training data; admins review, delete and export."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        d = self.dir.name
+        self.store = accounts(d, **{'bs.an': 'doctor', 'bs.binh': 'doctor', 'lab.hv': 'lab', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(d, 'audit.jsonl'))
+        self.feedback = DiseaseFeedbackStore(Path(d, 'disease_feedback.json'))
+        self.system = fake_disease_system(model())
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def server(self, **extra):
+        return LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit, DISEASE_FEEDBACK=self.feedback,
+                          SYSTEM=self.system, **extra)
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data['token']
+
+    SUGGESTIONS = [{'disease_id': 'ORPHA:3380', 'disease_name': 'Trisomy 18', 'rank': 1, 'overall_rank': 1, 'group': 'NST',
+                    'match_percentage': 41.5},
+                   {'disease_id': 'OMIM:190685', 'disease_name': 'Down syndrome', 'rank': 2, 'overall_rank': 3, 'group': 'NST',
+                    'match_percentage': 30.0}]
+    BODY = {'case_code': 'HV-2026-0123', 'hpos': [{'id': 'HP:0001674', 'vi': 'Kênh nhĩ thất', 'en': 'Complete AVSD', 'status': 'CÓ'},
+                                                  {'id': 'HP:0001511', 'vi': 'Thai chậm tăng trưởng', 'en': 'IUGR', 'status': 'NGHI NGỜ'}],
+            'genes': ['dscam', 'DSCAM'], 'suggestions': SUGGESTIONS, 'wrong_ids': ['ORPHA:3380'],
+            'correct': {'disease_id': 'omim:190685', 'disease_name': 'tên bác sĩ gõ'}, 'note': 'Karyotype 47,XX,+21 BÍ-MẬT-456'}
+
+    def test_submit_list_review_delete_and_export(self):
+        with self.server() as srv:
+            an, lab, admin = self.login(srv, 'bs.an'), self.login(srv, 'lab.hv'), self.login(srv, 'quan.tri')
+            code, out = srv.call('/api/disease_feedback', self.BODY, an)
+            self.assertEqual(code, 200, out)
+            item = out['item']
+            self.assertRegex(item['id'], r'^[0-9a-f]{12}$')
+            self.assertEqual((item['user'], item['status'], item['reviewed_by'], item['case_code']), ('bs.an', 'new', None, 'HV-2026-0123'))
+            self.assertEqual(item['correct'], {'disease_id': 'OMIM:190685', 'disease_name': 'Down syndrome'})  # catalog name wins
+            self.assertEqual(item['genes'], ['DSCAM'])
+            self.assertEqual(item['wrong_ids'], ['ORPHA:3380'])
+            self.assertEqual([h['id'] for h in item['hpos']], ['HP:0001674', 'HP:0001511'])
+            self.assertEqual(item['suggestions'][0]['match_percentage'], 41.5)
+            if os.name == 'posix':
+                self.assertEqual(os.stat(self.feedback.path).st_mode & 0o777, 0o600)
+            # the Lab and the admin may record too; an ORPHANET: id maps to the ORPHA: catalog id
+            for who in (lab, admin):
+                code, more = srv.call('/api/disease_feedback', {**self.BODY, 'correct': {'disease_id': 'Orphanet:3380', 'disease_name': 'x'},
+                                                                'wrong_ids': ['OMIM:190685']}, who)
+                self.assertEqual(code, 200, more)
+                self.assertEqual(more['item']['correct'], {'disease_id': 'ORPHA:3380', 'disease_name': 'Trisomy 18'})
+            # free text: a disease outside the catalog keeps the doctor's wording with disease_id null
+            code, free = srv.call('/api/disease_feedback', {**self.BODY, 'correct': {'disease_id': None, 'disease_name': ' Hội chứng lạ '}}, an)
+            self.assertEqual(code, 200, free)
+            self.assertEqual(free['item']['correct'], {'disease_id': None, 'disease_name': 'Hội chứng lạ'})
+            # validation
+            for body, message in (({**self.BODY, 'hpos': []}, 'Chọn ít nhất một HPO của ca.'),
+                                  ({**self.BODY, 'correct': {'disease_id': 'OMIM:999999', 'disease_name': 'x'}}, 'Mã bệnh không có trong danh mục.'),
+                                  ({**self.BODY, 'correct': {'disease_id': None, 'disease_name': ''}}, 'Ghi tên bệnh đúng.'),
+                                  ({**self.BODY, 'correct': {'disease_id': None, 'disease_name': 'x'}, 'wrong_ids': ['OMIM:1']},
+                                   'Bệnh báo sai phải nằm trong danh sách AI đã gợi ý.'),
+                                  ({**self.BODY, 'correct': {'disease_id': 'ORPHA:3380', 'disease_name': 'x'}}, 'Bệnh đúng không thể là bệnh đã báo sai.'),
+                                  ({**self.BODY, 'hpos': [{'id': 'HP:0001674', 'status': 'MAYBE'}]}, 'Dấu hiệu HPO không hợp lệ.'),
+                                  ({**self.BODY, 'genes': ['bad gene!']}, 'Ký hiệu gene không hợp lệ: bad gene!'),
+                                  ({**self.BODY, 'suggestions': [{'disease_id': 'ORPHA:3380', 'rank': 'first'}]}, 'Danh sách gợi ý của AI không hợp lệ.')):
+                code, err = srv.call('/api/disease_feedback', body, an)
+                self.assertEqual((code, err['error']), (422, message), body)
+            self.assertEqual(srv.call('/api/disease_feedback', {**self.BODY, 'note': 'n' * 501}, an)[0], 422)
+            # own list: newest first, own items only; status filter
+            code, mine = srv.call('/api/disease_feedback', token=an)
+            self.assertEqual((code, len(mine['items']), mine['labels']), (200, 2, {'new': 'Chờ xem', 'reviewed': 'Đã xem'}))
+            self.assertEqual(mine['items'][0]['id'], free['item']['id'])
+            self.assertEqual(srv.call('/api/disease_feedback?status=reviewed', token=an)[1]['items'], [])
+            self.assertEqual(srv.call('/api/disease_feedback', token=self.login(srv, 'bs.binh'))[1]['items'], [])
+            # admin: counts, filters, review, reopen, delete
+            for path in ('/api/admin/disease_feedback', '/api/admin/disease_feedback/export'):
+                self.assertEqual(srv.call(path, token=an)[0], 403)
+            self.assertEqual(srv.call('/api/admin/disease_feedback/status', {'id': item['id'], 'status': 'reviewed'}, an)[0], 403)
+            code, listing = srv.call('/api/admin/disease_feedback', token=admin)
+            self.assertEqual((code, listing['counts'], len(listing['items'])), (200, {'new': 4, 'reviewed': 0}, 4))
+            self.assertEqual(len(srv.call('/api/admin/disease_feedback?user=bs.an&status=all', token=admin)[1]['items']), 2)
+            self.assertEqual(srv.call('/api/admin/disease_feedback/status', {'id': item['id'], 'status': 'reviewed'}, admin)[1], {'ok': True})
+            code, after = srv.call('/api/admin/disease_feedback', token=admin)
+            self.assertEqual((after['counts'], len(after['items'])), ({'new': 3, 'reviewed': 1}, 3))
+            reviewed = srv.call('/api/admin/disease_feedback?status=reviewed', token=admin)[1]['items']
+            self.assertEqual((reviewed[0]['id'], reviewed[0]['reviewed_by']), (item['id'], 'quan.tri'))
+            self.assertIsNotNone(reviewed[0]['reviewed_at'])
+            self.assertEqual(srv.call('/api/disease_feedback?status=reviewed', token=an)[1]['items'][0]['id'], item['id'])
+            self.assertEqual(srv.call('/api/admin/disease_feedback/status', {'id': item['id'], 'status': 'new'}, admin)[0], 200)
+            self.assertIsNone(srv.call('/api/admin/disease_feedback?status=all', token=admin)[1]['items'][-1]['reviewed_at'])
+            code, err = srv.call('/api/admin/disease_feedback/status', {'id': 'khongco00000', 'status': 'reviewed'}, admin)
+            self.assertEqual((code, err['error']), (422, 'Không tìm thấy ghi nhận này.'))
+            self.assertEqual(srv.call('/api/admin/disease_feedback/status', {'id': item['id'], 'status': 'gone'}, admin)[0], 422)
+            # export: every item regardless of status, as training cases
+            self.assertEqual(srv.call('/api/admin/disease_feedback/status', {'id': item['id'], 'status': 'reviewed'}, admin)[0], 200)
+            status, headers, body = raw_fetch(srv.base, '/api/admin/disease_feedback/export', admin)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers['Content-Type'], 'application/json; charset=utf-8')
+            self.assertRegex(headers['Content-Disposition'], r'^attachment; filename="fe2gen_benh_dung_\d{8}\.json"$')
+            data = json.loads(body)
+            self.assertEqual((data['count'], len(data['cases'])), (4, 4))
+            case = next(c for c in data['cases'] if c['id'] == item['id'])
+            self.assertEqual(case['hpos'], [{'id': 'HP:0001674', 'status': 'CÓ'}, {'id': 'HP:0001511', 'status': 'NGHI NGỜ'}])
+            self.assertEqual((case['correct_disease_id'], case['correct_disease_name'], case['wrong_disease_ids'], case['genes'], case['case_code']),
+                             ('OMIM:190685', 'Down syndrome', ['ORPHA:3380'], ['DSCAM'], 'HV-2026-0123'))
+            self.assertEqual(case['ai_suggestions'][0], {'disease_id': 'ORPHA:3380', 'rank': 1, 'overall_rank': 1, 'group': 'NST', 'match_percentage': 41.5})
+            self.assertIn('BÍ-MẬT-456', case['note'])
+            self.assertEqual(srv.call('/api/admin/disease_feedback/delete', {'id': item['id']}, admin)[1], {'ok': True})
+            self.assertEqual(srv.call('/api/admin/disease_feedback?status=all', token=admin)[1]['counts'], {'new': 3, 'reviewed': 0})
+            self.assertEqual(srv.call('/api/admin/disease_feedback/delete', {'id': item['id']}, admin)[0], 422)
+            # the catalog search is open to every signed-in role
+            self.assertEqual(srv.call('/api/disease_search?q=down', token=lab)[1], [{'disease_id': 'OMIM:190685', 'disease_name': 'Down syndrome', 'group': None}])
+            self.assertEqual(srv.call('/api/disease_search?q=', token=lab)[1], [])
+        # the audit log: ids, status and counts only, never the case content
+        log = json.dumps(self.audit.tail(), ensure_ascii=False)
+        for secret in ('BÍ-MẬT', 'HV-2026', 'HP:0001674', 'DSCAM', 'Down', 'ORPHA:3380', 'Hội chứng lạ'):
+            self.assertNotIn(secret, log)
+        submitted = [e for e in self.audit.tail() if e['event'] == 'disease_feedback_submitted']
+        self.assertEqual(len(submitted), 4)
+        self.assertEqual(set(submitted[0]) - {'time', 'event', 'user', 'prev'}, {'feedback_id'})
+        self.assertIn(item['id'], [e['feedback_id'] for e in submitted])
+        events = [(e['event'], e.get('feedback_id'), e.get('status'), e.get('count')) for e in self.audit.tail()]
+        self.assertIn(('disease_feedback_updated', item['id'], 'reviewed', None), events)
+        self.assertIn(('disease_feedback_updated', item['id'], 'new', None), events)
+        self.assertIn(('disease_feedback_deleted', item['id'], None, None), events)
+        self.assertIn(('disease_feedback_exported', None, None, 4), events)
+
+    def test_doctor_on_admin_routes_gets_one_403(self):
+        with self.server() as srv:
+            an = self.login(srv, 'bs.an')
+            for path in ('/api/admin/disease_feedback', '/api/admin/disease_feedback/export'):
+                raw = raw_get(srv.base, path, an)
+                self.assertEqual(raw.count(b'HTTP/1.0 '), 1, raw)
+                self.assertTrue(raw.startswith(b'HTTP/1.0 403'), raw[:40])
+                self.assertEqual(raw.count(b'"error"'), 1)
+
+    def test_corrupt_store_answers_500_not_422(self):
+        self.feedback.path.write_text('{"items": [', encoding='utf-8')
+        with self.server() as srv:
+            an, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            code, err = srv.call('/api/disease_feedback', self.BODY, an)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được ghi nhận. Liên hệ quản trị viên.'))
+            code, err = srv.call('/api/disease_feedback', token=an)
+            self.assertEqual((code, err['error']), (500, 'Không đọc được danh sách ghi nhận. Liên hệ quản trị viên.'))
+            code, err = srv.call('/api/admin/disease_feedback', token=admin)
+            self.assertEqual((code, err['error']), (500, 'Không đọc được dữ liệu đã lưu. Liên hệ quản trị viên.'))
+            self.assertEqual(srv.call('/api/admin/disease_feedback/export', token=admin)[0], 500)
+            code, err = srv.call('/api/admin/disease_feedback/status', {'id': 'a' * 12, 'status': 'reviewed'}, admin)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được thay đổi. Liên hệ quản trị viên.'))
+            self.assertEqual(srv.call('/api/admin/disease_feedback/delete', {'id': 'a' * 12}, admin)[0], 500)
+            code, err = srv.call('/api/disease_feedback', {**self.BODY, 'hpos': []}, an)  # validation still 422
+            self.assertEqual((code, err['error']), (422, 'Chọn ít nhất một HPO của ca.'))
+            time.sleep(0.02)
+            self.feedback.path.write_text('{"items": "x"}', encoding='utf-8')  # parses, wrong shape
+            self.assertEqual(srv.call('/api/disease_feedback', self.BODY, an)[0], 500)
+            self.feedback.path.unlink()
+            self.assertEqual(srv.call('/api/disease_feedback', self.BODY, an)[0], 200)  # a missing file is an empty store
+        self.assertEqual(sum(1 for e in self.audit.tail() if e['event'] == 'disease_feedback_submitted'), 1)
+
+    def test_rate_groups_and_store_limits(self):
+        import disease_feedback
+        import serve_web
+        for group in ('disease_search', 'disease_feedback'):
+            self.assertIn(group, serve_web.RATES)
+            self.assertIn(group, fresh_rates())
+        with self.server(RATES=fresh_rates(disease_feedback=2)) as srv:
+            an = self.login(srv, 'bs.an')
+            codes = [srv.call('/api/disease_feedback', self.BODY, an)[0] for _ in range(3)]
+            self.assertEqual(codes, [200, 200, 429])
+            self.assertEqual(srv.call('/api/disease_feedback', token=an)[0], 429)  # the GET shares the group
+        self.assertIn(('rate_limited', 'bs.an', 'disease_feedback'), [(e['event'], e['user'], e.get('group')) for e in self.audit.tail()])
+        for _ in range(3):
+            self.feedback.add('bs.binh', 'BS. Bình', {**self.BODY, 'genes': [], 'correct': {'disease_id': None, 'disease_name': 'x'}})
+        with patch.object(disease_feedback, 'MAX_ITEMS', 2):
+            items, counts = self.feedback.listing('all')
+            self.assertEqual((len(items), counts), (2, {'new': 5, 'reviewed': 0}))  # the newest 2, counts complete
+            self.assertEqual(len(self.feedback.own('bs.binh')), 2)
+        self.assertEqual(len(self.feedback.listing('new', 'bs.an')[0]), 2)
+
+    def raw_post(self, srv, path, body, token):
+        """POST a pre-serialised body (what srv.call cannot send: NaN is not json.dumps-able into valid JSON)."""
+        req = urllib.request.Request(srv.base + path, data=body.encode(),
+                                     headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_rejects_nan_infinity_and_unbounded_numbers(self):
+        from disease_feedback import _number_or_none
+        with self.server() as srv:
+            an = self.login(srv, 'bs.an')
+            # NaN / Infinity pass json.loads by default and would be written to disk as invalid JSON: 400, not stored
+            base = json.dumps(self.BODY, ensure_ascii=False)
+            for constant in ('NaN', 'Infinity', '-Infinity'):
+                body = base.replace('"match_percentage": 41.5', '"match_percentage": ' + constant)
+                self.assertIn(constant, body)
+                code, err = self.raw_post(srv, '/api/disease_feedback', body, an)
+                self.assertEqual((code, err['error']), (400, 'JSON không hợp lệ.'), constant)
+            code, err = self.raw_post(srv, '/api/login', '{"username": NaN, "password": "x"}', an)  # the hook is global
+            self.assertEqual((code, err['error']), (400, 'JSON không hợp lệ.'))
+            # finite but out of bounds, or not a number at all
+            for field, value in (('rank', 1e308), ('rank', -1), ('rank', 100001), ('rank', 1.5), ('rank', True),
+                                 ('overall_rank', 1e308), ('match_percentage', 100.5), ('match_percentage', -0.1),
+                                 ('match_percentage', False), ('match_percentage', '41.5')):
+                body = {**self.BODY, 'suggestions': [{**self.SUGGESTIONS[0], field: value}, self.SUGGESTIONS[1]]}
+                code, err = srv.call('/api/disease_feedback', body, an)
+                self.assertEqual((code, err['error']), (422, 'Danh sách gợi ý của AI không hợp lệ.'), (field, value))
+            # the bounds themselves are accepted
+            body = {**self.BODY, 'suggestions': [{**self.SUGGESTIONS[0], 'rank': 0, 'overall_rank': 100000, 'match_percentage': 100},
+                                                 self.SUGGESTIONS[1]]}
+            code, out = srv.call('/api/disease_feedback', body, an)
+            self.assertEqual(code, 200, out)
+            self.assertEqual((out['item']['suggestions'][0]['rank'], out['item']['suggestions'][0]['overall_rank'],
+                              out['item']['suggestions'][0]['match_percentage']), (0, 100000, 100.0))
+            self.assertEqual(len(srv.call('/api/disease_feedback', token=an)[1]['items']), 1)  # nothing of the refused ones
+        for value in (float('nan'), float('inf'), float('-inf'), 10 ** 400, True):
+            with self.assertRaises(ValueError):
+                _number_or_none(value)
+        self.assertIsNone(_number_or_none(None))
+        self.assertEqual(_number_or_none(3.0, integer=True), 3)
+
+    def test_caps_per_user_and_file_size(self):
+        import disease_feedback
+        self.feedback.per_user = 1
+        with self.server() as srv:
+            an, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            code, first = srv.call('/api/disease_feedback', self.BODY, an)
+            self.assertEqual(code, 200, first)
+            code, err = srv.call('/api/disease_feedback', self.BODY, an)
+            self.assertEqual((code, err['error']), (422, 'Bác sĩ đã có 1 ghi nhận chưa xem; chờ quản trị xem trước khi ghi thêm.'))
+            self.assertEqual(srv.call('/api/disease_feedback', self.BODY, self.login(srv, 'bs.binh'))[0], 200)  # per user
+            self.assertEqual(srv.call('/api/admin/disease_feedback/status', {'id': first['item']['id'], 'status': 'reviewed'}, admin)[0], 200)
+            self.assertEqual(srv.call('/api/disease_feedback', self.BODY, an)[0], 200)  # reviewed ones do not count
+            # total size: the JSON text of the stored items plus the new one
+            self.feedback.per_user = 0
+            self.feedback.max_bytes = len(self.feedback.path.read_text(encoding='utf-8')) + 100
+            code, err = srv.call('/api/disease_feedback', self.BODY, an)
+            self.assertEqual((code, err['error']), (422, 'Kho ghi nhận bệnh đúng đã đầy; nhờ quản trị dọn bớt.'))
+            self.assertEqual(srv.call('/api/admin/disease_feedback?status=all', token=admin)[1]['counts'], {'new': 2, 'reviewed': 1})
+            self.feedback.max_bytes = 0  # cap off
+            self.assertEqual(srv.call('/api/disease_feedback', self.BODY, an)[0], 200)
+        with patch.dict(os.environ, {'WEB_DISEASE_FEEDBACK_PER_USER': '3', 'WEB_DISEASE_FEEDBACK_MAX_MB': '2'}):
+            store = DiseaseFeedbackStore(Path(self.dir.name, 'x.json'))
+        self.assertEqual((store.per_user, store.max_bytes), (3, 2000000))
+        with patch.dict(os.environ, {'WEB_DISEASE_FEEDBACK_PER_USER': '', 'WEB_DISEASE_FEEDBACK_MAX_MB': 'abc'}):
+            store = DiseaseFeedbackStore(Path(self.dir.name, 'x.json'))
+        self.assertEqual((store.per_user, store.max_bytes), (50, 50000000))  # defaults
+        self.assertEqual((disease_feedback.DEFAULT_PER_USER, disease_feedback.DEFAULT_MAX_MB), (50, 50))
+
+    def test_failed_save_leaves_no_phantom_item(self):
+        import corrections
+        import disease_feedback
+        with self.server() as srv:
+            an, admin = self.login(srv, 'bs.an'), self.login(srv, 'quan.tri')
+            with patch.object(disease_feedback, 'write_private_json', side_effect=OSError('disk full')):
+                code, err = srv.call('/api/disease_feedback', self.BODY, an)
+            self.assertEqual((code, err['error']), (500, 'Chưa lưu được ghi nhận. Liên hệ quản trị viên.'))
+            self.assertFalse(self.feedback.path.exists())
+            self.assertEqual(srv.call('/api/disease_feedback', token=an)[1]['items'], [])  # not in memory either
+            self.assertEqual(srv.call('/api/admin/disease_feedback?status=all', token=admin)[1]['counts'], {'new': 0, 'reviewed': 0})
+            code, out = srv.call('/api/disease_feedback', self.BODY, an)  # the store works again afterwards
+            self.assertEqual(code, 200, out)
+            self.assertEqual([i['id'] for i in srv.call('/api/disease_feedback', token=an)[1]['items']], [out['item']['id']])
+        self.assertEqual(sum(1 for e in self.audit.tail() if e['event'] == 'disease_feedback_submitted'), 1)
+        # the same for corrections.json
+        store = CorrectionStore(Path(self.dir.name, 'corrections.json'))
+        fields = {'phrase': 'thai to', 'right': {'id': 'HP:0001520', 'vi': 'Thai to', 'en': 'LGA'}, 'wrong': [],
+                  'context': '', 'note': '', 'source': 'text'}
+        with patch.object(corrections, 'write_private_json', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                store.add('bs.an', 'BS. An', fields)
+        self.assertEqual((store.items, store.own('bs.an'), store.path.exists()), ([], [], False))
+        item, duplicate = store.add('bs.an', 'BS. An', fields)
+        self.assertEqual((duplicate, [i['id'] for i in store.own('bs.an')]), (False, [item['id']]))
+
+    def test_case_code_limit_matches_the_page(self):
+        with self.server() as srv:
+            an = self.login(srv, 'bs.an')
+            code, out = srv.call('/api/disease_feedback', {**self.BODY, 'case_code': 'C' * 80}, an)
+            self.assertEqual((code, out['item']['case_code']), (200, 'C' * 80), out)
+            code, err = srv.call('/api/disease_feedback', {**self.BODY, 'case_code': 'C' * 81}, an)
+            self.assertEqual((code, err['error']), (422, 'Trường "case_code" dài quá 80 ký tự.'))
+        page = Path(__file__).resolve().parent.parent / 'docs' / 'index.html'
+        if page.exists():
+            self.assertIn('id="case-id" maxlength="80"', page.read_text(encoding='utf-8'))
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
