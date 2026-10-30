@@ -30,9 +30,14 @@ GPU_ROLES = ('admin', 'doctor')  # roles that use text extraction (Model 1 on th
 MIN_PASSWORD = 10
 SCRYPT = dict(n=2 ** 14, r=8, p=1, dklen=32)
 # A username is locked for 1, 2, 4 ... up to WEB_LOCK_MAX_SECONDS (default 5 minutes) from its 5th wrong password
-# in a row; more than 30 wrong passwords in a minute over all usernames (password spraying) pause every login for
-# that minute. The lock is kept short because anyone can trigger it for a known username (serve_web also limits
-# login attempts per connection source and per username); an admin can lift it on the admin page.
+# in a row. The lock is kept short because anyone can trigger it for a known username (serve_web also limits
+# login attempts per username); an admin can lift it on the admin page.
+# Only with a trusted proxy (WEB_TRUST_PROXY=1, every client has its own source address): more than 30 wrong
+# passwords in a minute over all usernames (password spraying) pause every login for that minute. Without one
+# (Tailscale Funnel: every request comes from 127.0.0.1) that pause would be a switch anyone on the Internet could
+# flip to lock out every user, admins included, so it is off; spraying is then slowed only per username (the
+# lock above and serve_web's per-username budget), which an attacker trying many names does not hit. That is the
+# trade-off: availability for real users over a global brake on spraying.
 def _env_int(name, default):
     try:
         return int(os.getenv(name, default))
@@ -231,13 +236,17 @@ class Auth:
     PENDING_SECONDS, TOTP_TRIES = 300, 5  # second step of a login: 5 minutes, 5 codes
 
     def __init__(self, store=None, token=None, session_hours=None, idle_hours=None, require_accounts=None, admin_2fa=None,
-                 failures_file=None):
+                 failures_file=None, global_pause=None, max_sessions=None):
         self.store = store or UserStore()
         self.token = os.getenv('WEB_ACCESS_TOKEN', '') if token is None else token
         self.require_accounts = (env_flag('WEB_REQUIRE_ACCOUNTS', '1') if require_accounts is None
                                  else bool(require_accounts))
         # WEB_ADMIN_2FA_REQUIRED (default on): an admin session without a verified second factor can only set one up.
         self.admin_2fa = env_flag('WEB_ADMIN_2FA_REQUIRED', '1') if admin_2fa is None else bool(admin_2fa)
+        # The all-usernames spraying pause (GLOBAL_FAILURES): only behind a trusted proxy (see the note at the top).
+        self.global_pause = (os.getenv('WEB_TRUST_PROXY', '0') == '1') if global_pause is None else bool(global_pause)
+        # WEB_MAX_SESSIONS_PER_USER (5): live sessions one account may hold; a new login ends its oldest. 0 = no cap.
+        self.max_sessions = _env_int('WEB_MAX_SESSIONS_PER_USER', 5) if max_sessions is None else int(max_sessions)
         self.pending = {}    # sha256(pending token) -> {"user", "created", "tries"}: password right, code not yet
         # WEB_SESSION_HOURS (12) from login; WEB_IDLE_MINUTES (60) without a request; the page logs out by itself
         # at the same idle limit. WEB_TEMP_PASSWORD_HOURS (72): a one-time password not used by then stops working.
@@ -306,7 +315,8 @@ class Auth:
         count, _, last = self.failures.get(username, (0, 0, 0))
         count = 0 if now - last > 3600 else count
         count += 1
-        self.recent.append(now)
+        if self.global_pause:
+            self.recent.append(now)
         lock = min(LOCK_MAX, LOCK_BASE * 2 ** (count - LOCK_AFTER)) if count >= LOCK_AFTER else 0
         self.failures[username] = (count, now + lock, now)
         self._save_failures()
@@ -314,7 +324,7 @@ class Auth:
     def _check_lock(self, username, now):
         with self.lock:
             self.recent = [t for t in self.recent if now - t < GLOBAL_WINDOW]
-            if len(self.recent) >= GLOBAL_FAILURES:
+            if self.global_pause and len(self.recent) >= GLOBAL_FAILURES:
                 raise LoginRefused('Hệ thống tạm ngừng nhận đăng nhập 1 phút vì có nhiều lần nhập sai.', 'login_paused')
             _, until, _ = self.failures.get(username, (0, 0, 0))
         if until > now:
@@ -397,6 +407,12 @@ class Auth:
         info = public_user(username, user)
         token = secrets.token_urlsafe(32)
         with self.lock:
+            self._prune_sessions(now)
+            if self.max_sessions > 0:  # a 6th login of one account ends its least recently USED session: the tab
+                # a doctor works in is often the first one opened, while reloads and new tabs leave idle sessions
+                own = sorted((s['seen'], s['created'], k) for k, s in self.sessions.items() if s['user'] == username)
+                for *_, k in own[:max(0, len(own) - self.max_sessions + 1)]:
+                    del self.sessions[k]
             self.sessions[self._key(token)] = {'user': username, 'name': info['name'], 'role': info['role'],
                                                'must_change': info['must_change'], 'created': now, 'seen': now,
                                                'mfa': mfa, 'totp': info['totp']}
@@ -409,6 +425,15 @@ class Auth:
         except (StoreError, OSError):  # a read-only or broken file must not block a valid login
             pass
         return token, {k: info[k] for k in ('username', 'name', 'role', 'must_change')}
+
+    def _expired(self, s, now):
+        return now - s['created'] > self.session_seconds or now - s['seen'] > self.idle_seconds
+
+    def _prune_sessions(self, now):
+        """Drop sessions past the idle or absolute limit; call with self.lock held. Without this a session nobody
+        uses again would stay in memory until the restart."""
+        for k in [k for k, s in self.sessions.items() if self._expired(s, now)]:
+            del self.sessions[k]
 
     def needs_2fa(self, s):
         """An admin session without a verified second factor (WEB_ADMIN_2FA_REQUIRED)."""
@@ -521,7 +546,7 @@ class Auth:
             s = self.sessions.get(key)
             if not s:
                 return None
-            if now - s['created'] > self.session_seconds or now - s['seen'] > self.idle_seconds:
+            if self._expired(s, now):
                 del self.sessions[key]
                 return None
         user = self.store.get(s['user'])
@@ -568,8 +593,8 @@ class Auth:
     def list_sessions(self):
         now = time.time()
         with self.lock:
-            live = [s for s in self.sessions.values()
-                    if now - s['created'] <= self.session_seconds and now - s['seen'] <= self.idle_seconds]
+            self._prune_sessions(now)
+            live = list(self.sessions.values())
         return sorted(({'username': s['user'], 'name': s['name'], 'role': s['role'],
                         'since': time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created'])),
                         'idle_minutes': int((now - s['seen']) // 60)} for s in live), key=lambda s: s['idle_minutes'])

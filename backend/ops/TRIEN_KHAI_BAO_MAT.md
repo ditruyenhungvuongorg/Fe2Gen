@@ -110,10 +110,16 @@ Giữ `WEB_ACCESS_TOKEN` tạm thời đến bước 7: nếu phải quay lui v�
 `WEB_REQUIRE_ACCOUNTS=1`, mã chung không còn mở được API khi đã có tài khoản.
 
 `WEB_TRUST_PROXY` để `0` (mặc định, không cần ghi). Qua Tailscale Funnel mọi kết nối tới dịch vụ đều đến từ
-`127.0.0.1`, và chưa xác nhận được Funnel có gửi `X-Forwarded-For` đáng tin hay không. Hệ quả: giới hạn số lần
-đăng nhập sai "theo nguồn" (`WEB_RATE_LOGIN`, 10/phút) là **chung cho mọi người** dùng Funnel, không theo từng máy.
-Khóa theo tên đăng nhập vẫn riêng từng tài khoản. Chỉ đặt `WEB_TRUST_PROXY=1` khi đã đặt một proxy cục bộ (Caddy,
-nginx) trước dịch vụ và proxy đó tự ghi `X-Forwarded-For`.
+`127.0.0.1`, và chưa xác nhận được Funnel có gửi `X-Forwarded-For` đáng tin hay không. Một giới hạn "theo nguồn"
+khi đó là **một thùng chung cho cả Internet**: trước 30/10/2026, khoảng 10 lần nhập sai/phút từ bất kỳ ai là đủ để
+mọi người dùng (cả admin) nhận 429, và hơn 30 lần sai/phút trên mọi tên đăng nhập làm tạm ngừng toàn bộ đăng nhập.
+Từ 30/10/2026, khi `WEB_TRUST_PROXY=0` **cả hai đều tắt**: chỉ còn giới hạn theo tên đăng nhập (`WEB_RATE_LOGIN`
+lần sai/phút cho mỗi tên) và khóa theo tên đăng nhập (từ lần sai thứ 5, tối đa `WEB_LOCK_MAX_SECONDS`).
+Đánh đổi: người dò mật khẩu bằng nhiều tên khác nhau không còn bị một phanh chung chặn lại (mỗi tên vẫn chỉ thử được
+vài lần/phút trước khi bị khóa), đổi lại kẻ lạ không thể khóa cả hệ thống. Mật khẩu ≥ 10 ký tự, danh sách mật khẩu
+quá dễ bị chặn và 2FA cho admin là lớp bảo vệ chính trước dò mật khẩu. Chỉ đặt `WEB_TRUST_PROXY=1` khi đã đặt một
+proxy cục bộ (Caddy, nginx) trước dịch vụ và proxy đó tự ghi `X-Forwarded-For`: khi đó giới hạn theo nguồn
+(`WEB_RATE_LOGIN`/phút mỗi địa chỉ) và lệnh tạm ngừng chung (30 lần sai/phút) hoạt động lại như trước.
 
 Kiểm tra: `grep -E '^(WEB_REQUIRE_ACCOUNTS|WEB_HSTS|MODEL1_STATE_FILE)=' "$ENV"` in đủ 3 dòng;
 `stat -c %a "$ENV"` là `600`. Bảng biến môi trường đầy đủ ở cuối tài liệu.
@@ -280,7 +286,7 @@ nếu không giữ.
 bash "$NEW/backend/gpu.sh" status                        # cờ tạm dừng, Web: online, Model 1 từ file trạng thái
 systemd-analyze security --user prenatal-web | tail -1   # điểm phơi nhiễm, càng thấp càng tốt
 journalctl --user -u prenatal-web -n 50 --no-pager | grep -E '\[audit\]|Model 1|Error' | tail -20
-cd "$NEW/backend" && python3 audit.py verify "$DEP/audit.jsonl"     # chuỗi băm của nhật ký
+cd "$NEW/backend" && python3 audit.py verify "$DEP/audit.jsonl"     # chuỗi băm: file đang ghi và mọi .1 .2 ... cạnh nó
 ls -l "$DEP"                                             # users.json, web.env, login_failures.json, access.log: 600
 ```
 
@@ -321,11 +327,12 @@ Tên và mặc định lấy từ code (`grep getenv|env_flag|env_int|_env_float
 | `WEB_HSTS` | `1` | Gửi `Strict-Transport-Security`; `0` tắt (chạy http thuần). |
 | `WEB_ACCESS_LOG` | `~/prenatal_pubcasefinder/.deployment/access.log` | Access log JSON (không query, body, token), xoay ở 20 MB, giữ 3 file. Rỗng, `0` hoặc `off` = tắt. |
 | `WEB_AUDIT_FILE` | `~/prenatal_pubcasefinder/.deployment/audit.jsonl` | Nhật ký audit có chuỗi băm (`python audit.py verify`). |
+| `WEB_AUDIT_KEEP` | `10` | Số file audit đã xoay được giữ (mỗi file 5 MB): `audit.jsonl.1` mới nhất … `.N` cũ nhất, dồn lên mỗi lần xoay. `python audit.py verify` kiểm cả bộ theo thứ tự. Tối thiểu 1. |
 | `WEB_AUDIT_STDERR` | `1` | Chép từng dòng audit ra stderr (journald giữ bản thứ hai). `0` tắt. |
-| `WEB_RATE_HPO_SEARCH` | `60` | Số yêu cầu/phút mỗi phiên cho `/api/hpo_search`; vượt → 429 + `Retry-After`. `0` tắt. |
+| `WEB_RATE_HPO_SEARCH` | `60` | Số yêu cầu/phút mỗi tài khoản (từ 30/10/2026; trước đó mỗi phiên) cho `/api/hpo_search`; vượt → 429 + `Retry-After`. `0` tắt. Các giới hạn `WEB_RATE_*` dưới đây ghi "mỗi phiên" cũng tính theo tài khoản: đăng nhập thêm phiên không được thêm lượt. |
 | `WEB_RATE_MATCH` | `10` | Như trên, `/api/match_diseases`. |
 | `WEB_RATE_EXTRACT` | `10` | Như trên, `/api/extract_hpo`. |
-| `WEB_RATE_LOGIN` | `10` | Lần đăng nhập SAI/phút theo nguồn kết nối và, riêng, theo tên đăng nhập (đăng nhập đúng không tính). |
+| `WEB_RATE_LOGIN` | `10` | Lần đăng nhập SAI/phút theo tên đăng nhập và, chỉ khi `WEB_TRUST_PROXY=1`, theo nguồn kết nối (đăng nhập đúng không tính). |
 | `WEB_RATE_ADMIN` | `60` | Yêu cầu/phút mỗi phiên cho `/api/admin/*`. |
 | `WEB_RATE_CORRECTIONS` | `20` | Yêu cầu/phút mỗi phiên cho `/api/corrections` (góp ý sửa mã của bác sĩ). |
 | `WEB_RATE_BUG_REPORT` | `5` | Yêu cầu/phút mỗi phiên cho `/api/bug_reports` (báo lỗi kèm ảnh). |
@@ -337,15 +344,20 @@ Tên và mặc định lấy từ code (`grep getenv|env_flag|env_int|_env_float
 | `WEB_DISEASE_FEEDBACK_FILE` | `~/prenatal_pubcasefinder/.deployment/disease_feedback.json` | Bệnh đúng của ca (chờ xem / đã xem): ảnh chụp ca (HPO, gene, bệnh AI gợi ý, bệnh đúng) để huấn luyện lại Model 2; quyền 600, ghi nguyên tử. Nội dung lâm sàng: nằm trong sao lưu mã hóa. |
 | `WEB_BUG_REPORTS_PER_USER` | `20` | Số báo lỗi *chưa xử lý* tối đa mỗi tài khoản; vượt → 422 "Bác sĩ đã có N báo lỗi chưa xử lý…" cho đến khi quản trị đánh dấu đã xử lý hoặc xóa. `0` tắt. |
 | `WEB_BUG_REPORTS_MAX_MB` | `500` | Tổng dung lượng ảnh (MB, tính theo `index.json`) thư mục báo lỗi được giữ; vượt → 422 "Kho báo lỗi đã đầy…" cho đến khi quản trị xóa bớt. `0` tắt. |
+| `WEB_CORRECTIONS_PER_USER` | `50` | Số góp ý sửa mã *chờ duyệt* tối đa mỗi tài khoản; vượt → 422 "Bác sĩ đã có N góp ý chờ duyệt…" cho đến khi quản trị duyệt/từ chối. Gửi lại đúng góp ý đang chờ không bị chặn. `0` tắt. |
+| `WEB_CORRECTIONS_MAX_MB` | `20` | Dung lượng tối đa (MB, ước theo nội dung JSON) của `corrections.json`; vượt → 422 "Kho góp ý đã đầy; nhờ quản trị dọn bớt." `0` tắt. |
 | `WEB_DISEASE_FEEDBACK_PER_USER` | `50` | Số ghi nhận bệnh đúng *chưa xem* tối đa mỗi tài khoản; vượt → 422 "Bác sĩ đã có N ghi nhận chưa xem…" cho đến khi quản trị đánh dấu đã xem hoặc xóa. `0` tắt. |
 | `WEB_DISEASE_FEEDBACK_MAX_MB` | `50` | Dung lượng tối đa (MB, ước theo nội dung JSON) của `disease_feedback.json`; vượt → 422 "Kho ghi nhận bệnh đúng đã đầy…" cho đến khi quản trị xóa bớt. `0` tắt. |
 | `WEB_QUEUE_MAX` | `5` | Số yêu cầu tối đa chờ hàng đợi GPU/CPU (1 chạy); người tiếp theo nhận 503 ngay. |
 | `WEB_MAX_CONNECTIONS` | `64` | Số kết nối đồng thời; quá → 503 ngắn và đóng. |
 | `WEB_HEADER_TIMEOUT` | `15` | Giây tối đa để nhận dòng yêu cầu + header (chống slowloris). |
-| `WEB_TRUST_PROXY` | `0` | `1`: lấy nguồn từ mục cuối `X-Forwarded-For` (chỉ khi có proxy cục bộ tự ghi header đó). Xem bước 3. |
+| `WEB_BODY_TIMEOUT` | `20` | Giây tối đa (tổng, không phải mỗi lần đọc) để nhận hết body JSON của một yêu cầu POST, kể cả `/api/login`; quá → cắt kết nối, không trả lời. Chống gửi body nhỏ giọt giữ hết 64 kết nối. |
+| `WEB_UPLOAD_TIMEOUT` | `120` | Như trên, riêng `/api/bug_reports` (ảnh, tới `WEB_MAX_UPLOAD_BYTES`). Mạng rất chậm gửi 3 ảnh lớn có thể bị cắt: tăng nếu bác sĩ báo không gửi được báo lỗi kèm ảnh. |
+| `WEB_TRUST_PROXY` | `0` | `1`: lấy nguồn từ mục cuối `X-Forwarded-For` (chỉ khi có proxy cục bộ tự ghi header đó) và bật giới hạn đăng nhập theo nguồn + tạm ngừng đăng nhập khi >30 lần sai/phút. `0` (Funnel): cả hai tắt. Xem bước 3. |
 | `WEB_LOCK_MAX_SECONDS` | `300` | Thời gian khóa tối đa của một tài khoản sau nhiều lần sai mật khẩu. |
 | `WEB_IDLE_MINUTES` | `60` | Phiên hết hạn sau từng ấy phút không yêu cầu; trang tự đăng xuất và xóa ca ở cùng ngưỡng (cảnh báo 60 giây trước). |
 | `WEB_SESSION_HOURS` | `12` | Thời gian sống tối đa của một phiên kể từ khi đăng nhập. |
+| `WEB_MAX_SESSIONS_PER_USER` | `5` | Số phiên đăng nhập cùng lúc tối đa của một tài khoản; đăng nhập lần thứ 6 đóng phiên cũ nhất của tài khoản đó (máy/tab đó phải đăng nhập lại). `0` tắt. Phiên hết hạn được dọn khỏi bộ nhớ ở mỗi lần đăng nhập và khi mở trang *Phiên*. |
 | `WEB_TEMP_PASSWORD_HOURS` | `72` | Mật khẩu tạm do admin cấp hết hạn sau từng ấy giờ nếu chưa đổi. |
 | `WEB_LOGIN_FAILURES_FILE` | `login_failures.json` cạnh `users.json` | Khóa đăng nhập giữ qua restart (600). |
 | `MODEL1_STATE_FILE` | `~/prenatal_pubcasefinder/.deployment/model1_state.json` | Trạng thái Model 1 cho `gpu.sh status` (600). Đặt rỗng để tắt. |
@@ -366,4 +378,5 @@ Giữ nguyên từ trước: `WEB_USERS_FILE`, `WEB_ALLOWED_ORIGINS`, `PORT`, `M
 - Chưa có mã QR trên trang: người dùng nhập khóa hoặc liên kết `otpauth://` bằng tay.
 - Unit `--user` có thể phải chạy mức `basic` trên Ubuntu 24.04; muốn đủ hardening (DeviceAllow, Protect*) thì chuyển
   sang unit hệ thống với user riêng (`backend/ops/separate_user.md`).
-- Qua Funnel, giới hạn đăng nhập theo nguồn là chung cho mọi người (bước 3).
+- Qua Funnel (`WEB_TRUST_PROXY=0`) không có giới hạn đăng nhập theo nguồn và không có lệnh tạm ngừng chung khi bị
+  dò mật khẩu trên nhiều tên; chỉ có giới hạn và khóa theo từng tên đăng nhập (bước 3).

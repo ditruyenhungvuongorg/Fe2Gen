@@ -42,14 +42,18 @@ def phrase_key(text):
     """Exact phrase match ignoring case and spacing but keeping diacritics ("mắt to" and "mặt to" differ)."""
     return ' '.join(unicodedata.normalize('NFC', text).casefold().split())
 
-# Names doctors use that the HPOA catalog does not: eponyms and Vietnamese forms (keys are normalize_text output).
+# Names doctors use that the HPOA catalog does not: eponyms and Vietnamese forms. Keys and values both go through
+# normalize_text below, because the query and the catalog names do ('-' and '.' become spaces: 'prader-willi' would
+# never match the key 'prader willi syndrome'). A Vietnamese term that is a group of diseases ('loạn sản xương',
+# skeletal dysplasia in general) is not an alias of one of them. test_web checks that every alias finds something.
 DISEASE_ALIASES = {'edwards': 'trisomy 18', 'edward': 'trisomy 18', 'patau': 'trisomy 13', 'digeorge': '22q11.2 deletion',
-                   'di george': '22q11.2 deletion', 'tam nhiem sac the 21': 'trisomy 21', 'tam nhiem sac the 18': 'trisomy 18',
+                   'di george': '22q11.2 deletion', 'tam nhiem sac the 21': 'down syndrome', 'tam nhiem sac the 18': 'trisomy 18',
                    'tam nhiem sac the 13': 'trisomy 13', 'tam boi': 'triploidy', 'cri du chat': 'cri-du-chat', 'meo keu': 'cri-du-chat',
                    'wolf hirschhorn': 'wolf-hirschhorn', 'prader willi': 'prader-willi', 'beckwith wiedemann': 'beckwith-wiedemann',
                    'smith lemli opitz': 'smith-lemli-opitz', 'cornelia de lange': 'cornelia de lange', 'thalassemia': 'thalassemia',
-                   'tan mau bam sinh': 'thalassemia', 'loan san xuong': 'achondroplasia', 'thoat vi hoanh': 'congenital diaphragmatic hernia',
-                   'tim bam sinh': 'congenital heart'}
+                   'tan mau bam sinh': 'thalassemia', 'loan san sun': 'achondroplasia', 'thoat vi hoanh': 'congenital diaphragmatic hernia',
+                   'tim bam sinh': 'congenital heart defects'}  # not 'congenital heart': that put "Congenital heart block" first
+DISEASE_ALIASES = {normalize_text(k): normalize_text(v) for k, v in DISEASE_ALIASES.items()}
 
 
 class WebSystem(Fe2genSystem):

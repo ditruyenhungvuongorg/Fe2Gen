@@ -104,6 +104,10 @@ class Fe2genSystem:
                 if len(parts) >= 4 and parts[0] != "ncbi_gene_id":
                     gene = parts[1].strip().upper()
                     dis_id = parts[3].strip()
+                    # A few rows have no gene symbol ('-', e.g. OMIM:176270): not a gene, so no gene pill and no
+                    # line on the lab sheet.
+                    if gene in ("", "-") or not dis_id:
+                        continue
                     if gene not in self.disease_to_genes[dis_id]:
                         self.disease_to_genes[dis_id].append(gene)
         print(f"[Model 3] Đã ánh xạ {len(self.disease_to_genes):,} bệnh với các gen gây bệnh tương ứng.")

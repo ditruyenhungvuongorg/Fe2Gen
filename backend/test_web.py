@@ -55,6 +55,33 @@ class WebTests(unittest.TestCase):
         self.assertIn('ORPHA:3380', [f['disease_id'] for f in s.search_diseases('Edwards')[:3]])
         self.assertEqual(s.search_diseases('hội chứng Down')[0]['disease_name'], 'Down syndrome')
         self.assertTrue(any('trisomy 13' in f['disease_name'].lower() for f in s.search_diseases('Patau')[:3]))
+        # Every alias finds something: keys and values go through normalize_text like the query and the names.
+        from web_service import DISEASE_ALIASES
+        for alias in DISEASE_ALIASES:
+            self.assertTrue(s.search_diseases(alias), alias)
+        for typed in ('Prader Willi', 'Prader-Willi', 'Wolf Hirschhorn', 'Beckwith Wiedemann', 'Smith-Lemli-Opitz',
+                      'cri du chat', 'hội chứng mèo kêu', 'DiGeorge', 'di george', 'tam nhiễm sắc thể 21', 'tim bẩm sinh'):
+            self.assertTrue(s.search_diseases(typed), typed)
+        top3 = lambda q: [f['disease_id'] for f in s.search_diseases(q)[:3]]
+        self.assertTrue({'OMIM:176270', 'ORPHA:739'} & set(top3('Prader-Willi')), top3('Prader-Willi'))
+        self.assertTrue({'OMIM:176270', 'ORPHA:739'} & set(top3('hội chứng Prader Willi')))
+        for name in ('DiGeorge', 'di george'):
+            names = [f['disease_name'].lower() for f in s.search_diseases(name)[:3]]
+            self.assertTrue(any('22q11' in n and 'deletion' in n for n in names), names)
+        self.assertEqual(s.search_diseases('loạn sản sụn')[0]['disease_name'], 'Achondroplasia')
+        bone = s.search_diseases('loạn sản xương')  # skeletal dysplasia in general is not achondroplasia
+        self.assertFalse(bone and 'achondroplasia' in bone[0]['disease_name'].lower(), bone[:1])
+        heart = s.search_diseases('tim bẩm sinh')
+        self.assertTrue(heart[0]['disease_name'].lower().startswith('congenital heart defects'), heart[:1])
+        self.assertNotIn('block', heart[0]['disease_name'].lower())
+        self.assertEqual(s.search_diseases('tam nhiễm sắc thể 21')[0]['disease_name'], 'Down syndrome')
+
+    @needs_data
+    def test_no_placeholder_gene_symbols(self):
+        # genes_to_disease.txt has rows whose gene symbol is '-' (e.g. OMIM:176270): not a gene pill, not on the lab sheet.
+        bad = {(d, g) for d, genes in self.system.disease_to_genes.items() for g in genes if not g.strip() or g.strip() == '-'}
+        self.assertEqual(bad, set())
+        self.assertNotIn('-', self.system.disease_to_genes.get('OMIM:176270', []))
 
     @needs_data
     def test_input_validation(self):

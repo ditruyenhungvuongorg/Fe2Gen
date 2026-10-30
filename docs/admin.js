@@ -22,7 +22,8 @@
     r.onload = () => resolve(String(r.result || '')); r.onerror = () => reject(Error('Không đọc được ảnh.'));
     r.readAsDataURL(blob);
   });
-  let tab = 'users', temp = null;
+  // gen changes on sign-out/sign-in: a view still loading for the previous admin must not draw into the page.
+  let tab = 'users', temp = null, gen = 0;
 
   function el(tag, props = {}, ...children) {
     const node = document.createElement(tag);
@@ -38,8 +39,9 @@
   }
   async function act(run, done) {
     status('');
-    try { const data = await run(); if (done) status(done(data)); await show(tab, true); }
-    catch (e) { status(e.message, true); }
+    const g = gen;
+    try { const data = await run(); if (g !== gen) return; if (done) status(done(data)); await show(tab, true); }
+    catch (e) { if (g === gen) status(e.message, true); }
   }
   // locked_until: epoch seconds or ms, or a date string; returns false, true (time unknown) or the local time.
   function lockUntil(value) {
@@ -52,10 +54,10 @@
     tab = name;
     for (const b of document.querySelectorAll('#admin [data-tab]')) b.setAttribute('aria-selected', String(b.dataset.tab === name));
     if (!keepStatus) status('');
-    const body = $('admin-body');
+    const body = $('admin-body'), g = gen;
     if (!body.children.length) body.append(el('p', {class:'hint'}, 'Đang tải…'));
-    try { body.replaceChildren(await VIEWS[name]()); }
-    catch (e) { body.replaceChildren(); status(e.message, true); }
+    try { const view = await VIEWS[name](); if (g === gen) body.replaceChildren(view); }
+    catch (e) { if (g === gen) { body.replaceChildren(); status(e.message, true); } }
   }
 
   const VIEWS = {
@@ -323,6 +325,14 @@
     },
   };
 
+  // Sign-out, ended session, idle logout, sign-in: the next admin on a shared computer must not see the last
+  // one-time temporary password, bug reports or case HPOs of the previous one; filters go back to their defaults.
+  window.resetAdmin = () => {
+    gen++; temp = null; tab = 'users';
+    for (const k of ['auditFilter', 'correctionsFilter', 'bugsFilter', 'diseasesFilter']) delete VIEWS[k];
+    $('admin-body').replaceChildren(); status('');
+    for (const b of document.querySelectorAll('#admin [data-tab]')) b.setAttribute('aria-selected', String(b.dataset.tab === 'users'));
+  };
   window.openAdmin = () => { if (!$('admin').open) $('admin').showModal(); show(tab); };
   $('admin-close').onclick = () => $('admin').close();
   for (const b of document.querySelectorAll('#admin [data-tab]')) b.onclick = () => show(b.dataset.tab);

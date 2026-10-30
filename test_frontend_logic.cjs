@@ -35,6 +35,14 @@ test('idle: a long request pauses the countdown; activity restarts it', () => {
   assert.equal(F.idleState({now: t0 + 2 * 3600e3, lastActivity: t0, idleMinutes: 60, busy: true}).phase, 'active');
   assert.equal(F.idleState({now: t0 + 61 * 60e3, lastActivity: t0 + 60 * 60e3, idleMinutes: 60}).phase, 'active');
 });
+test('kept case: only the same account (and role) gets back the case of an ended session', () => {
+  const bsb = {username: 'bsb', role: 'doctor'};
+  assert.equal(F.keepsCase(bsb, {username: 'bsb', role: 'doctor', name: 'B'}), true);
+  assert.equal(F.keepsCase(bsb, {username: 'bsa', role: 'doctor'}), false, 'another doctor');
+  assert.equal(F.keepsCase(bsb, {username: 'bsb', role: 'lab'}), false, 'role changed meanwhile');
+  for (const owner of [null, undefined, {}, {username: '', role: 'doctor'}]) assert.equal(F.keepsCase(owner, bsb), false, 'unknown owner');
+  assert.equal(F.keepsCase(bsb, null), false);
+});
 test('idle: missing or invalid idle_minutes falls back to 60; tiny limits still warn', () => {
   for (const v of [undefined, null, 0, -5, 'abc']) assert.equal(F.idleMinutesOf(v), 60);
   assert.equal(F.idleMinutesOf('15'), 15);

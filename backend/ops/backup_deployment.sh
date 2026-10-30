@@ -160,7 +160,8 @@ Nothing live was changed. To put the files back (stop first so the service does 
   chmod 700 "$SRC"/bug_reports 2>/dev/null; chmod 600 "$SRC"/bug_reports/* 2>/dev/null || true
   systemctl --user start prenatal-web
 Check: python3 manage_users.py list   (from the backend folder);  bash gpu.sh status
-       python3 audit.py verify "$SRC/audit.jsonl"   (if this release has audit.py verify)
+       python3 audit.py verify "$SRC/audit.jsonl"   (if this release has audit.py verify; since 30/10/2026 it also
+                                                    checks every rotated audit.jsonl.N beside it, oldest first)
 Undo: stop the service, copy the files back from "$SRC/before-restore-\$STAMP", start it.
 Delete $target when done: it holds the decrypted accounts.
 EOF
