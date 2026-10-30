@@ -28,7 +28,11 @@ STATIC_FILES = ('/', '/index.html', '/styles.css', '/app.js', '/admin.js', '/con
                 '/fonts/BeVietnamPro-Regular.ttf', '/fonts/BeVietnamPro-SemiBold.ttf', '/fonts/OFL.txt',
                 '/fonts/Inter-vietnamese.woff2', '/fonts/Inter-latin-ext.woff2', '/fonts/Inter-latin.woff2', '/fonts/OFL-Inter.txt')
 SYSTEM = WebSystem()
-AUTH = Auth()
+# Behind Tailscale Funnel every connection comes from 127.0.0.1. Only with WEB_TRUST_PROXY=1 is the last
+# X-Forwarded-For entry (the one the local proxy appended) used as the source; never trust it otherwise.
+TRUST_PROXY = os.getenv('WEB_TRUST_PROXY', '0') == '1'
+# The all-usernames spraying pause in Auth follows TRUST_PROXY, like the per-source login budget (see login()).
+AUTH = Auth(global_pause=TRUST_PROXY)
 AUDIT = AuditLog()
 ACCESS = AccessLog()
 CORRECTIONS = CorrectionStore()   # doctors' "Góp ý sửa mã"; approved ones feed SYSTEM.apply_corrections
@@ -40,8 +44,9 @@ UPLOAD_BYTES = env_int('WEB_MAX_UPLOAD_BYTES', 8000000)
 QUEUE_SECONDS = 90
 # One request at a time on the GPU/CPU; at most WEB_QUEUE_MAX more wait (up to QUEUE_SECONDS), the next gets 503.
 WORK = WorkQueue(env_int('WEB_QUEUE_MAX', 5))
-# Requests per minute (token bucket, burst = one minute's worth); 0 turns a limit off. Keys: the session token's
-# hash; for login the connection source and, separately, the username.
+# Requests per minute (token bucket, burst = one minute's worth); 0 turns a limit off. Keys: the signed-in
+# account ('user:' + username, so ten logins of one account share one budget; the token's hash only without a
+# personal session); for login the username and, only with WEB_TRUST_PROXY=1, the connection source as well.
 RATES = {'hpo_search': RateLimiter(env_int('WEB_RATE_HPO_SEARCH', 60)),
          'match_diseases': RateLimiter(env_int('WEB_RATE_MATCH', 10)),
          'extract_hpo': RateLimiter(env_int('WEB_RATE_EXTRACT', 10)),
@@ -52,12 +57,16 @@ RATES = {'hpo_search': RateLimiter(env_int('WEB_RATE_HPO_SEARCH', 60)),
          'bug_report': RateLimiter(env_int('WEB_RATE_BUG_REPORT', 5)),
          'disease_search': RateLimiter(env_int('WEB_RATE_DISEASE_SEARCH', 60)),
          'disease_feedback': RateLimiter(env_int('WEB_RATE_DISEASE_FEEDBACK', 20))}
-# Behind Tailscale Funnel every connection comes from 127.0.0.1. Only with WEB_TRUST_PROXY=1 is the last
-# X-Forwarded-For entry (the one the local proxy appended) used as the source; never trust it otherwise.
-TRUST_PROXY = os.getenv('WEB_TRUST_PROXY', '0') == '1'
 MAX_CONNECTIONS = env_int('WEB_MAX_CONNECTIONS', 64)
 HEADER_SECONDS = env_int('WEB_HEADER_TIMEOUT', 15)   # whole request line + headers, against slowloris
-REQUEST_SECONDS = 180                                 # each socket read/write once the headers are in
+# The whole request body, in total (the per-read REQUEST_SECONDS restarts with every byte, so a client sending one
+# byte a minute would otherwise hold a connection slot for ever): WEB_BODY_TIMEOUT for the JSON routes,
+# WEB_UPLOAD_TIMEOUT for /api/bug_reports (screenshots, up to WEB_MAX_UPLOAD_BYTES). Then the connection is cut.
+BODY_SECONDS = env_int('WEB_BODY_TIMEOUT', 20)
+UPLOAD_SECONDS = env_int('WEB_UPLOAD_TIMEOUT', 120)
+# Each socket read/write once the headers are in. The response is written once, at the end (model work and the
+# GPU queue are not socket I/O), and HTTP/1.0 closes the connection after it, so nothing waits on the socket longer.
+REQUEST_SECONDS = 60
 # On logout Model 1 stays loaded while another doctor was active in the last 10 minutes; otherwise it is released.
 LOGOUT_GRACE_SECONDS = 600
 
@@ -91,11 +100,33 @@ class Handler(SimpleHTTPRequestHandler):
         self.connection.settimeout(HEADER_SECONDS)
 
     def header_deadline(self):
-        """The request line and headers did not arrive within HEADER_SECONDS (slowloris): drop the connection."""
+        """The request line and headers did not arrive within HEADER_SECONDS (slowloris), or the body within
+        BODY_SECONDS / UPLOAD_SECONDS (slow body): drop the connection."""
         try:
             self.connection.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+
+    def start_deadline(self, seconds):
+        """Arm a total deadline (a Timer, unlike the per-read socket timeout) that cuts the connection."""
+        self.deadline = Timer(seconds, self.header_deadline)
+        self.deadline.daemon = True
+        self.deadline.start()
+
+    def read_body(self, size, seconds):
+        """size bytes of body within seconds in total, or None (the connection is then closed without a reply:
+        it has been shut down, or the client went away)."""
+        self.start_deadline(seconds)
+        try:
+            body = self.rfile.read(size)
+        except OSError:  # socket timeout, reset
+            body = b''
+        finally:
+            self.deadline.cancel()
+        if len(body) < size:
+            self.close_connection = True
+            return None
+        return body
 
     def parse_request(self):
         ok = super().parse_request()  # reads the request line and headers
@@ -110,9 +141,7 @@ class Handler(SimpleHTTPRequestHandler):
     def handle_one_request(self):
         self.session, self.status_sent, self.bytes_sent, started = None, None, 0, time.monotonic()
         self.connection.settimeout(HEADER_SECONDS)
-        self.deadline = Timer(HEADER_SECONDS, self.header_deadline)
-        self.deadline.daemon = True
-        self.deadline.start()
+        self.start_deadline(HEADER_SECONDS)
         try:
             super().handle_one_request()
         finally:
@@ -228,6 +257,9 @@ class Handler(SimpleHTTPRequestHandler):
         return self.client_address[0]
 
     def rate_key(self):
+        """The budget key of a signed-in request: the account, so opening more sessions buys no more requests."""
+        if self.session:
+            return 'user:' + self.session['user']
         token = self.token()
         return 'session:' + hashlib.sha256(token.encode()).hexdigest() if token else 'source:' + self.source()
 
@@ -243,16 +275,20 @@ class Handler(SimpleHTTPRequestHandler):
                        {'Retry-After': str(wait)})
         return True
 
-    def read_json(self, limit=100000):
-        """The request body as a dict, or None after an error reply."""
+    def read_json(self, limit=100000, seconds=None):
+        """The request body as a dict, or None after an error reply (or a cut connection: see read_body).
+        seconds: total time allowed for the body (default BODY_SECONDS)."""
         try:
             size = int(self.headers.get('Content-Length', '0'))
             if not 0 < size <= limit:
                 self.send_json({'error': 'Yêu cầu quá lớn hoặc rỗng.'}, 413)
                 return None
+            body = self.read_body(size, BODY_SECONDS if seconds is None else seconds)
+            if body is None:
+                return None
             # NaN/Infinity are not JSON: json.loads accepts them by default and they would be stored and emitted
             # as invalid JSON, so they take the same 400 as any other malformed body.
-            payload = json.loads(self.rfile.read(size).decode(), parse_constant=_reject_json_constant)
+            payload = json.loads(body.decode(), parse_constant=_reject_json_constant)
             if not isinstance(payload, dict):
                 raise ValueError()
             return payload
@@ -333,6 +369,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_error(404)
         super().do_GET()
 
+    def do_HEAD(self):
+        """Headers only, for the same STATIC_FILES as GET: anything else under docs/ (and every /api/ path) is 404."""
+        if urlparse(self.path).path not in STATIC_FILES:
+            return self.send_error(404)
+        super().do_HEAD()
+
     def do_POST(self):
         path = urlparse(self.path).path
         if self.locked():
@@ -351,7 +393,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == '/api/bug_reports':  # the one route that may carry screenshots (UPLOAD_BYTES)
             if self.limited('bug_report'):  # before the body is read: HTTP/1.0, the unread upload is just dropped
                 return
-            payload = self.read_json(limit=UPLOAD_BYTES)
+            payload = self.read_json(limit=UPLOAD_BYTES, seconds=UPLOAD_SECONDS)
             if payload is not None:
                 self.bug_report(payload)
             return
@@ -431,8 +473,12 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             name = str(payload.get('username') or '').strip().lower()
         who = name if USERNAME.match(name) else '(tên không hợp lệ)'
-        source_key, user_key = 'source:' + self.source(), 'user:' + name[:64]
-        if self.limited('login', source_key, who) or self.limited('login_user', user_key, who):
+        # Per-source budget only with a trusted proxy. Without one (Tailscale Funnel) every request comes from
+        # 127.0.0.1, so one shared bucket: ~10 wrong passwords a minute from anyone on the Internet would answer
+        # 429 to every user, admins included. Then only the per-username budget and lock apply: a guesser can try
+        # many usernames, but cannot lock real users out. Same trade-off as Auth.global_pause.
+        source_key, user_key = ('source:' + self.source() if TRUST_PROXY else None), 'user:' + name[:64]
+        if (source_key and self.limited('login', source_key, who)) or self.limited('login_user', user_key, who):
             return
         backup = False
         try:
@@ -445,7 +491,8 @@ class Handler(SimpleHTTPRequestHandler):
             code = 401 if exc.event in ('login_fail', 'totp_fail', 'totp_expired') else 403 if exc.event == 'temp_password_expired' else 429
             # pending_invalid: the second step was cancelled (5 wrong codes) or expired; the page starts from the password
             return self.send_json({'error': str(exc), **({'pending_invalid': True} if exc.pending_invalid else {})}, code)
-        RATES['login'].give_back(source_key)  # only failed attempts use up the source's budget
+        if source_key:
+            RATES['login'].give_back(source_key)  # only failed attempts use up the source's budget
         RATES['login_user'].give_back(user_key)
         if token is None:  # password right; the code comes next
             return self.send_json(user)

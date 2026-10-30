@@ -264,12 +264,26 @@ class AuthTests(unittest.TestCase):
 
     def test_global_limit_stops_password_spraying(self):
         self.add()
-        a = Auth(self.store)
+        a = Auth(self.store, global_pause=True)  # only behind a trusted proxy (WEB_TRUST_PROXY=1)
         for i in range(30):
             with self.assertRaises(PermissionError):
                 a.login(f'user{i:02d}', 'mat-khau-1')
         with self.assertRaisesRegex(PermissionError, 'tạm ngừng'):
             a.login('bs.an', 'mat-khau-1')
+
+    def test_no_global_pause_without_a_trusted_proxy(self):
+        # Behind Funnel every failure comes from 127.0.0.1: a pause over all usernames would let anyone lock out
+        # every user, so it is off by default (WEB_TRUST_PROXY unset); the per-username lock still applies.
+        self.add()
+        with patch.dict(os.environ, {'WEB_TRUST_PROXY': '0'}):
+            a = Auth(self.store)
+        self.assertFalse(a.global_pause)
+        for i in range(40):
+            with self.assertRaises(PermissionError):
+                a.login(f'user{i:02d}', 'mat-khau-1')
+        self.assertEqual(a.login('bs.an', 'mat-khau-1')[1]['username'], 'bs.an')
+        with patch.dict(os.environ, {'WEB_TRUST_PROXY': '1'}):
+            self.assertTrue(Auth(self.store).global_pause)
 
     def test_admin_actions_and_last_admin(self):
         self.add('quan.tri')
@@ -694,7 +708,9 @@ class LimitTests(unittest.TestCase):
         self.assertEqual([(e['user'], e['group']) for e in limited], [('bs.an', 'hpo_search')])  # one line, not two
 
     def test_login_budget_per_source_counts_failures_only(self):
-        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(login=3)) as srv:
+        # Only with a trusted proxy (WEB_TRUST_PROXY=1): each client then has its own source address.
+        with LiveServer(AUTH=Auth(self.store, global_pause=True), AUDIT=self.audit, RATES=fresh_rates(login=3),
+                        TRUST_PROXY=True) as srv:
             for _ in range(5):
                 self.login(srv, 'bs.an')  # successful logins are refunded
             for name in ('khach1', 'khach2', 'khach3'):
@@ -702,6 +718,33 @@ class LimitTests(unittest.TestCase):
             code, data = srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})
             self.assertEqual(code, 429)
             self.assertIn('thử lại sau', data['error'])
+
+    def test_wrong_logins_from_one_source_do_not_lock_out_others_without_a_trusted_proxy(self):
+        # Production (Tailscale Funnel, WEB_TRUST_PROXY=0): every request comes from 127.0.0.1. 40 wrong passwords
+        # on random usernames must not stop a real user (an admin here) from logging in: no per-source bucket and no
+        # global pause; default budgets (10/min) as in production.
+        rates = fresh_rates(10)
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False, global_pause=False), AUDIT=self.audit, RATES=rates,
+                        TRUST_PROXY=False) as srv:
+            codes = {srv.call('/api/login', {'username': f'ke.la{i:02d}', 'password': 'sai-mat-khau'})[0] for i in range(40)}
+            self.assertEqual(codes, {401})
+            self.assertEqual(srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})[0], 200)
+            self.assertEqual(srv.call('/api/login', {'username': 'bs.an', 'password': 'mat-khau-bs.an'})[0], 200)
+            self.assertEqual(rates['login'].buckets, {})  # the per-source bucket was never used
+        # With a trusted proxy the old behaviour holds: the shared source runs out, then the spraying pause.
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False, global_pause=True), AUDIT=self.audit,
+                        RATES=fresh_rates(10), TRUST_PROXY=True) as srv:
+            codes = [srv.call('/api/login', {'username': f'ke.la{i:02d}', 'password': 'sai-mat-khau'})[0] for i in range(40)]
+            self.assertEqual(codes[:10], [401] * 10)
+            self.assertEqual(set(codes[10:]), {429})
+            self.assertEqual(srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})[0], 429)
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False, global_pause=True), AUDIT=self.audit,
+                        RATES=fresh_rates(1000), TRUST_PROXY=True) as srv:
+            for i in range(30):
+                srv.call('/api/login', {'username': f'ke.la{i:02d}', 'password': 'sai-mat-khau'})
+            code, data = srv.call('/api/login', {'username': 'quan.tri', 'password': 'mat-khau-quan.tri'})
+            self.assertEqual(code, 429)
+            self.assertIn('tạm ngừng', data['error'])
 
     def test_login_budget_per_username(self):
         with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit, RATES=fresh_rates(login_user=2)) as srv:
@@ -2135,6 +2178,237 @@ class DiseaseFeedbackTests(unittest.TestCase):
         page = Path(__file__).resolve().parent.parent / 'docs' / 'index.html'
         if page.exists():
             self.assertIn('id="case-id" maxlength="80"', page.read_text(encoding='utf-8'))
+
+
+def closed_within(sock, seconds, trickle=0.3):
+    """Send one byte every `trickle` seconds until the server closes sock; seconds it took, or None if it did not."""
+    import socket
+    started = time.monotonic()
+    while time.monotonic() - started < seconds:
+        try:
+            sock.sendall(b' ')
+            sock.settimeout(trickle)
+            if sock.recv(1) == b'':
+                return time.monotonic() - started
+        except socket.timeout:
+            continue
+        except OSError:
+            return time.monotonic() - started
+    return None
+
+
+class Fixes20261030Tests(unittest.TestCase):
+    """Audit 30/10/2026: slow bodies, sessions per account, per-account budgets, correction caps, audit rotation,
+    HEAD on the static allowlist."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = accounts(self.dir.name, **{'bs.an': 'doctor', 'bs.binh': 'doctor', 'quan.tri': 'admin'})
+        self.audit = AuditLog(Path(self.dir.name, 'audit.jsonl'))
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def login(self, srv, name):
+        code, data = srv.call('/api/login', {'username': name, 'password': 'mat-khau-' + name})
+        self.assertEqual(code, 200, data)
+        return data['token']
+
+    # ------------------------------------------------------------------ slow request body
+    def test_slow_body_is_cut_after_a_total_deadline(self):
+        import socket
+        import serve_web
+        system = types.SimpleNamespace(matcher=types.SimpleNamespace(profiles=[1]), canonical={}, runner=model(),
+                                       search_hpo=lambda q: [])
+        self.assertLessEqual(serve_web.REQUEST_SECONDS, 60)
+        with patch.object(serve_web, 'BODY_SECONDS', 1), patch.object(serve_web, 'UPLOAD_SECONDS', 30), \
+             patch.object(serve_web, 'AUTH', Auth(self.store)), patch.object(serve_web, 'SYSTEM', system), \
+             patch.object(serve_web, 'AUDIT', self.audit), patch.object(serve_web, 'RATES', fresh_rates()), \
+             patch.object(serve_web, 'ACCESS', AccessLog('off')), redirect_stderr(StringIO()):
+            server = serve_web.Server(('127.0.0.1', 0), serve_web.Handler, max_connections=1)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            port = server.server_address[1]
+            head = (b'POST %s HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n%s'
+                    b'Content-Length: 1000\r\n\r\n{"username"')
+            try:
+                # Without login: the headers and 10 bytes of a 1000-byte body, then one byte every 0.3 s. Each byte
+                # would restart a per-read timeout; the total deadline (1 s here) cuts the connection anyway.
+                with socket.create_connection(('127.0.0.1', port), timeout=10) as slow:
+                    slow.sendall(head % (b'/api/login', b''))
+                    took = closed_within(slow, 6)
+                self.assertIsNotNone(took, 'slow body was never cut')
+                self.assertLess(took, 4)
+                # its slot (max_connections=1) is free again, and a normal body is read as before. A slot is
+                # released just after the reply is sent, so wait for it before each next request.
+                def slot_free():
+                    deadline = time.monotonic() + 5
+                    while server.slots._value < 1 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual(server.slots._value, 1)
+                slot_free()
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/status', timeout=10) as r:
+                    self.assertEqual(r.status, 200)
+                slot_free()
+                req = urllib.request.Request(f'http://127.0.0.1:{port}/api/login', headers={'Content-Type': 'application/json'},
+                                             data=json.dumps({'username': 'bs.an', 'password': 'mat-khau-bs.an'}).encode())
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    token = json.loads(r.read())['token']
+                # /api/bug_reports has its own, longer deadline (UPLOAD_SECONDS): 1 s here, BODY_SECONDS 30
+                slot_free()
+                with patch.object(serve_web, 'BODY_SECONDS', 30), patch.object(serve_web, 'UPLOAD_SECONDS', 1):
+                    with socket.create_connection(('127.0.0.1', port), timeout=10) as slow:
+                        slow.sendall(head % (b'/api/bug_reports', b'Authorization: Bearer ' + token.encode() + b'\r\n'))
+                        took = closed_within(slow, 6)
+                self.assertIsNotNone(took, 'slow upload was never cut')
+                self.assertLess(took, 4)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    # ------------------------------------------------------------------ sessions per account
+    def test_sixth_session_of_an_account_ends_the_least_recently_used(self):
+        a = Auth(self.store, max_sessions=5)
+        tokens = [a.login('bs.an', 'mat-khau-bs.an')[0] for _ in range(5)]
+        other, _ = a.login('bs.binh', 'mat-khau-bs.binh')
+        for k, t in enumerate(tokens):
+            a.sessions[a._key(t)]['created'] -= 10 - k  # distinct, increasing login times
+            a.sessions[a._key(t)]['seen'] -= 10 - k
+        a.sessions[a._key(tokens[0])]['seen'] += 9.5   # the first tab is the one still in use
+        sixth, _ = a.login('bs.an', 'mat-khau-bs.an')
+        self.assertFalse(a.check('Bearer ' + tokens[1])[0])  # idle longest, not the oldest login
+        self.assertTrue(all(a.check('Bearer ' + t)[0] for t in [tokens[0]] + tokens[2:] + [sixth, other]))
+        self.assertEqual(sum(1 for s in a.sessions.values() if s['user'] == 'bs.an'), 5)
+        with patch.dict(os.environ, {'WEB_MAX_SESSIONS_PER_USER': '2'}):
+            self.assertEqual(Auth(self.store).max_sessions, 2)
+        with patch.dict(os.environ, {}):
+            os.environ.pop('WEB_MAX_SESSIONS_PER_USER', None)
+            self.assertEqual(Auth(self.store).max_sessions, 5)
+        unlimited = Auth(self.store, max_sessions=0)
+        for _ in range(8):
+            unlimited.login('bs.an', 'mat-khau-bs.an')
+        self.assertEqual(len(unlimited.sessions), 8)
+
+    def test_expired_sessions_are_pruned_without_their_token(self):
+        a = Auth(self.store, idle_hours=1, session_hours=12)
+        idle, _ = a.login('bs.an', 'mat-khau-bs.an')
+        old, _ = a.login('bs.binh', 'mat-khau-bs.binh')
+        a.sessions[a._key(idle)]['seen'] -= 3601
+        a.login('quan.tri', 'mat-khau-quan.tri')  # any login prunes
+        self.assertNotIn(a._key(idle), a.sessions)
+        self.assertIn(a._key(old), a.sessions)
+        a.sessions[a._key(old)]['created'] -= 12 * 3600 + 1  # past the absolute limit, though still active
+        self.assertEqual([s['username'] for s in a.list_sessions()], ['quan.tri'])
+        self.assertNotIn(a._key(old), a.sessions)  # the admin page's listing prunes too
+        self.assertEqual(len(a.sessions), 1)
+
+    def test_request_budget_is_per_account_not_per_session(self):
+        rates = fresh_rates(hpo_search=3)
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit, RATES=rates) as srv:
+            first, second = self.login(srv, 'bs.an'), self.login(srv, 'bs.an')
+            other = self.login(srv, 'bs.binh')
+            self.assertEqual([srv.call('/api/hpo_search?q=a', token=first)[0] for _ in range(3)], [200] * 3)
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=second)[0], 429)  # a new login buys no budget
+            self.assertEqual(srv.call('/api/hpo_search?q=a', token=other)[0], 200)
+        self.assertEqual(set(rates['hpo_search'].buckets), {'user:bs.an', 'user:bs.binh'})
+
+    # ------------------------------------------------------------------ correction caps
+    def test_corrections_caps_per_user_and_file_size(self):
+        store = CorrectionStore(Path(self.dir.name, 'corrections.json'), per_user=2, max_mb=1)
+        right = {'id': 'HP:0001520', 'vi': 'Thai to', 'en': 'Large for gestational age'}
+        fields = lambda phrase: {'phrase': phrase, 'right': right, 'wrong': [], 'context': '', 'note': '', 'source': 'text'}
+        store.add('bs.an', 'BS. An', fields('thai to 1'))
+        second, _ = store.add('bs.an', 'BS. An', fields('thai to 2'))
+        with self.assertRaises(ValueError) as caught:
+            store.add('bs.an', 'BS. An', fields('thai to 3'))
+        self.assertEqual(str(caught.exception), 'Bác sĩ đã có 2 góp ý chờ duyệt; chờ quản trị duyệt trước khi gửi thêm.')
+        self.assertTrue(store.add('bs.an', 'BS. An', fields('thai to 2'))[1])  # a resubmitted duplicate is not refused
+        store.add('bs.binh', 'BS. Bình', fields('thai to 3'))                  # per user
+        store.decide(second['id'], 'approved', '', 'quan.tri')
+        store.add('bs.an', 'BS. An', fields('thai to 3'))                      # decided ones do not count
+        store.per_user, store.max_bytes = 0, len(json.dumps(store.items, ensure_ascii=False)) + 10
+        with self.assertRaisesRegex(ValueError, '^Kho góp ý đã đầy; nhờ quản trị dọn bớt.$'):
+            store.add('bs.an', 'BS. An', fields('thai to 4'))
+        self.assertEqual(len(store.all()), 4)
+        with patch.dict(os.environ, {'WEB_CORRECTIONS_PER_USER': '7', 'WEB_CORRECTIONS_MAX_MB': '3'}):
+            capped = CorrectionStore(Path(self.dir.name, 'x.json'))
+        self.assertEqual((capped.per_user, capped.max_bytes), (7, 3000000))
+        with patch.dict(os.environ, {}):
+            os.environ.pop('WEB_CORRECTIONS_PER_USER', None)
+            os.environ.pop('WEB_CORRECTIONS_MAX_MB', None)
+            defaults = CorrectionStore(Path(self.dir.name, 'y.json'))
+        self.assertEqual((defaults.per_user, defaults.max_bytes), (50, 20000000))
+        # over HTTP the doctor gets the message as a 422
+        store.per_user, store.max_bytes = 1, 0
+        with LiveServer(AUTH=Auth(self.store, admin_2fa=False), AUDIT=self.audit, CORRECTIONS=store,
+                        SYSTEM=fake_hpo_system(model())) as srv:
+            code, err = srv.call('/api/corrections', {'phrase': 'thai to 5', 'right_id': 'HP:0001520'}, self.login(srv, 'bs.binh'))
+        self.assertEqual((code, err['error']), (422, 'Bác sĩ đã có 1 góp ý chờ duyệt; chờ quản trị duyệt trước khi gửi thêm.'))
+
+    # ------------------------------------------------------------------ audit rotation
+    def test_audit_keeps_n_rotated_files_and_verifies_them_in_order(self):
+        import audit
+        path = Path(self.dir.name, 'logs', 'audit.jsonl')
+        log = AuditLog(path, keep=3, max_bytes=300)
+        first_line = lambda p: p.read_text(encoding='utf-8').splitlines()[0]
+        with redirect_stderr(StringIO()):
+            for i in range(6):
+                log.write('match', 'bs.an', hpo_count=i)
+            first_of_1 = first_line(audit.rotated(path, 1))
+            while first_line(audit.rotated(path, 1)) == first_of_1:
+                log.write('match', 'bs.an', hpo_count=99)
+            self.assertEqual(first_line(audit.rotated(path, 2)), first_of_1)  # .1 shifted to .2
+            for i in range(60):
+                log.write('login_fail', 'ke.la', n=i)
+        names = sorted(p.name for p in path.parent.iterdir())
+        self.assertEqual(names, ['audit.jsonl', 'audit.jsonl.1', 'audit.jsonl.2', 'audit.jsonl.3'])  # keep=3, no .4
+        files = audit.log_set(path)
+        self.assertEqual([p.name for p in files], ['audit.jsonl.3', 'audit.jsonl.2', 'audit.jsonl.1', 'audit.jsonl'])
+        ok, report = audit.verify(files)
+        self.assertTrue(ok, report)
+        out = StringIO()
+        with patch('sys.stdout', out):
+            self.assertEqual(audit.main(['verify', str(path)]), 0)  # the live file: its whole set
+            self.assertEqual(audit.main(['verify', str(audit.rotated(path, 1)), str(path)]), 0)  # the old two-file form
+            with patch.dict(os.environ, {'WEB_AUDIT_FILE': str(path)}):
+                self.assertEqual(audit.main(['verify']), 0)
+        self.assertIn('audit.jsonl.3, audit.jsonl.2, audit.jsonl.1, audit.jsonl', out.getvalue())
+        self.assertFalse(audit.verify(list(reversed(files)))[0])  # out of order breaks the chain
+        middle = audit.rotated(path, 2)
+        lines = middle.read_text(encoding='utf-8').splitlines()
+        lines[1] = lines[1].replace('"login_fail"', '"login_ok"').replace('"match"', '"extract"')
+        middle.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        ok, report = audit.verify(audit.log_set(path))
+        self.assertFalse(ok)
+        self.assertIn('chuỗi băm bị đứt', report[-1])
+        # a smaller WEB_AUDIT_KEEP later drops the files beyond it at the next rotation, leaving no gap
+        with redirect_stderr(StringIO()):
+            small = AuditLog(path, keep=2, max_bytes=300)
+            for i in range(10):
+                small.write('logout', 'bs.an')
+        self.assertFalse(audit.rotated(path, 3).exists())
+        with patch.dict(os.environ, {'WEB_AUDIT_KEEP': '4'}):
+            self.assertEqual(AuditLog(path).keep, 4)
+        with patch.dict(os.environ, {'WEB_AUDIT_KEEP': 'x'}):
+            self.assertEqual(AuditLog(path).keep, 10)
+
+    # ------------------------------------------------------------------ HEAD
+    def test_head_uses_the_static_allowlist(self):
+        import serve_web
+        root = Path(serve_web.STATIC_ROOT)
+        outside = sorted('/' + p.relative_to(root).as_posix() for p in root.rglob('*')
+                         if p.is_file() and '/' + p.relative_to(root).as_posix() not in serve_web.STATIC_FILES)
+        with LiveServer(AUTH=Auth(self.store), AUDIT=self.audit) as srv:
+            def head(path):
+                req = urllib.request.Request(srv.base + path, method='HEAD')
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return r.status, r.read()
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read()
+            self.assertEqual(head('/'), (200, b''))
+            self.assertEqual(head('/app.js')[0], 200)
+            for path in outside[:5] + ['/fonts/', '/api/status', '/nope.txt']:
+                self.assertEqual(head(path), (404, b''), path)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

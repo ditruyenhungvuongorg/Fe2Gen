@@ -37,6 +37,12 @@
     return lastActivity > lastPing && now - lastPing >= intervalMs;
   }
 
+  // A case left behind by an ended session (expired, forced logout, server restart) is kept only for the same
+  // account signing in again; any other account, or an unknown owner, starts from an empty case.
+  function keepsCase(owner, next) {
+    return !!(owner && next && owner.username && owner.username === next.username && owner.role === next.role);
+  }
+
   // B5: /api/login answers with a session, or asks for the second factor when the account has 2FA on.
   function loginStep(data) {
     if (data && data.second_factor === true && typeof data.pending === 'string' && data.pending)
@@ -76,7 +82,7 @@
     return seconds > 0 ? 'Thao tác quá nhanh, thử lại sau ' + Math.ceil(seconds) + ' giây.' : 'Thao tác quá nhanh, thử lại sau ít phút.';
   }
 
-  const api = {serverLockState, idleState, idleMinutesOf, shouldPing, loginStep, normalizeCode, formatSecret, isOtpauth,
+  const api = {serverLockState, idleState, idleMinutesOf, shouldPing, keepsCase, loginStep, normalizeCode, formatSecret, isOtpauth,
                retryAfterSeconds, tooFastMessage, DEFAULT_IDLE_MINUTES};
   root.FrontLogic = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

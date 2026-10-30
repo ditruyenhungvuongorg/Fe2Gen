@@ -189,3 +189,39 @@ ghi chú**.
 - Bệnh báo sai phải nằm trong danh sách AI đã gợi ý ở lần đối chiếu đó (tối đa 10); bệnh đúng không thể trùng bệnh đã
   báo sai.
 
+## Sửa lỗi 30/10
+
+Những gì người vận hành thấy khác (biến mới đều có mặc định, không cần thêm vào `web.env`; bảng đầy đủ ở cuối
+`TRIEN_KHAI_BAO_MAT.md`):
+
+- **Giới hạn đăng nhập.** Với `WEB_TRUST_PROXY=0` (Funnel, mặc định) không còn giới hạn "theo nguồn" và không còn
+  "Hệ thống tạm ngừng nhận đăng nhập 1 phút": qua Funnel mọi yêu cầu đều đến từ `127.0.0.1`, nên ~10 lần nhập sai/phút
+  từ bất kỳ ai từng làm mọi người, kể cả admin, nhận 429. Giới hạn và khóa **theo tên đăng nhập** giữ nguyên. Đặt
+  `WEB_TRUST_PROXY=1` (chỉ khi có proxy cục bộ ghi `X-Forwarded-For`) thì hai cơ chế cũ hoạt động lại.
+- **Giới hạn tốc độ theo tài khoản.** `WEB_RATE_*` tính theo tài khoản thay vì theo phiên: đăng nhập thêm phiên không
+  được thêm lượt tra cứu/đối chiếu.
+- **Số phiên mỗi tài khoản.** Tối đa `WEB_MAX_SESSIONS_PER_USER` (5) phiên cùng lúc; lần đăng nhập thứ 6 đóng phiên
+  cũ nhất của tài khoản đó (máy/tab đó thấy "Phiên đăng nhập đã hết hạn" và đăng nhập lại). Phiên hết hạn được dọn
+  khỏi bộ nhớ; trang *Phiên* chỉ còn phiên đang sống.
+- **Thời hạn nhận yêu cầu.** Body của một POST phải đến đủ trong `WEB_BODY_TIMEOUT` (20 giây, tổng cộng) hoặc
+  `WEB_UPLOAD_TIMEOUT` (120 giây, riêng báo lỗi kèm ảnh); quá hạn thì kết nối bị cắt, không trả lời. Trước đây gửi body
+  nhỏ giọt (1 byte/50 giây) giữ được kết nối mãi và 64 kết nối như vậy làm web ngừng phục vụ. Mỗi lần đọc/ghi socket
+  sau header giảm từ 180 xuống 60 giây.
+- **Giới hạn góp ý sửa mã.** Tối đa `WEB_CORRECTIONS_PER_USER` (50) góp ý chờ duyệt mỗi bác sĩ và
+  `WEB_CORRECTIONS_MAX_MB` (20) cho `corrections.json`; vượt → bác sĩ thấy "Bác sĩ đã có 50 góp ý chờ duyệt; chờ quản
+  trị duyệt trước khi gửi thêm." hoặc "Kho góp ý đã đầy; nhờ quản trị dọn bớt."
+- **Xoay nhật ký audit.** Giữ `WEB_AUDIT_KEEP` (10) file đã xoay: `audit.jsonl.1` (mới nhất) … `audit.jsonl.10` (cũ
+  nhất), mỗi file 5 MB, thay vì chỉ một `audit.jsonl.1`. `python3 audit.py verify "$DEP/audit.jsonl"` (hoặc không đối số)
+  kiểm cả bộ theo thứ tự cũ → mới; cách gọi cũ hai file (`verify audit.jsonl.1 audit.jsonl`) vẫn dùng được. Sao lưu
+  đã gồm `audit.jsonl*`.
+- **HEAD** chỉ trả lời cho đúng các file tĩnh mà GET phục vụ; file khác trong `docs/` → 404.
+- **Tra bệnh (ô *Bệnh đúng*).** Tên gọi tắt có dấu gạch/chấm tìm được trở lại (Prader-Willi, Wolf-Hirschhorn,
+  Beckwith-Wiedemann, Smith-Lemli-Opitz, cri du chat / mèo kêu, DiGeorge → 22q11.2 deletion); "tam nhiễm sắc thể 21" →
+  Down syndrome; "loạn sản sụn" → Achondroplasia; "loạn sản xương" (nhóm bệnh) **không** còn trỏ vào Achondroplasia;
+  "tim bẩm sinh" đưa "Congenital heart defects…" lên đầu thay vì "Congenital heart block".
+- **Gene "-".** Các dòng `genes_to_disease.txt` không có ký hiệu gene (`-`) không còn hiện thành gene trên thẻ bệnh và
+  phiếu gửi Lab.
+
+Kiểm tra trước khi deploy: `python test_access.py` (lớp `Fixes20261030Tests` và các test đăng nhập trong
+`LimitTests`, `AuthTests`), `python test_web.py` (cần `backend/data`).
+

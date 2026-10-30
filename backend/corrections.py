@@ -8,7 +8,10 @@ atomically; re-read when it changes on disk). Shape {"items": [ITEM, ...]} where
 "note", "source", "status": "pending"|"approved"|"rejected", "decided_by", "decided_at", "decision_note"};
 a decided item also carries "decided_ts" (time.time() float, the order of approvals within one minute).
 Phrases are clinical wording (no patient identity), kept with the same care as lab_cases.json: 600 and in the
-encrypted backup. Standard library only.
+encrypted backup.
+Caps: WEB_CORRECTIONS_PER_USER (default 50) pending items per user and WEB_CORRECTIONS_MAX_MB (default 20) for the
+whole file, estimated from the JSON text; 0 turns a cap off. A resubmitted duplicate is never refused. Standard
+library only.
 """
 import json
 import os
@@ -20,6 +23,7 @@ import unicodedata
 from pathlib import Path
 
 from model1_process import write_private_json
+from ratelimit import env_int
 
 DEFAULT_FILE = Path.home() / 'prenatal_pubcasefinder/.deployment/corrections.json'
 LABELS = {'pending': 'Chờ duyệt', 'approved': 'Đã duyệt', 'rejected': 'Đã từ chối'}
@@ -28,6 +32,11 @@ SOURCES = ('text', 'search', 'selected')
 HPO_ID = re.compile(r'^HP:\d{7}$')
 MAX_WRONG = 5
 MAX_ITEMS = 200  # the longest list one request returns
+# Caps (0 turns one off), as in disease_feedback: pending items one user may have waiting for the admin, and the
+# size of the whole file (estimated from the JSON text of the items plus the new one).
+DEFAULT_PER_USER = 50
+DEFAULT_MAX_MB = 20
+FULL = 'Kho góp ý đã đầy; nhờ quản trị dọn bớt.'
 
 
 class StoreError(OSError):
@@ -91,10 +100,12 @@ def parse_submission(payload, resolve):
 
 
 class CorrectionStore:
-    def __init__(self, path=None):
+    def __init__(self, path=None, per_user=None, max_mb=None):
         self.path = Path(path or os.getenv('WEB_CORRECTIONS_FILE') or DEFAULT_FILE)
         self.lock = threading.Lock()
         self.items, self.mtime = [], None
+        self.per_user = env_int('WEB_CORRECTIONS_PER_USER', DEFAULT_PER_USER) if per_user is None else int(per_user)
+        self.max_bytes = env_int('WEB_CORRECTIONS_MAX_MB', DEFAULT_MAX_MB) * 1000000 if max_mb is None else int(max_mb * 1000000)
 
     # ------------------------------------------------------------------ file
     def _refresh(self):
@@ -122,6 +133,17 @@ class CorrectionStore:
         write_private_json(self.path, {'items': items})
         self.items, self.mtime = items, self.path.stat().st_mtime_ns
 
+    def _check_caps(self, user, item):
+        """ValueError (shown to the doctor) when user has per_user items pending or the file would outgrow max_bytes."""
+        if self.per_user > 0:
+            waiting = sum(1 for i in self.items if i.get('user') == user and i.get('status') == 'pending')
+            if waiting >= self.per_user:
+                raise ValueError(f'Bác sĩ đã có {self.per_user} góp ý chờ duyệt; chờ quản trị duyệt trước khi gửi thêm.')
+        if self.max_bytes > 0:
+            size = len(json.dumps(self.items, ensure_ascii=False)) + len(json.dumps(item, ensure_ascii=False))
+            if size > self.max_bytes:
+                raise ValueError(FULL)
+
     def all(self):
         """Every item, newest first (copies)."""
         with self.lock:
@@ -145,6 +167,7 @@ class CorrectionStore:
                 new_id = secrets.token_hex(6)
             item = {'id': new_id, 'time': now(), 'user': user, 'name': name or user, **fields,
                     'status': 'pending', 'decided_by': None, 'decided_at': None, 'decision_note': ''}
+            self._check_caps(user, item)
             self._save(self.items + [item])  # copy-on-write: self.items changes only after the file is written
             return dict(item), False
 

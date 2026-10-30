@@ -44,7 +44,8 @@ async function api(path, payload, timeout = 120000, controller = new AbortContro
     if (response.status === 429) throw apiError(FrontLogic.tooFastMessage(response.headers.get('Retry-After'), data || {}, {preferServer:path.startsWith('/api/login')}), 429, data || {});
     if (!data || typeof data !== 'object') throw apiError('Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.', response.status);
     if (!response.ok) {
-      if (response.status === 401 && authMode === 'accounts' && access && !CREDENTIAL_PATHS.has(path)) sessionEnded();
+      // sessionEnded aborts every request in flight; this one already has its answer and keeps the server's message.
+      if (response.status === 401 && authMode === 'accounts' && access && !CREDENTIAL_PATHS.has(path)) { requests.delete(controller); sessionEnded(); }
       if (response.status === 403 && data.must_change && user) { user.must_change = true; openAccount(); }
       // Admin without 2FA: only /api/session, /api/totp/* and logout work until it is turned on.
       if (response.status === 403 && data.totp_required && user) { sessionInfo = {...(sessionInfo || {}), totp_required:true}; openAccount(); }
@@ -70,7 +71,7 @@ async function apiBlob(path, timeout = 60000) {
       let data = null;
       try { data = await response.json(); } catch {}
       if (response.status === 429) throw apiError(FrontLogic.tooFastMessage(response.headers.get('Retry-After'), data || {}), 429, data || {});
-      if (response.status === 401 && authMode === 'accounts' && access) sessionEnded();
+      if (response.status === 401 && authMode === 'accounts' && access) { requests.delete(controller); sessionEnded(); }
       throw apiError((data && data.error) || 'Không xử lý được yêu cầu. Vui lòng thử lại.', response.status, data || {});
     }
     return await response.blob();
@@ -186,10 +187,25 @@ function showGate(state, message = '') {
   if (state === 'login') ($('login-username').value ? $('login-password') : $('login-username')).focus();
   if (state === 'totp') ($('login-backup-label').hidden ? $('login-code') : $('login-backup')).focus();
 }
+// The case on screen belongs to keptFor ({username, role}, set at sign-in). After a 401 (session expired, forced
+// logout, server restart, account locked or password reset) it is kept for that account only: signedIn() starts a new
+// case for anyone else, and if nobody signs in again within the idle limit the case is wiped (keptUntil).
+let keptFor = null, keptUntil = 0;
+const KEPT_MESSAGE = 'Phiên đăng nhập đã hết hạn. Đăng nhập lại bằng cùng tài khoản để tiếp tục ca này; tài khoản khác sẽ bắt đầu ca mới.';
 function sessionEnded() {
-  access = ''; user = null; sessionInfo = null; pendingLogin = null; window.resetTwoFactor?.(); window.resetCorrection?.(); window.resetBugReport?.(); window.resetDiseaseFeedback?.(); showUser();
+  // Capture before user and sessionInfo are dropped. A second 401 in a row (user already null) changes nothing.
+  if (user) keptUntil = Date.now() + FrontLogic.idleMinutesOf(sessionInfo?.idle_minutes) * 60000;
+  for (const c of requests) c.abort('session-ended');
+  access = ''; user = null; sessionInfo = null; pendingLogin = null; window.resetTwoFactor?.(); window.resetCorrection?.(); window.resetBugReport?.(); window.resetDiseaseFeedback?.(); window.resetAdmin?.(); showUser();
   for (const d of ['account', 'admin', 'settings', 'lab', 'correction', 'bug-report']) if ($(d).open) $(d).close();
-  showGate('login', 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại; danh sách HPO của ca vẫn được giữ.');
+  $('sheet').replaceChildren();  // the case is kept, the printable sheet is not (it is rebuilt from the result)
+  showGate('login', KEPT_MESSAGE);
+}
+// Nobody signed in again within the idle limit: the kept case must not wait behind the sign-in page.
+function dropKeptCase() {
+  if (!keptUntil || access || Date.now() < keptUntil) return;
+  keptUntil = 0; keptFor = null; resetCase();
+  if ($('login-error').textContent === KEPT_MESSAGE) { $('login-error').textContent = 'Nội dung ca trong tab này đã được xóa vì không ai đăng nhập lại.'; }
 }
 function updateActions() {
   $('reviewed').disabled = busy || !!selection.conflicts || !chosen.size;
@@ -208,6 +224,7 @@ function invalidate() {
   $('inheritance-filter').innerHTML = '<option value="">Tất cả kiểu di truyền</option>';
   $('results').innerHTML = '<div class="empty"><div class="empty-symbol">↻</div><h3>Sẵn sàng cho lần đối chiếu tiếp theo</h3><p>Duyệt danh sách HPO hiện tại để xem kết quả phù hợp với ca này.</p></div>';
   if ($('lab').open) $('lab').close();
+  $('sheet').replaceChildren();  // the lab sheet holds the case (id, text, HPO); Ctrl+P must not print a stale one
   updateActions();
 }
 function add(term, state = 'CÓ', source = {kind:'manual'}) {
@@ -345,7 +362,13 @@ $('extract').onclick = async () => {
 };
 $('clear-hpos').onclick = () => { selection.clear(); invalidate(); renderSelected(); renderSearch(); renderMentions(); notice('Đã xóa danh sách HPO. Đoạn văn và gợi ý vẫn được giữ.'); };
 $('reviewed').onchange = updateActions;
-$('wes-genes').oninput = () => { if (result) invalidate(); };
+// Also while matching: the request in flight used the old genes, so drop its answer (invalidate bumps revision).
+// Before any match there is nothing to drop and the "reviewed" box stays ticked.
+$('wes-genes').oninput = () => {
+  const matching = busy === 'match';
+  if (result || matching) invalidate();
+  if (matching) notice('Danh sách gene đã thay đổi trong lúc đối chiếu. Duyệt lại rồi bấm Đối chiếu bệnh.');
+};
 $('match').onclick = async () => {
   if (busy || selection.conflicts || !$('reviewed').checked) return;
   const seq = revision;
@@ -452,7 +475,10 @@ $('export').onclick=()=>{
   '<p>Chỉ định / ghi chú bác sĩ: ........................................................................\n...........................................................................................................</p><div class="signature"><div>Bác sĩ chỉ định<br>(Ký, ghi rõ họ tên)</div><div>Phòng Lab tiếp nhận<br>(Ký, ghi rõ họ tên)</div></div>';
   $('lab').showModal();
 };
-$('print').onclick=()=>window.print();$('close-lab').onclick=()=>$('lab').close();
+// A closed lab sheet keeps nothing to print: emptied on Đóng, on Esc and on any other close (sign-out closes it too).
+const clearSheet=()=>$('sheet').replaceChildren();
+$('print').onclick=()=>window.print();$('close-lab').onclick=()=>{$('lab').close();clearSheet();};
+$('lab').addEventListener('cancel',clearSheet);$('lab').addEventListener('close',clearSheet);
 function hasCase(){return chosen.size||$('clinical-text').value||$('case-id').value||$('wes-genes').value;}
 $('new-case').onclick=()=>{
   if((chosen.size||$('clinical-text').value)&&!confirm('Bắt đầu ca mới và xóa nội dung ca hiện tại trong phiên này?'))return;
@@ -474,7 +500,7 @@ $('logout').onclick=async()=>{
 // After logout: forget the user, the 2FA state and the case. /api/logout sends Clear-Site-Data "cache", which
 // leaves localStorage alone; still reread the saved server instead of assuming it is kept or gone.
 function signedOut(){
-  resetCase();access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();window.resetDiseaseFeedback?.();showUser();
+  resetCase();keptFor=null;keptUntil=0;access='';user=null;sessionInfo=null;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();window.resetDiseaseFeedback?.();window.resetAdmin?.();showUser();
   $('idle-warning').hidden=true;
   try{const saved=localStorage.getItem('prenatal-api');if(saved)base=saved;}catch{}
 }
@@ -491,6 +517,7 @@ function placeIdleWarning(){
   if($('idle-warning').parentElement!==host)host.prepend($('idle-warning'));
 }
 function checkIdle(){
+  dropKeptCase();
   if(idle.ending)return;
   if(!idleOn()){$('idle-warning').hidden=true;return;}
   const now=Date.now();
@@ -505,7 +532,7 @@ async function idleLogout(){
   idle.ending=true;
   const minutes=FrontLogic.idleMinutesOf(sessionInfo?.idle_minutes);
   for(const d of ['account','admin','settings','lab','correction','bug-report'])if($(d).open)$(d).close();
-  resetCase();  // clear the case first, before waiting for the network
+  resetCase();window.resetAdmin?.();  // clear the case and the admin page first, before waiting for the network
   try{await api('/api/logout',{},15000);}catch{}
   signedOut();idle.ending=false;
   showGate('login','Đã tự đăng xuất sau '+minutes+' phút không thao tác; nội dung ca trong tab này đã được xóa.');
@@ -516,6 +543,7 @@ $('idle-stay').onclick=()=>{markActivity();idle.lastPing=Date.now();refreshSessi
 // Back to a hidden tab: timers may have been slowed, so decide at once; then ask the server whether the session
 // still exists (401 → sign-in page).
 document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible')dropKeptCase();
   if(document.visibilityState!=='visible'||!idleOn())return;
   checkIdle();
   if(idleOn())refreshSession();
@@ -583,7 +611,10 @@ let pendingLogin=null;  // {pending, user, at, failures}
 const PENDING_MS=5*60000,CODE_TRIES=5;
 const BAD_REPLY='Máy chủ trả dữ liệu không hợp lệ. Kiểm tra lại kết nối.';
 async function signedIn(step,data){
-  access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();window.resetDiseaseFeedback?.();
+  // A case kept from an ended session goes back only to the same account; anyone else starts an empty case.
+  if(!FrontLogic.keepsCase(keptFor,step.user))resetCase();
+  keptFor={username:step.user.username,role:step.user.role};keptUntil=0;
+  access=step.token;user=step.user;lastModel=data;pendingLogin=null;window.resetTwoFactor?.();window.resetCorrection?.();window.resetBugReport?.();window.resetDiseaseFeedback?.();window.resetAdmin?.();
   idle.last=idle.lastPing=Date.now();
   showUser();notice('');
   await refreshSession();  // 2FA requirement and the idle limit
