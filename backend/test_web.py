@@ -413,6 +413,42 @@ class WebTests(unittest.TestCase):
             s.apply_corrections([])
         self.assertEqual(s.search_hpo('thai to'), before)
 
+    def test_v6_rescue_keeps_items_around_a_retyped_phrase(self):
+        from model1_v6 import contract as C
+        text = 'Thai 21 tuần, kênh nhĩ thất - eo động mạchc hủ hẹp, gan lớn'
+        raw = '{"findings":[{"text":"kênh nhĩ thất","assertion":"present"},{"text":"eo động mạch chủ hẹp","assertion":"present"},{"text":"gan lớn","assertion":"suspected"},{"text":"không có trong câu này","assertion":"present"}]}'
+        with self.assertRaises(ValueError):
+            C.align(text, raw)
+        got = C.rescue(text, raw)['predicted']
+        self.assertEqual([f['mention_text'] for f in got], ['kênh nhĩ thất', 'eo động mạchc hủ hẹp', 'gan lớn'])
+        self.assertEqual(got[2]['assertion'], 'suspected')
+        self.assertIsNone(C.rescue(text, 'không phải JSON'))
+
+    def test_v6_add_low_vote_only_adds_and_flags(self):
+        from model1_v6 import contract as C
+        text = 'thoát vị hoành, gan lớn, ruột sáng'
+        def f(t, a='present'):
+            s = text.index(t)
+            return dict(mention_text=t, span_start=s, span_end=s + len(t), assertion=a)
+        base = dict(predicted=[f('thoát vị hoành')])
+        runs = [dict(predicted=[f('thoát vị hoành'), f('gan lớn', 'suspected')]), dict(predicted=[f('thoát vị hoành')]), dict(predicted=[f('hoành'), f('ruột sáng')])]
+        got = C.add_low_vote(text, base, runs, 1)['predicted']
+        self.assertEqual([x['mention_text'] for x in got], ['thoát vị hoành', 'gan lớn', 'ruột sáng'])
+        self.assertNotIn('alignment', got[0])
+        self.assertEqual((got[1]['alignment'], got[1]['assertion']), ('ambiguous_first_occurrence', 'suspected'))
+        self.assertEqual(C.add_low_vote(text, base, runs, 2), base)
+
+    def test_v6_add_low_vote_recovers_a_report_with_only_invalid_runs(self):
+        from model1_v6 import contract as C
+        text = 'gan lớn, động mạchc hủ hẹp'
+        raw = '{"findings":[{"text":"gan lớn","assertion":"present"},{"text":"động mạch chủ hẹp","assertion":"present"}]}'
+        bad = dict(predicted=[], error='Finding text absent from report or cuts a word', raw=raw)
+        got = C.add_low_vote(text, C.vote([bad, bad], 2), [bad, bad], 1)
+        self.assertNotIn('error', got)
+        self.assertEqual([x['mention_text'] for x in got['predicted']], ['gan lớn', 'động mạchc hủ hẹp'])
+        lost = dict(predicted=[], error='x', raw='hỏng')
+        self.assertIn('error', C.add_low_vote(text, C.vote([lost], 2), [lost], 1))
+
     def test_v6_contract_alignment_and_chunks(self):
         from model1_v6 import contract as C
         with self.assertRaises(ValueError):
