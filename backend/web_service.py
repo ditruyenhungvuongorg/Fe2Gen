@@ -4,6 +4,7 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
+from dataclasses import replace
 from server import Fe2genSystem, normalize_text, BASE_DIR
 from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy, load_disease_xref
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
@@ -22,6 +23,9 @@ CATEGORY_FILES = (BASE_DIR / 'data/disease_category.tsv', BASE_DIR / 'resources/
 RERANKER_FILES = (BASE_DIR / 'data/model2_reranker.json', BASE_DIR / 'resources/model2_reranker.json')
 TOP_OVERALL = 5
 WES_TOP = 10
+# The MONDO table pairs OMIM with ORPHA only, so the karyotype forms of Turner syndrome are joined here.
+# The card shows the first ID.
+TURNER_IDS = ('ORPHA:881', 'ORPHA:99413', 'ORPHA:99226', 'ORPHA:99228')
 GENE_SYMBOL = re.compile(r'^[A-Z0-9][A-Z0-9.-]{0,19}$')
 # A reviewed phrase whose HPO means absence but whose words do not ("thận (P)" -> renal agenesis) was cut from a
 # sentence such as "không thấy thận (P)"; its meaning depends on that sentence.
@@ -146,6 +150,8 @@ class WebSystem(Fe2genSystem):
             print('[Model 2] Chưa có disease_category.tsv: kết quả hiển thị một danh sách chung.')
         xref = next((p for p in XREF_FILES if p.is_file()), None)
         self.resolver = load_disease_xref(xref) if xref else None
+        if self.resolver:
+            self.resolver.mapping.update(dict.fromkeys(TURNER_IDS, TURNER_IDS[0]))
         print(f'[Model 2] Gộp mã OMIM/ORPHA cùng bệnh: {xref.name if xref else "không có bảng, không gộp"}.')
         reranker = next((p for p in RERANKER_FILES if p.is_file()), None)
         self.reranker = Reranker.load(reranker) if reranker and self.categories else None
@@ -305,6 +311,19 @@ class WebSystem(Fe2genSystem):
                 kept.append(candidate)
         return kept, {k: sorted(v) for k, v in others.items() if v}
 
+    def show_turner_id(self, ranked, equivalents):
+        """The Turner card keeps the evidence of its best-ranked form under the ID of the disease itself.
+        The reranker's features use the ranked ID, so this runs after it."""
+        main = TURNER_IDS[0]
+        for position, c in enumerate(ranked):
+            if c.disease_id in TURNER_IDS:
+                if c.disease_id != main:
+                    forms = {c.disease_id, *equivalents.pop(c.disease_id, [])}
+                    equivalents[main] = sorted(forms - {main})
+                    ranked[position] = replace(c, disease_id=main, disease_name=self.profiles_by_id[main].disease_name)
+                break
+        return ranked
+
     def rerank(self, ranked, equivalents):
         """Reorder the top POOL of each mechanism column with the learned model; the rest keeps its order."""
         taken, pool, rest = defaultdict(int), [], []
@@ -370,6 +389,8 @@ class WebSystem(Fe2genSystem):
             equivalents = {}
         if self.reranker:
             ranked = self.rerank(ranked, equivalents)
+        if self.resolver:
+            ranked = self.show_turner_id(ranked, equivalents)
         report = self.decider.analyze_case(case_id='WEB', observations=positive, disease_candidates=ranked[:20], top_k=5)
         if self.categories:
             chosen, taken = [], {name: 0 for name, _ in GROUPS}

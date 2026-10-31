@@ -6,7 +6,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import Mock, patch
-from web_service import WebSystem
+from web_service import TURNER_IDS, WebSystem
 from model1_v38_package.core import align
 
 # backend/data/ (licensed HPO files) is not in the repository, so CI has none: tests that need it are skipped.
@@ -136,6 +136,16 @@ class WebTests(unittest.TestCase):
         self.assertTrue(merged)
         for c in merged:
             self.assertTrue(all(resolve(e) == resolve(c['disease_id']) for e in c['equivalent_ids']))
+
+    @needs_data
+    def test_turner_forms_are_one_card(self):
+        hpos = [{'id': h, 'status': 'CÓ'} for h in ('HP:0000476', 'HP:0001789', 'HP:0001627')]
+        result = self.system.match({'hpos': hpos})
+        cards = [c for c in result['candidates'] if c['disease_id'] in TURNER_IDS]
+        self.assertEqual([c['disease_id'] for c in cards], ['ORPHA:881'])
+        self.assertEqual(cards[0]['disease_name'], self.system.profiles_by_id['ORPHA:881'].disease_name)
+        self.assertEqual(sorted(cards[0]['equivalent_ids']), sorted(TURNER_IDS[1:]))
+        self.assertEqual(len(set(result['top_overall']) & set(TURNER_IDS[1:])), 0)
 
     @needs_data
     def test_merge_matches_matcher_resolver(self):
