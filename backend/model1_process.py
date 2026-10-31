@@ -274,36 +274,51 @@ class Model1Process:
     def extract_spans(self, text):
         return self.call(text)
 
+    def similar(self, text):
+        """Retriever hits for the search box, or None when the model cannot answer right now.
+        Never loads the model and never waits for a running extraction: a keystroke must stay fast."""
+        if self.state != 'ready' or not self.call_lock.acquire(blocking=False):
+            return None
+        try:
+            return self._exchange({'text': text, 'op': 'similar'})
+        except (ModelUnavailable, ModelProcessError, RuntimeError, ValueError):
+            return None
+        finally:
+            self.call_lock.release()
+
     def call(self, text):
         self.ensure_ready()
         with self.call_lock:
-            with self.cond:
-                proc, responses = self.proc, self.responses
-                if self.state != 'ready' or proc is None:
-                    raise ModelUnavailable('Model vừa được giải phóng. Vui lòng thử lại.')
-                self.next_id += 1
-                rid = self.next_id
-                self.busy = True
+            return self._exchange({'text': text})
+
+    def _exchange(self, request):
+        with self.cond:
+            proc, responses = self.proc, self.responses
+            if self.state != 'ready' or proc is None:
+                raise ModelUnavailable('Model vừa được giải phóng. Vui lòng thử lại.')
+            self.next_id += 1
+            rid = self.next_id
+            self.busy = True
+        try:
             try:
+                proc.stdin.write(json.dumps({'id': rid, **request}, ensure_ascii=False) + '\n')
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                raise ModelUnavailable('Tiến trình model đã dừng. Vui lòng thử lại.')
+            deadline = time.monotonic() + self.request_seconds
+            while True:
                 try:
-                    proc.stdin.write(json.dumps({'id': rid, 'text': text}, ensure_ascii=False) + '\n')
-                    proc.stdin.flush()
-                except (OSError, ValueError):
+                    msg = responses.get(timeout=max(0.1, deadline - time.monotonic()))
+                except queue.Empty:
+                    self.stop('quá thời gian xử lý')
+                    raise ModelUnavailable('Model xử lý quá lâu và đã được khởi động lại. Vui lòng thử lại.')
+                if msg is None:
                     raise ModelUnavailable('Tiến trình model đã dừng. Vui lòng thử lại.')
-                deadline = time.monotonic() + self.request_seconds
-                while True:
-                    try:
-                        msg = responses.get(timeout=max(0.1, deadline - time.monotonic()))
-                    except queue.Empty:
-                        self.stop('quá thời gian xử lý')
-                        raise ModelUnavailable('Model xử lý quá lâu và đã được khởi động lại. Vui lòng thử lại.')
-                    if msg is None:
-                        raise ModelUnavailable('Tiến trình model đã dừng. Vui lòng thử lại.')
-                    if msg.get('id') == rid:
-                        break
-            finally:
-                self.busy = False
-                self.touch()
+                if msg.get('id') == rid:
+                    break
+        finally:
+            self.busy = False
+            self.touch()
         if msg.get('ok'):
             return msg['result']
         kind = msg.get('error_type')  # filtered again here: the child may be an older build
@@ -396,7 +411,8 @@ def worker_main(runner_factory=build_runner):
         except ValueError:
             continue
         try:
-            send({'id': request.get('id'), 'ok': True, 'result': extract(request.get('text'))})
+            handle = runner.similar_hpo if request.get('op') == 'similar' else extract
+            send({'id': request.get('id'), 'ok': True, 'result': handle(request.get('text'))})
         except Exception as exc:  # the class name only: str(exc) may quote the report
             if isinstance(exc, ValueError):
                 kind, message = 'ValueError', safe_input_error(str(exc))
