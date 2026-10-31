@@ -57,6 +57,7 @@ class Model1V6Runner:
         self.manifest = m
         self.members = [(c, eps) for c, eps in m['extractor']['members']]
         self.need, self.extend = m['extractor']['need'], m['extractor']['extend']
+        self.recall_need = m['extractor'].get('recall_need')
         model, _ = FastLanguageModel.from_pretrained(model_name=m['base_model_dir'], max_seq_length=C.MAX_LENGTH, dtype=torch.bfloat16,
                                                      load_in_4bit=False, load_in_16bit=True)
         tok = AutoTokenizer.from_pretrained(self.bundle / 'tokenizer', local_files_only=True)
@@ -154,7 +155,7 @@ class Model1V6Runner:
             ids.pop()
         return tok.decode(ids, skip_special_tokens=False).strip()
 
-    def _member(self, text, config, epochs):
+    def _runs(self, text, config, epochs):
         preds = []
         for e in epochs:
             raw = self.generate(text, f'{config}__epoch{e}')
@@ -162,23 +163,25 @@ class Model1V6Runner:
                 preds.append(dict(predicted=C.align(text, raw)))
             except (ValueError, TypeError, KeyError) as exc:
                 if not str(exc).startswith('Ambiguous repeated'):
-                    preds.append(dict(predicted=[], error=str(exc)))
+                    preds.append(dict(predicted=[], error=str(exc), raw=raw))
                     continue
                 try:  # repeated phrase: earliest in-order occurrence, flagged for the doctor
                     preds.append(dict(predicted=C.lenient_align(text, raw)))
                 except (ValueError, TypeError, KeyError):
-                    preds.append(dict(predicted=[], error=str(exc)))
-        return C.vote(preds) if len(preds) > 1 else preds[0]
+                    preds.append(dict(predicted=[], error=str(exc), raw=raw))
+        return preds
 
     def extract_findings(self, text):
         chunk_chars = self.manifest.get('chunk_chars', 1200)
         parts = C.chunks(text, chunk_chars) if len(text) > chunk_chars else [(0, text)]
         findings, errors = [], []
         for off, seg in parts:
-            ms = [self._member(seg, c, eps) for c, eps in self.members]
-            p = C.vote(ms, self.need)
+            runs = [self._runs(seg, c, eps) for c, eps in self.members]
+            p = C.vote([C.vote(x) if len(x) > 1 else x[0] for x in runs], self.need)
             if self.extend:
                 p = C.extend_modifiers(seg, p)
+            if self.recall_need:
+                p = C.add_low_vote(seg, p, [r for x in runs for r in x], self.recall_need)
             if p.get('error'):
                 errors.append(p['error'])
             findings += [dict(C.shift(x, off), context=seg) for x in p['predicted']]

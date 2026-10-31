@@ -4,6 +4,7 @@ Copied verbatim from the evaluated research package (outputs/model1_improve_ubun
 Qwen never outputs HPO IDs or offsets; spans come from deterministic alignment against the report text.
 """
 import collections
+import difflib
 import json
 import re
 import unicodedata
@@ -128,6 +129,75 @@ def vote(pred_lists, need=2):
         return dict(predicted=[], error='all ensemble members invalid')
     chosen = sorted((keep[k] for k, n in counter.items() if n >= min(need, valid)), key=lambda f: f['span_start'])
     return dict(predicted=chosen)
+
+
+def _overlap(a, b):
+    return a[0] < b[1] and b[0] < a[1]
+
+
+def _closest_span(text, phrase, taken, floor=0.85):
+    """Word window closest to a phrase the model retyped (it fixed a typo in the report); None when nothing is close."""
+    words = list(re.finditer(r'\S+', text))
+    n = len(phrase.split())
+    best, score = None, floor
+    for size in (n, n + 1, n - 1):
+        for i in range(len(words) - size + 1 if size > 0 else 0):
+            span = (words[i].start(), words[i].start() + len(text[words[i].start():words[i + size - 1].end()].rstrip(',.;:')))
+            ratio = difflib.SequenceMatcher(None, text[span[0]:span[1]].lower(), phrase.lower()).ratio()
+            if ratio > score and not any(_overlap(span, c) for c in taken):
+                best, score = span, ratio
+    return best
+
+
+def rescue(text, raw):
+    """A rejected run keeps every item that can be placed, so one retyped item does not lose the whole run."""
+    try:
+        items = strict_json(raw)['findings']
+    except (ValueError, TypeError, KeyError):
+        return None
+    if not isinstance(items, list):
+        return None
+    out, taken = [], []
+    for it in items[:MAX_FINDINGS]:
+        if not isinstance(it, dict) or not isinstance(it.get('text'), str) or not it['text'].strip() or it.get('assertion') not in ASSERTIONS:
+            continue
+        phrase = it['text'].strip()
+        span = next((o for o in occurrences(text, phrase) if not any(_overlap(o, c) for c in taken)), None) or _closest_span(text, phrase, taken)
+        if span:
+            taken.append(span)
+            out.append(dict(mention_text=text[span[0]:span[1]], span_start=span[0], span_end=span[1], assertion=it['assertion']))
+    return dict(predicted=out)
+
+
+def add_low_vote(text, pred, runs, need=1):
+    """Recall-first: keep the voted findings and add spans seen by >= need runs that overlap none of them.
+
+    The doctor reviews every code, so a wrong extra costs less than a missed finding. Added spans are flagged so the web
+    asks the doctor to choose their status. A report whose runs were all invalid stays an error only if nothing is rescued.
+    """
+    kept = []
+    for r in runs:
+        if not r.get('error'):
+            kept.append(r)
+        elif r.get('raw'):
+            saved = rescue(text, r['raw'])
+            if saved:
+                kept.append(saved)
+    exact = collections.defaultdict(list)
+    for r in kept:
+        for f in r['predicted']:
+            exact[(f['span_start'], f['span_end'])].append(f['assertion'])
+    votes = {s: sum(any(_overlap(s, (f['span_start'], f['span_end'])) for f in r['predicted']) for r in kept) for s in exact}
+    chosen = [(f['span_start'], f['span_end']) for f in pred['predicted']]
+    added = []
+    for s in sorted(exact, key=lambda s: (-votes[s], -len(exact[s]), s[1] - s[0], s[0])):
+        if votes[s] >= need and not any(_overlap(s, c) for c in chosen):
+            chosen.append(s)
+            added.append(dict(mention_text=text[s[0]:s[1]], span_start=s[0], span_end=s[1], assertion=collections.Counter(exact[s]).most_common(1)[0][0],
+                              alignment='ambiguous_first_occurrence'))
+    if not added:
+        return pred
+    return dict(predicted=sorted(pred['predicted'] + added, key=lambda f: f['span_start']))
 
 
 def extend_modifiers(text, pred):
