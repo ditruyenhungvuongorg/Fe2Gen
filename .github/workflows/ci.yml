@@ -38,6 +38,8 @@ jobs:
       # and runs the rest (alignment, contract, category table, re-ranker file, preload failure).
       - name: Web tests (data-free subset)
         run: python test_web.py
+      - name: HPO search box tests
+        run: python test_hpo_search.py
 
   node-tests:
     name: node tests

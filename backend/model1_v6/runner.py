@@ -184,14 +184,23 @@ class Model1V6Runner:
             findings += [dict(C.shift(x, off), context=seg) for x in p['predicted']]
         return findings, errors
 
+    def _nearest(self, texts):
+        import torch
+        q = self._encode([C.normalize_query(t) for t in texts])
+        cat = q @ self.docs.T
+        mem = torch.full_like(cat, -1.0).scatter_reduce(1, self.mem_hpo.expand(len(q), -1), q @ self.mem.T, reduce='amax')
+        return torch.maximum(cat, mem).topk(C.K, dim=1)
+
+    def similar_hpo(self, text):
+        """Retriever only, for the search box: no reranker, so it is fast and needs no report around the phrase."""
+        top = self._nearest([text])
+        return [dict(id=self.ids[j], cosine=round(c, 4)) for j, c in zip(top.indices[0].tolist(), top.values[0].tolist())]
+
     def rank_hpo(self, findings, top_k=5):
         import torch
         if not findings:
             return []
-        q = self._encode([C.normalize_query(f['mention_text']) for f in findings])
-        cat = q @ self.docs.T
-        mem = torch.full_like(cat, -1.0).scatter_reduce(1, self.mem_hpo.expand(len(q), -1), q @ self.mem.T, reduce='amax')
-        top = torch.maximum(cat, mem).topk(C.K, dim=1)
+        top = self._nearest([f['mention_text'] for f in findings])
         ranked = [[self.ids[j] for j in row] for row in top.indices.tolist()]
         self.use(self.manifest['reranker_adapter'])
         out = []

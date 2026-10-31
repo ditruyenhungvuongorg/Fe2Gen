@@ -1,6 +1,7 @@
 """Web boundary for HPO review, evidence formatting and strict model serving."""
 import csv
 import json
+import os
 import re
 import unicodedata
 from collections import defaultdict
@@ -8,6 +9,7 @@ from server import Fe2genSystem, normalize_text, BASE_DIR
 from hpo_agents.agent2_schema import PhenotypeObservation, PhenotypeStatus, RankingStrategy, load_disease_xref
 from hpo_agents.agent3_prenatal_recommender import PRENATAL_SYNDROME_CATALOG
 from disease_feedback import disease_id_key
+from hpo_search import ABBREVIATIONS, STRONG, HpoSearch, read_bundle
 from model1_process import Model1Process, safe_input_error
 from model1_v6.runner import Model1V6Runner
 from model2_reranker import POOL, Reranker, candidate_features, load_validity
@@ -21,6 +23,7 @@ XREF_FILES = (BASE_DIR / 'data/disease_xref_mondo.tsv', BASE_DIR / 'resources/di
 CATEGORY_FILES = (BASE_DIR / 'data/disease_category.tsv', BASE_DIR / 'resources/disease_category.tsv')
 RERANKER_FILES = (BASE_DIR / 'data/model2_reranker.json', BASE_DIR / 'resources/model2_reranker.json')
 TOP_OVERALL = 5
+SEMANTIC_LEAD = 0.75  # retriever cosine above which a search hit goes ahead of partial text matches
 WES_TOP = 10
 GENE_SYMBOL = re.compile(r'^[A-Z0-9][A-Z0-9.-]{0,19}$')
 # A reviewed phrase whose HPO means absence but whose words do not ("thận (P)" -> renal agenesis) was cut from a
@@ -138,6 +141,7 @@ class WebSystem(Fe2genSystem):
                         ids.append(item['id'])
                     if ABSENCE_TERM.search(self.labels.get(item['id'], '')) and not ABSENCE_WORD.search(key):
                         self.context_phrases.add(key)
+        self.build_hpo_search()
         path = next((p for p in CATEGORY_FILES if p.is_file()), CATEGORY_FILES[-1])
         self.categories, self.category_version = load_categories(path)
         if self.categories:
@@ -159,36 +163,30 @@ class WebSystem(Fe2genSystem):
         t = self.canonical.get(hid, {})
         return {'id': hid, 'vi': t.get('vi', ''), 'en': self.labels.get(hid, t.get('en', hid))}
 
+    def build_hpo_search(self):
+        """The search box index: catalog names + doctors' wording, leaving out fragments whose meaning lies in their sentence."""
+        names = [(item.get('vi', ''), item.get('en', ''), item.get('synonyms', ''), item['id']) for _, _, item in self.search_index
+                 if item['id'] in self.canonical]
+        bundle_phrases, usage = read_bundle(os.getenv('MODEL1_V6_BUNDLE'))
+        phrases = [(key, hid) for key, ids in self.doctor_phrases.items() if key not in self.context_phrases for hid in ids]
+        for text, hid in bundle_phrases:
+            hid = self.aliases.get(hid, hid)
+            if hid in self.canonical and not (ABSENCE_TERM.search(self.labels.get(hid, '')) and not ABSENCE_WORD.search(text)):
+                phrases.append((text, hid))
+        phrases += list(ABBREVIATIONS.items())
+        self.hpo_search = HpoSearch(names, [(k, h) for k, h in phrases if h in self.canonical], usage)
+        print(f'[Model 1] Ô tìm HPO: {len(self.hpo_search.terms):,} cụm, {len(bundle_phrases):,} cụm lấy từ bundle.')
+
     def search_hpo(self, query, limit=20):
         q = normalize_text(query)
         if not q:
             return []
-        requested = self.aliases.get(query.strip().upper(), query.strip().upper())
-        ranked = {}
-        for vi, en, item in self.search_index:
-            hid = item['id']
-            if hid not in self.canonical:
-                continue
-            if hid == requested:
-                score = -10
-            elif q == vi:
-                score = 0
-            elif q == en:
-                score = 1
-            elif (' ' + q + ' ') in (' ' + vi + ' '):
-                score = 2
-            elif all(any(w.startswith(p) for w in vi.split()) for p in q.split()):
-                score = 3
-            elif q in en or hid.startswith(requested):
-                score = 4
-            elif q in normalize_text(item.get('synonyms', '')):
-                score = 5
-            else:
-                continue
-            value = (score, len(vi), hid)
-            if hid not in ranked or value < ranked[hid]:
-                ranked[hid] = value
-        found = [v[2] for v in sorted(ranked.values())]
+        found, tier = self.hpo_search.rank(query, self.aliases.get(query.strip().upper(), query.strip().upper()))
+        if tier not in STRONG:  # wording the dictionaries lack ("não úng nước"): ask the retriever when it can answer now
+            similar = getattr(self.runner, 'similar', None)
+            near = [(self.aliases.get(h['id'], h['id']), h['cosine']) for h in (similar(query) if similar else None) or []]
+            near = [(h, c) for h, c in near if h in self.canonical]
+            found = list(dict.fromkeys([h for h, c in near if c >= SEMANTIC_LEAD] + found + [h for h, _ in near]))
         corrected = self.corrections_search.get(q, [])
         if corrected:  # the doctors' approved choice for exactly this wording goes first
             found = list(corrected) + [h for h in found if h not in corrected]
